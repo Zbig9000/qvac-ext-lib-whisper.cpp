@@ -23,6 +23,9 @@ void usage(const char * argv0) {
         "          [--f16-weights 0|1] (load-time F16 materialization for the\n"
         "                            audit-identified hot matmul / pwconv weights;\n"
         "                            defaults to auto: on for GPU, off for CPU)\n"
+        "          [--f16-weights-deny PATTERN1,PATTERN2,...] (substring patterns,\n"
+        "                            comma-separated; matching tensors stay F32 even\n"
+        "                            when --f16-weights is on.  Default empty.)\n"
         "          [--prewarm TEXT] (run one throwaway synth on TEXT at engine\n"
         "                            construction so first-real-call latency on\n"
         "                            Vulkan / OpenCL doesn't pay the shader-\n"
@@ -80,6 +83,19 @@ int main(int argc, char ** argv) {
         else if (arg == "--vulkan-device") opts.vulkan_device = std::stoi(next("--vulkan-device"));
         else if (arg == "--f16-attn") opts.f16_attn = std::stoi(next("--f16-attn"));
         else if (arg == "--f16-weights") opts.f16_weights = std::stoi(next("--f16-weights"));
+        else if (arg == "--f16-weights-deny") {
+            // Comma-split into a vector<string>.  Empty entries
+            // are tolerated (predicate skips them defensively).
+            opts.f16_weights_deny_list.clear();
+            const std::string raw = next("--f16-weights-deny");
+            size_t start = 0;
+            for (size_t k = 0; k <= raw.size(); ++k) {
+                if (k == raw.size() || raw[k] == ',') {
+                    opts.f16_weights_deny_list.emplace_back(raw.substr(start, k - start));
+                    start = k + 1;
+                }
+            }
+        }
         else if (arg == "--prewarm") opts.prewarm_text = next("--prewarm");
         else if (arg == "--noise-npy") opts.noise_npy_path = next("--noise-npy");
         else if (arg == "-h" || arg == "--help") { usage(argv[0]); return 0; }

@@ -905,6 +905,44 @@ bool should_materialise_f16_weight(const std::string & source_name) {
     return false;
 }
 
+// QVAC-18605 round 6 — 2-arg overload.
+//
+// Two-stage decision:
+//
+//   1. If any non-empty entry in `extra_deny_substrings` is a
+//      substring of `source_name`, return `false` immediately.
+//      Operator-supplied deny patterns short-circuit the curated
+//      allow-list (they're meant to FORCE F32 even for tensors
+//      the curated path would have promoted).
+//
+//   2. Otherwise, forward to the 1-arg version (curated allow-
+//      list).
+//
+// Empty deny-list → behaviour identical to the 1-arg version
+// (zero behaviour change for every existing call site that
+// passes the default empty list).
+//
+// Empty strings inside the deny-list are SKIPPED on purpose:
+// substring `""` would otherwise match every name and silently
+// disable F16 weights for the entire model, which is almost
+// certainly an operator typo (e.g. trailing comma in a config
+// file producing an empty entry).  Surfacing the typo via a
+// loud warning would be nicer, but `should_materialise_f16_weight`
+// is a pure predicate with no logging hook; the defensive skip
+// keeps the predicate honest while a higher-layer config
+// validator can warn separately if desired.
+bool should_materialise_f16_weight(const std::string & source_name,
+                                   const std::vector<std::string> & extra_deny_substrings) {
+    if (source_name.empty()) return false;
+    for (const std::string & pattern : extra_deny_substrings) {
+        if (pattern.empty()) continue;  // defensive skip
+        if (source_name.find(pattern) != std::string::npos) {
+            return false;
+        }
+    }
+    return should_materialise_f16_weight(source_name);
+}
+
 // Thread-local dispatch flags consulted by the GGML graph builders to
 // pick between the CBLAS-backed `ggml_custom_4d` fast paths (CPU only)
 // and the portable pure-GGML fallbacks (any backend).  See the
@@ -1165,7 +1203,8 @@ bool load_supertonic_gguf(const std::string & path,
                           int n_gpu_layers,
                           bool verbose,
                           int f16_weights,
-                          int vulkan_device) {
+                          int vulkan_device,
+                          const std::vector<std::string> & f16_weights_deny_list) {
     model.generation_id = next_supertonic_generation_id();
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
@@ -1256,6 +1295,20 @@ bool load_supertonic_gguf(const std::string & path,
         if (verbose) {
             fprintf(stderr, "supertonic: use_f16_weights=%s\n",
                     model.use_f16_weights ? "true" : "false");
+            // Round 6 — log the user-supplied deny-list (if any) so
+            // operators can confirm their config got plumbed through.
+            // Empty list (the default) is silent — same baseline as
+            // the round-3 log output.
+            if (model.use_f16_weights && !f16_weights_deny_list.empty()) {
+                fprintf(stderr,
+                        "supertonic: f16_weights_deny_list (%zu pattern%s):\n",
+                        f16_weights_deny_list.size(),
+                        f16_weights_deny_list.size() == 1 ? "" : "s");
+                for (const auto & p : f16_weights_deny_list) {
+                    fprintf(stderr, "  - \"%s\"%s\n", p.c_str(),
+                            p.empty() ? " (empty — skipped at predicate time)" : "");
+                }
+            }
         }
 
         // Phase 2A pre-step: build a (tensor_name → source_name)
@@ -1320,14 +1373,29 @@ bool load_supertonic_gguf(const std::string & path,
             // either F32 or one of the expand-to-F32 types
             // (otherwise the source already carries narrower
             // precision than F16 and we don't widen).
+            //
+            // QVAC-18605 round 6 — the 2-arg overload layers the
+            // user-supplied `f16_weights_deny_list` substring
+            // patterns on top of the curated allow-list.  Empty
+            // deny-list (the default) → identical behaviour to
+            // the round-1/2/3 path.  When the deny-list flips a
+            // would-be-hot tensor back to F32 we bump
+            // `model.f16_weights_excluded_count` so bench output
+            // can confirm the user's deny-list took effect.
             bool f16_materialise = false;
             if (model.use_f16_weights) {
                 auto sit = tensor_to_source_for_alloc.find(name);
                 if (sit != tensor_to_source_for_alloc.end() &&
-                    should_materialise_f16_weight(sit->second) &&
                     (src->type == GGML_TYPE_F32 ||
                      should_expand_supertonic_tensor(src->type))) {
-                    f16_materialise = true;
+                    const bool curated_hot = should_materialise_f16_weight(sit->second);
+                    const bool denied      = curated_hot &&
+                        !should_materialise_f16_weight(sit->second, f16_weights_deny_list);
+                    if (denied) {
+                        ++model.f16_weights_excluded_count;
+                    } else if (curated_hot) {
+                        f16_materialise = true;
+                    }
                 }
             }
 
