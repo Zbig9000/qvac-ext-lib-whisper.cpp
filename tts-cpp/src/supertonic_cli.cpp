@@ -22,6 +22,10 @@ void usage(const char * argv0) {
         "          [--f16-weights 0|1] (load-time F16 materialization for the\n"
         "                            audit-identified hot matmul / pwconv weights;\n"
         "                            defaults to auto: on for GPU, off for CPU)\n"
+        "          [--prewarm TEXT] (run one throwaway synth on TEXT at engine\n"
+        "                            construction so first-real-call latency on\n"
+        "                            Vulkan / OpenCL doesn't pay the shader-\n"
+        "                            compile cost; no-op on CPU)\n"
         "          [--noise-npy /path/to/noise.npy]\n",
         argv0);
 }
@@ -75,6 +79,7 @@ int main(int argc, char ** argv) {
         else if (arg == "--vulkan-device") opts.vulkan_device = std::stoi(next("--vulkan-device"));
         else if (arg == "--f16-attn") opts.f16_attn = std::stoi(next("--f16-attn"));
         else if (arg == "--f16-weights") opts.f16_weights = std::stoi(next("--f16-weights"));
+        else if (arg == "--prewarm") opts.prewarm_text = next("--prewarm");
         else if (arg == "--noise-npy") opts.noise_npy_path = next("--noise-npy");
         else if (arg == "-h" || arg == "--help") { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown arg: %s\n", arg.c_str()); usage(argv[0]); return 2; }
