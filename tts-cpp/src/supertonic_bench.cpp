@@ -19,6 +19,12 @@
 #include "supertonic_internal.h"
 #include "npy.h"
 
+#ifdef GGML_USE_VULKAN
+// QVAC-18605 — needed for `ggml_backend_vk_get_device_description`
+// in the bench's backend annotator (Vulkan-only).
+#include "ggml-vulkan.h"
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -46,7 +52,8 @@ void usage(const char * argv0) {
         "          [--voice M1] [--language en] [--steps 5] [--speed 1.05]\n"
         "          [--seed 42] [--noise-npy /path/to/noise.npy]\n"
         "          [--runs 5] [--warmup 1] [--threads N] [--n-gpu-layers N]\n"
-        "          [--f16-attn 0|1] [--json-out FILE]\n",
+        "          [--vulkan-device N] [--f16-attn 0|1] [--f16-weights 0|1]\n"
+        "          [--json-out FILE]\n",
         argv0);
 }
 
@@ -123,6 +130,11 @@ int main(int argc, char ** argv) {
     // Phase 2A — F16 load-time materialization of the hot matmul /
     // pwconv weights.  -1 auto / 0 / 1 force.
     int f16_weights = -1;
+    // QVAC-18605 — Vulkan adapter index.  Default 0 (the historical
+    // hard-coded value in `init_supertonic_backend`).  Range-checked
+    // at GGUF load against `ggml_backend_vk_get_device_count()`; an
+    // out-of-range value is a hard error.
+    int vulkan_device = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -142,6 +154,7 @@ int main(int argc, char ** argv) {
         else if (a == "--warmup") warmup = std::stoi(next("--warmup"));
         else if (a == "--threads") n_threads = std::stoi(next("--threads"));
         else if (a == "--n-gpu-layers") n_gpu_layers = std::stoi(next("--n-gpu-layers"));
+        else if (a == "--vulkan-device") vulkan_device = std::stoi(next("--vulkan-device"));
         else if (a == "--f16-attn") f16_attn = std::stoi(next("--f16-attn"));
         else if (a == "--f16-weights") f16_weights = std::stoi(next("--f16-weights"));
         else if (a == "--json-out") json_out = next("--json-out");
@@ -151,15 +164,19 @@ int main(int argc, char ** argv) {
     if (model_path.empty() || text.empty()) { usage(argv[0]); return 2; }
 
     supertonic_model model;
-    if (!load_supertonic_gguf(model_path, model, n_gpu_layers, /*verbose=*/false, f16_weights)) {
+    if (!load_supertonic_gguf(model_path, model, n_gpu_layers, /*verbose=*/false,
+                              f16_weights, vulkan_device)) {
         fprintf(stderr, "failed to load model\n");
         return 1;
     }
     supertonic_set_n_threads(model, n_threads);
-    // F16 K/V flash-attention dispatch: same auto policy as Engine (auto
-    // ⇒ on for GPU backends, off for CPU; user can force).
+    // F16 K/V flash-attention dispatch: same auto policy as Engine
+    // (auto ⇒ on for GPU backends that pass the F16-K/V probe, off
+    // for CPU; user can force).  See `supertonic_backend_supports_f16_kv_flash_attn`
+    // in supertonic_gguf.cpp for the rationale (QVAC-18605).
     if (f16_attn < 0) {
-        model.use_f16_attn = !model.backend_is_cpu;
+        model.use_f16_attn = !model.backend_is_cpu &&
+                             supertonic_backend_supports_f16_kv_flash_attn(model.backend);
     } else {
         model.use_f16_attn = f16_attn != 0;
     }
@@ -292,9 +309,27 @@ int main(int argc, char ** argv) {
     printf("  voice: %s, language: %s, steps: %d, speed: %.2f\n",
            voice.c_str(), language.c_str(), steps, speed);
     printf("  threads: %d\n", model.n_threads);
-    printf("  backend: %s%s\n",
-           ggml_backend_name(model.backend) ? ggml_backend_name(model.backend) : "(unknown)",
-           model.use_f16_attn ? " (f16_attn=on)" : "");
+    {
+        // QVAC-18605 — bench backend description.  On Vulkan the
+        // adapter description is appended so multi-GPU machines
+        // unambiguously identify which device ran the bench.
+        std::string desc = ggml_backend_name(model.backend) ? ggml_backend_name(model.backend) : "(unknown)";
+#ifdef GGML_USE_VULKAN
+        if (model.backend_is_vk) {
+            char vk_desc[256] = {0};
+            ggml_backend_vk_get_device_description(vulkan_device < 0 ? 0 : vulkan_device,
+                                                   vk_desc, sizeof(vk_desc) - 1);
+            if (vk_desc[0]) {
+                desc += " (device " + std::to_string(vulkan_device < 0 ? 0 : vulkan_device) +
+                        ": " + vk_desc + ")";
+            }
+        }
+#endif
+        printf("  backend: %s%s%s\n",
+               desc.c_str(),
+               model.use_f16_attn ? " (f16_attn=on)" : "",
+               model.use_native_leaky_relu ? " (native_leaky_relu=on)" : "");
+    }
     printf("  audio per run: %.3fs @ %d Hz\n", last_audio_s, model.hparams.sample_rate);
     printf("  runs: %d (warmup discarded: %d)\n", runs, warmup);
     printf("\n");
