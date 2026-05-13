@@ -119,6 +119,12 @@ struct Engine::Impl {
     EngineOptions    opts;
     supertonic_model model;
     std::atomic<bool> cancel_flag{false};
+    // QVAC-18605 round 7 — voice ttl/dp host cache.  Populated
+    // lazily on first `synthesize()` call per voice; subsequent
+    // calls hit the cache and skip the GPU→host download (2 sync
+    // points per call eliminated on Vulkan / OpenCL).  See the
+    // contract on `voice_host_cache` in supertonic_internal.h.
+    voice_host_cache voices_host;
 
     explicit Impl(const EngineOptions & o)
         : opts(o) {
@@ -128,6 +134,15 @@ struct Engine::Impl {
         if (!std::filesystem::exists(opts.model_gguf_path)) {
             throw std::runtime_error(supertonic_setup_hint(opts.model_gguf_path));
         }
+        // QVAC-18605 round 7 — apply Vulkan env-var overrides
+        // BEFORE `load_supertonic_gguf` (which calls
+        // `init_supertonic_backend`).  ggml-vulkan reads its
+        // GGML_VK_* env vars at backend init, so the overrides
+        // need to land in the environment before that point.
+        // Throws on any key without `GGML_VK_` prefix (operator-
+        // config typo guard); the throw propagates up to the
+        // caller (no model loaded yet, no cleanup needed).
+        apply_vulkan_env_overrides(opts.vulkan_env_overrides);
         if (!load_supertonic_gguf(opts.model_gguf_path, model,
                                   opts.n_gpu_layers, /*verbose=*/false,
                                   opts.f16_weights, opts.vulkan_device,
@@ -247,8 +262,16 @@ struct Engine::Impl {
             // construction (not currently supported but guard anyway).
             throw std::runtime_error("Supertonic Engine: unknown voice: " + voice);
         }
-        std::vector<float> style_ttl = read_tensor_f32(vit->second.ttl);
-        std::vector<float> style_dp  = read_tensor_f32(vit->second.dp);
+        // QVAC-18605 round 7 — `voices_host.get_or_load` returns
+        // a stable reference into the per-engine cache.  First
+        // call per voice does the 2 GPU→host downloads + caches;
+        // subsequent calls return the cached entry without
+        // touching the backend.  Pointers + size below are valid
+        // for the duration of this `synthesize()` call (cache is
+        // never `clear()`ed during synthesis).
+        const auto & voice_entry = voices_host.get_or_load(voice, vit->second.ttl, vit->second.dp);
+        const float * style_ttl  = voice_entry.ttl.data();
+        const float * style_dp   = voice_entry.dp.data();
 
         std::vector<int32_t> text_ids_i32;
         std::string normalized;
@@ -264,7 +287,7 @@ struct Engine::Impl {
 
         float duration_raw = 0.0f;
         if (!supertonic_duration_forward_ggml(model, text_ids.data(), (int) text_ids.size(),
-                                              style_dp.data(), duration_raw, &error)) {
+                                              style_dp, duration_raw, &error)) {
             throw std::runtime_error("Supertonic Engine: duration failed: " + error);
         }
         const float duration_s  = duration_raw / speed;
@@ -297,7 +320,7 @@ struct Engine::Impl {
 
         std::vector<float> text_emb;
         if (!supertonic_text_encoder_forward_ggml(model, text_ids.data(), (int) text_ids.size(),
-                                                  style_ttl.data(), text_emb, &error)) {
+                                                  style_ttl, text_emb, &error)) {
             throw std::runtime_error("Supertonic Engine: text encoder failed: " + error);
         }
 
@@ -311,7 +334,7 @@ struct Engine::Impl {
             }
             if (!supertonic_vector_step_ggml(model, latent.data(), latent_len,
                                              text_emb.data(), (int) text_ids.size(),
-                                             style_ttl.data(), latent_mask.data(),
+                                             style_ttl, latent_mask.data(),
                                              step, steps, next, &error)) {
                 throw std::runtime_error("Supertonic Engine: vector estimator failed: " + error);
             }
