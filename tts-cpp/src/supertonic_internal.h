@@ -12,6 +12,8 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 
+#include "backend_util.h"
+
 namespace tts_cpp::supertonic::detail {
 
 // QVAC-18605 round 4 — multi-dtype K/V flash-attention dispatch.
@@ -566,7 +568,9 @@ void supertonic_graph_compute(const supertonic_model & model, ggml_cgraph * grap
 // Mirrors the `!ggml_backend_is_cpu(backend)` idiom Chatterbox uses to gate
 // its Metal-only batched-CFG path.
 inline bool model_prefers_cpu_kernels(const supertonic_model & model) {
-    return model.backend == nullptr || ggml_backend_is_cpu(model.backend);
+    // `ggml_backend_is_cpu` lives in the CPU backend shared library, which is
+    // unlinkable under GGML_BACKEND_DL. Route through the registry-based shim.
+    return model.backend == nullptr || ::tts_cpp::detail::backend_is_cpu(model.backend);
 }
 
 // QVAC-19254 — scheduler-based alloc + compute (Option A), used by stages

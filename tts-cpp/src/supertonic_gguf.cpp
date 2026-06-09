@@ -218,12 +218,11 @@ void convert_supertonic_tensor_data(const ggml_tensor * src,
     const size_t dst_bytes = ggml_row_size(dst_type, n);
     out_buf.resize(dst_bytes);
 
-    const ggml_type_traits_cpu * dst_tr = ggml_get_type_traits_cpu(dst_type);
-    if (!dst_tr || !dst_tr->from_float) {
-        throw std::runtime_error(std::string("Supertonic load: missing from_float for ") +
-                                 ggml_type_name(dst_type));
-    }
-    dst_tr->from_float(f32_pivot.data(), out_buf.data(), n);
+    // `ggml_get_type_traits_cpu(...)->from_float` lives in the CPU backend
+    // shared library, which is unlinkable under GGML_BACKEND_DL. Quantize via
+    // the ggml-base `ggml_quantize_chunk` API (one row of `n` elements).
+    ggml_quantize_chunk(dst_type, f32_pivot.data(), out_buf.data(),
+                        /*start=*/0, /*nrows=*/1, /*n_per_row=*/n, /*imatrix=*/nullptr);
 }
 
 ggml_backend_t init_supertonic_backend(int n_gpu_layers, bool verbose, int vulkan_device = 0) {
@@ -1767,7 +1766,7 @@ bool load_supertonic_gguf(const std::string & path,
         // (any backend) based on this flag.  Stable for the model's
         // lifetime; see the supertonic_op_dispatch_scope comment in
         // supertonic_internal.h for the threading contract.
-        model.backend_is_cpu = ggml_backend_is_cpu(model.backend);
+        model.backend_is_cpu = ::tts_cpp::detail::backend_is_cpu(model.backend);
         // QVAC-18605 — Vulkan-specific dispatch capture.
         //
         // `backend_is_vk` is informational (the bench / engine show it
@@ -1975,7 +1974,7 @@ bool load_supertonic_gguf(const std::string & path,
                 // for tensors that don't need conversion.
                 dst_type = target_supertonic_storage_type(
                     decision_name, src->type, precision,
-                    /*backend_is_cpu=*/ ggml_backend_is_cpu(model.backend));
+                    /*backend_is_cpu=*/ ::tts_cpp::detail::backend_is_cpu(model.backend));
             }
 
             ggml_tensor * dst = (dst_type == src->type)
@@ -2313,7 +2312,7 @@ bool load_supertonic_gguf(const std::string & path,
         static const bool disable_pretranspose =
             std::getenv("SUPERTONIC_DISABLE_WEIGHT_PRETRANSPOSE") != nullptr;
         if (!disable_pretranspose && model.backend &&
-            !ggml_backend_is_cpu(model.backend)) {
+            !::tts_cpp::detail::backend_is_cpu(model.backend)) {
             std::vector<std::pair<std::string, ggml_tensor *>> to_pretranspose;
             for (const auto & [src_name, t] : model.source_tensors) {
                 if (!t) continue;
@@ -2404,14 +2403,11 @@ bool load_supertonic_gguf(const std::string & path,
                     } else {
                         const size_t dst_bytes = ggml_row_size(pre->type, n);
                         std::vector<uint8_t> raw(dst_bytes);
-                        const ggml_type_traits_cpu * dtr =
-                            ggml_get_type_traits_cpu(pre->type);
-                        if (!dtr || !dtr->from_float) {
-                            throw std::runtime_error(
-                                std::string("pretranspose: missing from_float for ") +
-                                ggml_type_name(pre->type));
-                        }
-                        dtr->from_float(host_pre_f32.data(), raw.data(), (int64_t) n);
+                        // from_float lives in the DL CPU backend; quantize via
+                        // the ggml-base ggml_quantize_chunk() API instead.
+                        ggml_quantize_chunk(pre->type, host_pre_f32.data(),
+                                            raw.data(), /*start=*/0, /*nrows=*/1,
+                                            /*n_per_row=*/(int64_t) n, /*imatrix=*/nullptr);
                         ggml_backend_tensor_set(pre, raw.data(), 0, raw.size());
                     }
                     model.pretransposed_weights[orig] = pre;
