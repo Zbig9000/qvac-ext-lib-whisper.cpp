@@ -834,6 +834,20 @@ setup for the Apple rows:
 - Reference voice: `test/reference-audio/jfk.wav` (11 s mono 16 kHz)
 - Seed: 42, warm 3-run average, inference only (excludes model load)
 
+### Backend & platform coverage
+
+Where each TTS engine runs and where we have **CI benchmark numbers** (legend:
+✅ current CI · ⚠️ maintainer-measured on Apple, not CI · ⏳ supported, benchmark
+pending · ⛔ GPU compute disabled, CPU fallback).
+
+| Platform | Chatterbox (Turbo / Multilingual) | Supertonic |
+|----------|-----------------------------------|------------|
+| Linux x86-64   | CPU ✅, Vulkan ✅ (CI) | CPU ✅ (CI); Vulkan ⏳ (re-land in [qvac#2506](https://github.com/tetherto/qvac/pull/2506)) |
+| Windows x64    | CPU ✅, Vulkan ✅ (CI) | CPU ✅; Vulkan ⏳ |
+| macOS / iOS    | CPU ✅, Metal ⚠️ (maintainer) | CPU ✅, Metal ⚠️ (maintainer); iOS ⏳ |
+| Android (arm64)| CPU only — GPU forced off at the engine boundary | CPU only — Adreno GPU aborts ([qvac#2506](https://github.com/tetherto/qvac/pull/2506)) |
+| NVIDIA CUDA    | ⏳ supported, not benchmarked | ⏳ supported, not benchmarked |
+
 ### CI benchmarks (latest `ggml-speech`, Linux x86-64)
 
 End-to-end RTF measured in CI on the `tetherto/qvac` self-hosted runners, using

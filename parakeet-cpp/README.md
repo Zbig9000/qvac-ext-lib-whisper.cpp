@@ -121,6 +121,21 @@ Default **`--quant`** is **`q8_0`**. Use **`f16`** for parity-calibrated harness
 
 Small tensors and shapes not divisible by 32 may stay f16; see `PROGRESS.md` for quant sweep detail.
 
+### Backend & platform coverage
+
+Where parakeet runs and where we have **CI benchmark numbers** (legend: ✅ current
+CI · ⚠️ maintainer-measured, not CI · ⏳ supported, benchmark pending · ⛔ GPU
+compute disabled, CPU fallback).
+
+| Platform | Backend(s) | Benchmark status |
+|----------|------------|------------------|
+| Linux x86-64       | CPU, Vulkan | ✅ CPU + Vulkan (CI — see table below) |
+| Linux arm64        | CPU         | ✅ CPU (CI) |
+| Windows x64        | CPU, Vulkan | ✅ CPU (CI); Vulkan supported, ⏳ not yet benched |
+| macOS x64/arm64, iOS | CPU, Metal | CPU ✅ (CI); Metal ⚠️ maintainer-measured (`RTF (Metal)` column above); iOS ⏳ |
+| Android (arm64)    | CPU         | ✅ CPU; Adreno Vulkan/OpenCL ⛔ force-disabled — ggml compute aborts ([qvac#2525](https://github.com/tetherto/qvac/pull/2525)) |
+| NVIDIA CUDA        | CPU, CUDA   | ⏳ supported, not benchmarked |
+
 ### CI benchmarks (latest `ggml-speech`, Linux x86-64)
 
 End-to-end RTF measured in CI on the `tetherto/qvac` self-hosted runners, using

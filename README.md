@@ -74,6 +74,33 @@ sources:
 Each subtree has its own README / build flow / public C++ API.  The
 upstream whisper.cpp build below is unaffected by either.
 
+### Platform & GPU-backend benchmark coverage
+
+Backends each engine can build for, and where we currently have **CI benchmark
+numbers** (2026-06; GPU runner = NVIDIA RTX 4000 SFF Ada Generation, Vulkan).
+Legend: ✅ current CI numbers · ⚠️ maintainer-measured on Apple Silicon (not CI)
+· ⏳ supported, benchmark pending · ⛔ GPU compute disabled (Adreno crash → CPU
+fallback) · — n/a.
+
+| Engine | CPU | Vulkan (Linux/Win) | Metal (macOS/iOS) | CUDA | Android (Vulkan/OpenCL) |
+|--------|:---:|:------------------:|:-----------------:|:----:|:-----------------------:|
+| whisper.cpp (ASR)   | ⏳² | ⏳ | ⏳ | ⏳ | ⏳ |
+| parakeet (ASR)      | ✅ | ✅ | ⚠️ | ⏳ | ⛔ |
+| Chatterbox (TTS)    | ✅ | ✅ | ⚠️ | ⏳ | ⛔ |
+| Supertonic (TTS)    | ✅ | ⏳¹ | ⚠️ | ⏳ | ⛔ |
+
+¹ Supertonic GPU (Vulkan/Metal) is re-landing in
+[qvac#2506](https://github.com/tetherto/qvac/pull/2506); on the current package
+it runs CPU-only. **Android GPU** (Adreno Vulkan/OpenCL) is force-disabled for
+parakeet and Supertonic — the ggml graph compute aborts — so `useGPU` falls back
+to CPU there (parakeet: [qvac#2525](https://github.com/tetherto/qvac/pull/2525)).
+² whisper-cli ships the upstream [`whisper-bench`](examples/bench) tool with
+community results in [ggml-org/whisper.cpp#89](https://github.com/ggml-org/whisper.cpp/issues/89);
+refreshed QVAC CI speed coverage is still pending.
+
+Per-engine detail: [`parakeet-cpp`](parakeet-cpp/README.md#backend--platform-coverage)
+· [`tts-cpp`](tts-cpp/README.md#backend--platform-coverage).
+
 ## Quick start
 
 First clone the repository:
