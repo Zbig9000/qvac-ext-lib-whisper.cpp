@@ -239,6 +239,7 @@ set(TTS_CPP_LIB_SOURCES
     src/campplus.cpp
     src/s3tokenizer.cpp
     src/t3_mtl.cpp
+    src/t3_stop_controller.cpp
     src/supertonic_gguf.cpp
     src/supertonic_preprocess.cpp
     src/supertonic_vocoder.cpp
@@ -591,6 +592,16 @@ if (TTS_CPP_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}/wav_16k.npy" "${_tcb_s3gen_ref}/log_mel.npy" "${_tcb_s3gen_ref}/speech_tokens.npy"
         REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}/wav_16k.npy" "${_tcb_s3gen_ref}/log_mel.npy" "${_tcb_s3gen_ref}/speech_tokens.npy")
+
+    # QVAC-20616: attention-free end-of-speech stop controller.  Pure host
+    # logic with no model / ggml dependency, so it links only its own source
+    # and always runs (no fixture REQUIRES).
+    add_executable(test-t3-stop-controller
+        test/test_t3_stop_controller.cpp
+        src/t3_stop_controller.cpp)
+    target_include_directories(test-t3-stop-controller PRIVATE src)
+    tts_cpp_apply_ccache(test-t3-stop-controller)
+    tts_cpp_register_test(test-t3-stop-controller LABEL "cpu")
 
     add_executable(test-mtl-tokenizer test/test_mtl_tokenizer.cpp)
     target_link_libraries(test-mtl-tokenizer PRIVATE tts-cpp)
