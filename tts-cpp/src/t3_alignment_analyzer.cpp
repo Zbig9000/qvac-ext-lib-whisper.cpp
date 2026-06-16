@@ -5,16 +5,13 @@
 namespace tts_cpp::chatterbox::detail {
 
 void t3_alignment_analyzer::reset(const t3_align_analyzer_params & p) {
-    p_              = p;
-    frame_          = 0;
-    text_position_  = 0;
-    started_        = false;
-    complete_       = false;
-    completed_at_   = -1;
+    p_             = p;
+    frame_         = 0;
+    text_position_ = 0;
+    complete_      = false;
+    completed_at_  = -1;
     tail_sum_.assign((size_t) std::max(0, p_.tail_cols), 0.0);
-    early_sum_      = 0.0;
-    max_first4_     = 0.0f;
-    prev_last2_max_ = 0.0f;
+    early_sum_     = 0.0;
     recent_tokens_.clear();
 }
 
@@ -38,7 +35,10 @@ t3_align_action t3_alignment_analyzer::step(const std::vector<float> & row,
 
     // Monotonic mask: a frame cannot align to text it has not reached yet, so
     // zero out columns beyond curr_frame_pos + 1 (curr_frame_pos == frame_).
-    // Operate on a local copy.
+    // This is also the safeguard against a start-of-speech hallucination
+    // spiking on a late text column and triggering an immediate false
+    // "complete": since cur <= frame_ + 1, `complete_` (text_position >= S -
+    // complete_margin) is impossible before frame (S - complete_margin - 1).
     std::vector<float> a(row.begin(), row.begin() + n);
     for (int c = frame_ + 1; c < n; ++c) a[(size_t) c] = 0.0f;
 
@@ -53,26 +53,6 @@ t3_align_action t3_alignment_analyzer::step(const std::vector<float> & row,
     const int delta = cur - text_position_;
     const bool discontinuity = !(delta > -p_.disc_back && delta < p_.disc_fwd);
     if (!discontinuity) text_position_ = cur;
-
-    // --- false-start / started ---------------------------------------------
-    // Hallucinations at the start show up as activations far off-diagonal in
-    // the last text columns of the first frames, or as no strong activation on
-    // the first columns yet.
-    const int last2_from = std::max(0, n - 2);
-    float curr_last2_max = 0.0f;
-    for (int c = last2_from; c < n; ++c) curr_last2_max = std::max(curr_last2_max, a[(size_t) c]);
-    const float a_tail_2x2_max = std::max(curr_last2_max, prev_last2_max_);
-
-    const int first4_to = std::min(n, 4);
-    float curr_first4_max = 0.0f;
-    for (int c = 0; c < first4_to; ++c) curr_first4_max = std::max(curr_first4_max, a[(size_t) c]);
-    max_first4_ = std::max(max_first4_, curr_first4_max);
-
-    if (!started_) {
-        const bool false_start = (a_tail_2x2_max > 0.1f) || (max_first4_ < 0.5f);
-        started_ = !false_start;
-    }
-    prev_last2_max_ = curr_last2_max;
 
     // --- completion --------------------------------------------------------
     if (!complete_ && text_position_ >= S - p_.complete_margin) {

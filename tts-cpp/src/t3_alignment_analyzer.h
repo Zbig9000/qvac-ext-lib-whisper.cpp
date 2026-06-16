@@ -77,7 +77,6 @@ public:
     t3_align_action step(const std::vector<float> & row, int32_t sampled_token);
 
     int  text_position() const { return text_position_; }
-    bool started()       const { return started_; }
     bool complete()      const { return complete_; }
     int  frames()        const { return frame_; }
 
@@ -85,16 +84,13 @@ private:
     t3_align_analyzer_params p_;
     int   frame_         = 0;     // T: frames seen so far
     int   text_position_ = 0;
-    bool  started_       = false;
     bool  complete_      = false;
     int   completed_at_  = -1;    // frame count at which `complete_` first set
 
     // Running reductions over the post-completion window, matching the
     // reference's A[completed_at:, -3:].sum(dim=0) and A[completed_at:, :-5].max(dim=1).sum().
-    std::vector<double> tail_sum_;        // per-column sum over the last `tail_cols`
-    double              early_sum_   = 0.0;   // sum of per-frame max on early columns
-    float               max_first4_  = 0.0f;  // running max over frames of first-4-col max
-    float               prev_last2_max_ = 0.0f;  // previous frame's last-2-col max
+    std::vector<double> tail_sum_;       // per-column sum over the last `tail_cols`
+    double              early_sum_ = 0.0; // sum of per-frame max on early columns
 
     std::vector<int32_t> recent_tokens_;
 };
