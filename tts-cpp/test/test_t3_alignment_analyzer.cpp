@@ -1,0 +1,150 @@
+// Unit tests for the host-side T3 alignment analyzer (QVAC-20616 Phase 2).
+// Pure logic, no model/ggml dependency:
+//
+//   g++ -std=c++17 -I src test/test_t3_alignment_analyzer.cpp src/t3_alignment_analyzer.cpp -o /tmp/t && /tmp/t
+//
+// Coverage:
+//   - mid-text frames never force EOS (climb that never completes)
+//   - a healthy generation that reaches the end then dwells forces EOS a few
+//     frames after completion (long_tail)
+//   - a ramble that backtracks after completion forces EOS (alignment_repetition)
+//   - token repetition only forces EOS once complete (avoids #519/#587 early cut)
+//   - short text / empty row / disabled => no force
+
+#include "t3_alignment_analyzer.h"
+
+#include <cstdio>
+#include <vector>
+
+using namespace tts_cpp::chatterbox::detail;
+
+namespace {
+
+int g_failures = 0;
+int g_checks   = 0;
+
+#define CHECK(cond, ...) do {                                            \
+    ++g_checks;                                                          \
+    if (!(cond)) {                                                       \
+        ++g_failures;                                                    \
+        fprintf(stderr, "FAIL %s:%d  ", __FILE__, __LINE__);            \
+        fprintf(stderr, __VA_ARGS__);                                    \
+        fprintf(stderr, "\n");                                          \
+    }                                                                    \
+} while (0)
+
+// One-hot-ish alignment row of length S peaked at column `peak`.
+std::vector<float> row_at(int S, int peak) {
+    std::vector<float> r((size_t) S, 0.0f);
+    if (peak >= 0 && peak < S) r[(size_t) peak] = 1.0f;
+    return r;
+}
+
+t3_align_analyzer_params params(int S) {
+    t3_align_analyzer_params p;
+    p.text_len        = S;
+    p.complete_margin = 3;
+    p.tail_cols       = 3;
+    p.long_tail_thresh = 5.0f;
+    p.rep_back_cols   = 5;
+    p.rep_thresh      = 5.0f;
+    p.min_text_len    = 6;
+    p.enabled         = true;
+    return p;
+}
+
+void test_midtext_never_forces() {
+    const int S = 13;
+    t3_alignment_analyzer az;
+    az.reset(params(S));
+    bool forced = false;
+    // Climb only to position 8 (never reaches S-3 == 10), 40 frames.
+    for (int f = 0; f < 40; ++f) {
+        int peak = f < 8 ? f : 8;
+        if (az.step(row_at(S, peak), /*token=*/100 + f) == t3_align_action::force_eos)
+            forced = true;
+    }
+    CHECK(!forced, "mid-text climb must never force EOS");
+    CHECK(!az.complete(), "must not be marked complete");
+}
+
+void test_healthy_long_tail_forces_after_completion() {
+    const int S = 13;
+    t3_alignment_analyzer az;
+    az.reset(params(S));
+    int force_frame = -1;
+    int complete_frame = -1;
+    for (int f = 0; f < 40; ++f) {
+        // climb to 12 by frame 12, then dwell at 12
+        int peak = f < 12 ? f : 12;
+        t3_align_action a = az.step(row_at(S, peak), /*token=*/200 + (f % 7));
+        if (complete_frame < 0 && az.complete()) complete_frame = f;
+        if (force_frame < 0 && a == t3_align_action::force_eos) force_frame = f;
+    }
+    CHECK(complete_frame >= 0, "should reach completion");
+    CHECK(force_frame >= 0, "long-tail dwell should force EOS");
+    CHECK(force_frame > complete_frame, "must not force before completion (got force=%d complete=%d)",
+          force_frame, complete_frame);
+    // ~long_tail_thresh frames of dwelling after completion.
+    CHECK(force_frame - complete_frame <= 8, "force should fire within a few frames of completion (got %d)",
+          force_frame - complete_frame);
+}
+
+void test_ramble_backtrack_forces() {
+    const int S = 13;
+    t3_alignment_analyzer az;
+    az.reset(params(S));
+    // Climb to 12, complete, then backtrack to early positions (repetition).
+    for (int f = 0; f <= 12; ++f) az.step(row_at(S, f), 300 + f);
+    CHECK(az.complete(), "should be complete after reaching the end");
+    bool forced = false;
+    // Backtrack: attend to early columns (0..3) after completion -> repetition.
+    for (int f = 0; f < 12 && !forced; ++f) {
+        if (az.step(row_at(S, f % 4), 400 + f) == t3_align_action::force_eos) forced = true;
+    }
+    CHECK(forced, "post-completion backtracking should force EOS (alignment_repetition)");
+}
+
+void test_token_repetition_gated_by_complete() {
+    const int S = 13;
+    // Mid-text repeated tokens should NOT force EOS.
+    t3_alignment_analyzer az;
+    az.reset(params(S));
+    bool forced = false;
+    for (int f = 0; f < 10; ++f) {
+        // stay mid-text (peak 5) with the same token repeated
+        if (az.step(row_at(S, 5), /*token=*/777) == t3_align_action::force_eos) forced = true;
+    }
+    CHECK(!forced, "repeated token mid-text must NOT force EOS (avoids #587 early cut)");
+}
+
+void test_short_text_and_empty_row_noop() {
+    // Short text (< min_text_len) -> disabled.
+    t3_alignment_analyzer az;
+    az.reset(params(4));
+    bool forced = false;
+    for (int f = 0; f < 20; ++f)
+        if (az.step(row_at(4, 1), 1) == t3_align_action::force_eos) forced = true;
+    CHECK(!forced, "short text must not force EOS");
+
+    // Empty row -> always none.
+    t3_alignment_analyzer az2;
+    az2.reset(params(13));
+    CHECK(az2.step(std::vector<float>{}, 5) == t3_align_action::none,
+          "empty alignment row must be a no-op");
+}
+
+} // namespace
+
+int main() {
+    test_midtext_never_forces();
+    test_healthy_long_tail_forces_after_completion();
+    test_ramble_backtrack_forces();
+    test_token_repetition_gated_by_complete();
+    test_short_text_and_empty_row_noop();
+
+    fprintf(stderr, "\n%s: %d/%d checks passed\n",
+            g_failures == 0 ? "PASS" : "FAIL",
+            g_checks - g_failures, g_checks);
+    return g_failures == 0 ? 0 : 1;
+}

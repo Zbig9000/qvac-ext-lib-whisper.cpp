@@ -240,6 +240,7 @@ set(TTS_CPP_LIB_SOURCES
     src/s3tokenizer.cpp
     src/t3_mtl.cpp
     src/t3_stop_controller.cpp
+    src/t3_alignment_analyzer.cpp
     src/supertonic_gguf.cpp
     src/supertonic_preprocess.cpp
     src/supertonic_vocoder.cpp
@@ -602,6 +603,15 @@ if (TTS_CPP_BUILD_TESTS)
     target_include_directories(test-t3-stop-controller PRIVATE src)
     tts_cpp_apply_ccache(test-t3-stop-controller)
     tts_cpp_register_test(test-t3-stop-controller LABEL "cpu")
+
+    # QVAC-20616 Phase 2: alignment analyzer state machine.  Pure host logic,
+    # no model / ggml dependency, so it always runs.
+    add_executable(test-t3-alignment-analyzer
+        test/test_t3_alignment_analyzer.cpp
+        src/t3_alignment_analyzer.cpp)
+    target_include_directories(test-t3-alignment-analyzer PRIVATE src)
+    tts_cpp_apply_ccache(test-t3-alignment-analyzer)
+    tts_cpp_register_test(test-t3-alignment-analyzer LABEL "cpu")
 
     add_executable(test-mtl-tokenizer test/test_mtl_tokenizer.cpp)
     target_link_libraries(test-mtl-tokenizer PRIVATE tts-cpp)

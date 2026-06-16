@@ -14,6 +14,7 @@
 #include "gpt2_bpe.h"
 #include "mtl_tokenizer.h"
 #include "npy.h"
+#include "t3_alignment_analyzer.h"
 #include "t3_mtl.h"
 #include "t3_stop_controller.h"
 #include "tts-cpp/chatterbox/s3gen_pipeline.h"
@@ -509,6 +510,19 @@ struct Engine::Impl {
                                    (int) text_tokens.size(), opts.n_predict)
             : t3_stop_params{});
 
+        // QVAC-20616 Phase 2: alignment-based EOS (primary signal on the CPU
+        // path).  Configures the in-graph probe; a no-op (graph unchanged) for
+        // Turbo / short text / the batched GPU path, where the Phase 1
+        // controller above remains the stop signal.
+        const int align_S = t3_align_begin_generation(model, (int) text_tokens.size());
+        t3_alignment_analyzer align_az;
+        const bool align_on = (align_S > 0);
+        if (align_on) {
+            t3_align_analyzer_params ap;
+            ap.text_len = align_S;
+            align_az.reset(ap);
+        }
+
         int32_t current = is_mtl
             ? sample_next_token_mtl(logits_c, logits_u, generated, sp, rng,
                                     model.hparams.stop_speech_token)
@@ -529,7 +543,16 @@ struct Engine::Impl {
                 throw std::runtime_error("Engine: T3 step eval failed");
             }
             ++n_past;
-            if (is_mtl && stop_ctrl.force_eos((int) generated.size(), logits_c, logits_u)) {
+            bool force_eos_now = false;
+            if (align_on &&
+                align_az.step(t3_align_last_row(), current) == t3_align_action::force_eos) {
+                force_eos_now = true;
+            }
+            if (!force_eos_now && is_mtl &&
+                stop_ctrl.force_eos((int) generated.size(), logits_c, logits_u)) {
+                force_eos_now = true;
+            }
+            if (force_eos_now) {
                 current = model.hparams.stop_speech_token;
             } else {
                 current = is_mtl
@@ -548,6 +571,8 @@ struct Engine::Impl {
                 break;
             }
         }
+
+        if (align_on) t3_align_reset();
 
         if (!generated.empty() && generated.back() == model.hparams.stop_speech_token) {
             generated.pop_back();
