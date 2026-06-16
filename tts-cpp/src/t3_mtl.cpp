@@ -83,10 +83,12 @@ void t3_align_capture_from_graph(ggml_cgraph * gf) {
         for (int r = 0; r < nt; ++r) acc[(size_t) r] += last_col[r];
         ++cnt;
     }
+    // Leave the row empty (not all-zeros) when no probe output was found so the
+    // analyzer takes its empty-row fast path and falls back to Phase 1.
+    if (cnt == 0) { g_t3_align.last_row.clear(); return; }
     g_t3_align.last_row.assign((size_t) nt, 0.0f);
-    if (cnt > 0)
-        for (int r = 0; r < nt; ++r)
-            g_t3_align.last_row[(size_t) r] = (float) (acc[(size_t) r] / cnt);
+    for (int r = 0; r < nt; ++r)
+        g_t3_align.last_row[(size_t) r] = (float) (acc[(size_t) r] / cnt);
 }
 
 // Process-wide registry of the Phase-15 stacked-weight buffers, with an
