@@ -54,6 +54,7 @@
 #include "tts-cpp/chatterbox/s3gen_pipeline.h"
 #include "tts-cpp/supertonic/engine.h"
 #include "chatterbox_t3_internal.h"
+#include "t3_stop_controller.h"
 #include "t3_mtl.h"
 #include "npy.h"
 #include "voice_features.h"
@@ -2049,6 +2050,16 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             constexpr int MAX_RETRIES = 3;
             auto rng_snapshot = rng;
 
+            // QVAC-20616: shared end-of-speech stop controller (same logic as
+            // chatterbox::Engine::run_t3).  Disabled for Turbo so that path is
+            // unchanged.  Params depend only on the (constant-across-retries)
+            // segment text length, so build once and reset per attempt.
+            const t3_stop_params stop_p = is_mtl
+                ? make_mtl_stop_params(model.hparams.stop_speech_token, sp_mtl.cfg_weight,
+                                       (int) seg_text_tokens[si].size(), params.n_predict)
+                : t3_stop_params{};
+            t3_stop_controller stop_ctrl;
+
             std::vector<int32_t> generated, best_generated;
             for (int attempt = 0; attempt <= MAX_RETRIES; ++attempt) {
                 rng = rng_snapshot;
@@ -2070,6 +2081,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 int n_past = prompt_len;
                 generated.clear();
                 generated.reserve(params.n_predict + 1);
+                stop_ctrl.reset(stop_p);
 
                 int32_t current = is_mtl
                     ? sample_next_token_mtl(logits_c, logits_u, generated, sp_mtl, rng,
@@ -2078,7 +2090,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 generated.push_back(current);
 
                 bool stopped_by_stop_token = false;
-                bool stopped_by_repetition  = false;
+                bool ctrl_forced_eos       = false;
+                t3_stop_reason ctrl_reason = t3_stop_reason::none;
                 for (int i = 0; i < params.n_predict; ++i) {
                     if (current == model.hparams.stop_speech_token) { stopped_by_stop_token = true; break; }
                     if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
@@ -2091,44 +2104,43 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     }
                     if (!step_ok) throw std::runtime_error("step eval failed");
                     ++n_past;
-                    current = is_mtl
-                        ? sample_next_token_mtl(logits_c, logits_u, generated, sp_mtl, rng,
-                                                model.hparams.stop_speech_token)
-                        : sample_next_token(logits, generated, params, rng);
-                    generated.push_back(current);
 
-                    // Port of the token_repetition check in the Python
-                    // AlignmentStreamAnalyzer. MTL T3 sometimes emits a
-                    // plausible end-of-speech silence cadence mid-utterance
-                    // and then hallucinates more low-energy content before
-                    // eventually stopping. Two consecutive identical tokens
-                    // signal this cadence; gated to MTL because the Turbo
-                    // codebook has a different cadence signature and to a
-                    // 60-token minimum so we don't fire on the first
-                    // utterance of short multilingual inputs. We trim only
-                    // the trailing duplicate (resize(n-1)) and leave the
-                    // legitimate prior token; the downstream pop_back()
-                    // handles the stop-speech token.
-                    constexpr int kMtlMinTokensBeforeCadence = 60;
-                    if (is_mtl && generated.size() >= 2 &&
-                        (int)generated.size() > kMtlMinTokensBeforeCadence) {
-                        size_t n = generated.size();
-                        if (generated[n - 1] == generated[n - 2]) {
-                            generated.resize(n - 1);
-                            stopped_by_repetition = true;
-                            break;
-                        }
+                    // Force EOS when the model's own argmax has preferred the
+                    // stop token for several consecutive steps but sampling
+                    // kept missing it (the dominant "rambles after the text is
+                    // done" failure mode).  See src/t3_stop_controller.h.
+                    if (is_mtl && stop_ctrl.force_eos((int) generated.size(), logits_c, logits_u)) {
+                        current = model.hparams.stop_speech_token;
+                        ctrl_forced_eos = true;
+                    } else {
+                        current = is_mtl
+                            ? sample_next_token_mtl(logits_c, logits_u, generated, sp_mtl, rng,
+                                                    model.hparams.stop_speech_token)
+                            : sample_next_token(logits, generated, params, rng);
+                    }
+                    generated.push_back(current);
+                    if (current == model.hparams.stop_speech_token) { stopped_by_stop_token = true; break; }
+
+                    // Repetition cadence / budget backstop (MTL only).
+                    const t3_post_result pr = stop_ctrl.post_check(generated);
+                    if (pr.reason != t3_stop_reason::none) {
+                        if (pr.trim_tail > 0 && (int) generated.size() >= pr.trim_tail)
+                            generated.resize(generated.size() - (size_t) pr.trim_tail);
+                        ctrl_reason = pr.reason;
+                        break;
                     }
                 }
 
                 if (!generated.empty() && generated.back() == model.hparams.stop_speech_token)
                     generated.pop_back();
 
-                if (stopped_by_repetition && params.verbose) {
-                    fprintf(stderr, "  [t3 segment %zu/%zu] stopped on 2x repeated token (%d) "
-                                    "at %zu tokens; MTL end-of-speech cadence\n",
-                            si + 1, N_SEG, generated.empty() ? -1 : (int)generated.back(),
-                            generated.size());
+                if (params.verbose && (ctrl_forced_eos || ctrl_reason != t3_stop_reason::none)) {
+                    const char * why = ctrl_forced_eos                       ? "forced EOS (model argmax)"
+                                     : ctrl_reason == t3_stop_reason::repetition ? "repetition cadence"
+                                     : ctrl_reason == t3_stop_reason::budget     ? "token budget"
+                                     :                                             "?";
+                    fprintf(stderr, "  [t3 segment %zu/%zu] stop controller: %s at %zu tokens\n",
+                            si + 1, N_SEG, why, generated.size());
                 }
 
                 // Keep the longest attempt as the fallback in case every
