@@ -54,6 +54,8 @@
 #include "tts-cpp/chatterbox/s3gen_pipeline.h"
 #include "tts-cpp/supertonic/engine.h"
 #include "chatterbox_t3_internal.h"
+#include "t3_alignment_analyzer.h"
+#include "t3_mtl.h"
 #include "t3_stop_controller.h"
 #include "t3_mtl.h"
 #include "npy.h"
@@ -2074,6 +2076,23 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 rng = rng_snapshot;
                 rng.discard((size_t)attempt * 1009);   // move to a different RNG stream each retry
 
+                // QVAC-20616 Phase 2: alignment-based EOS.  Configure the
+                // in-graph probe and reset the analyzer for this segment.  The
+                // probe leaves the forward graph unchanged when alignment is
+                // disabled / unsupported (Turbo, very short text, env override,
+                // or the batched GPU path where the probe is not wired yet); the
+                // analyzer then stays dormant and the Phase 1 controller is the
+                // sole stop signal.
+                const int align_S = t3_align_begin_generation(model, (int) seg_text_tokens[si].size());
+                t3_alignment_analyzer align_az;
+                const bool align_on = (align_S > 0);
+                if (align_on) {
+                    t3_align_analyzer_params ap;
+                    ap.text_len = align_S;
+                    align_az.reset(ap);
+                }
+                bool align_forced_eos = false;
+
                 std::vector<float> logits;
                 std::vector<float> logits_c, logits_u;
                 int prompt_len = 0;
@@ -2114,13 +2133,25 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     if (!step_ok) throw std::runtime_error("step eval failed");
                     ++n_past;
 
-                    // Force EOS when the model's own argmax has preferred the
-                    // stop token for several consecutive steps but sampling
-                    // kept missing it (the dominant "rambles after the text is
-                    // done" failure mode).  See src/t3_stop_controller.h.
-                    if (is_mtl && stop_ctrl.force_eos((int) generated.size(), logits_c, logits_u)) {
-                        current = model.hparams.stop_speech_token;
+                    // QVAC-20616 Phase 2: alignment-based force-EOS.  Feed the
+                    // alignment row for the just-evaluated position (token
+                    // `current`); if the analyzer reports the text is fully
+                    // spoken (long tail / backtracking), emit the stop token
+                    // instead of sampling.  Falls back to the Phase 1
+                    // controller's EOS-confidence when the probe is unavailable.
+                    bool force_eos_now = false;
+                    if (align_on &&
+                        align_az.step(t3_align_last_row(), current) == t3_align_action::force_eos) {
+                        force_eos_now    = true;
+                        align_forced_eos = true;
+                    }
+                    if (!force_eos_now && is_mtl &&
+                        stop_ctrl.force_eos((int) generated.size(), logits_c, logits_u)) {
+                        force_eos_now   = true;
                         ctrl_forced_eos = true;
+                    }
+                    if (force_eos_now) {
+                        current = model.hparams.stop_speech_token;
                     } else {
                         current = is_mtl
                             ? sample_next_token_mtl(logits_c, logits_u, generated, sp_mtl, rng,
@@ -2140,15 +2171,19 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     }
                 }
 
+                if (align_on) t3_align_reset();
+
                 if (!generated.empty() && generated.back() == model.hparams.stop_speech_token)
                     generated.pop_back();
 
-                if (params.verbose && (ctrl_forced_eos || ctrl_reason != t3_stop_reason::none)) {
-                    const char * why = ctrl_forced_eos                       ? "forced EOS (model argmax)"
+                if (params.verbose && (align_forced_eos || ctrl_forced_eos ||
+                                       ctrl_reason != t3_stop_reason::none)) {
+                    const char * why = align_forced_eos                          ? "alignment end-of-text"
+                                     : ctrl_forced_eos                           ? "EOS confidence"
                                      : ctrl_reason == t3_stop_reason::repetition ? "repetition cadence"
                                      : ctrl_reason == t3_stop_reason::budget     ? "token budget"
                                      :                                             "?";
-                    fprintf(stderr, "  [t3 segment %zu/%zu] stop controller: %s at %zu tokens\n",
+                    fprintf(stderr, "  [t3 segment %zu/%zu] stop: %s at %zu tokens\n",
                             si + 1, N_SEG, why, generated.size());
                 }
 
