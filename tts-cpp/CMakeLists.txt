@@ -481,6 +481,7 @@ if (TTS_CPP_BUILD_TESTS)
     # DISABLED tests via tts_cpp_register_test(REQUIRES ...).
     set(_tcb_t3_turbo_gguf      "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-t3-turbo.gguf")
     set(_tcb_t3_mtl_gguf        "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-t3-mtl.gguf")
+    set(_tcb_t3_mtl_q4_gguf     "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-t3-mtl-q4_0.gguf")
     set(_tcb_s3gen_gguf         "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-s3gen.gguf")
     set(_tcb_s3gen_mtl_gguf     "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-s3gen-mtl.gguf")
     set(_tcb_super_gguf         "${TTS_CPP_TEST_MODEL_DIR}/supertonic.gguf")
@@ -763,6 +764,22 @@ if (TTS_CPP_BUILD_TESTS)
                      --lang          "en"
                      --tmp           "${_mtl_out_dir}"
             REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}")
+
+        # QVAC-20616 #3: same round-trip on the quantized (Q4_0) T3 the mobile
+        # app ships, to confirm the aligned heads still track under
+        # quantization.  Uses the f16 S3Gen (the S3Gen Q4_0 path is a separate
+        # converter limitation).  Auto-disabled until the Q4_0 T3 GGUF exists.
+        tts_cpp_register_test(test-eos-roundtrip-q4_0
+            EXE      test-eos-roundtrip
+            LABEL    "fixture;asr"
+            ARGS     --tts-cli       "$<TARGET_FILE:tts-cli>"
+                     --t3            "${_tcb_t3_mtl_q4_gguf}"
+                     --s3gen         "${_tcb_s3gen_mtl_gguf}"
+                     --whisper-cli   "${WHISPER_CLI}"
+                     --whisper-model "${WHISPER_MODEL}"
+                     --lang          "en"
+                     --tmp           "${_mtl_out_dir}"
+            REQUIRES "${_tcb_t3_mtl_q4_gguf}" "${_tcb_s3gen_mtl_gguf}")
     else()
         message(STATUS "tts-cpp: test-eos-roundtrip built but not registered (needs whisper-cli + model + tts-cli)")
     endif()
