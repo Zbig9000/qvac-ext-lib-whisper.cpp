@@ -215,6 +215,28 @@ void test_budget() {
     CHECK(r.trim_tail == 0, "budget never trims");
 }
 
+void test_small_input_no_premature_stop() {
+    // Very small inputs (e.g. text below the alignment analyzer's min length)
+    // are handled by this controller.  A tiny utterance must never be
+    // force-stopped below the min-token floor, even if the model's argmax is
+    // already the stop token and tokens repeat — otherwise the word is clipped.
+    t3_stop_params p = base_params();
+    p.min_tokens = 16;                          // production floor
+    t3_stop_controller c;
+    c.reset(p);
+    const std::vector<float> empty;
+    const auto eos = logits_with_argmax(EOS);    // model "wants" to stop every step
+    std::vector<int32_t> g;
+    bool forced = false, posted = false;
+    for (int i = 0; i < 12; ++i) {               // 12 tokens, all below the 16 floor
+        if (c.force_eos((int) g.size(), eos, empty)) forced = true;
+        g.push_back(7);                          // identical tokens (would be repetition if not floored)
+        if (c.post_check(g).reason != t3_stop_reason::none) posted = true;
+    }
+    CHECK(!forced, "tiny utterance: EOS-confidence must not fire below min_tokens (no clip)");
+    CHECK(!posted, "tiny utterance: repetition/budget must not fire below min_tokens (no clip)");
+}
+
 void test_disabled_preserves_turbo() {
     t3_stop_params p;                        // default: enabled == false
     t3_stop_controller c;
@@ -283,6 +305,7 @@ int main() {
     test_repetition_below_floor();
     test_no_false_repetition();
     test_budget();
+    test_small_input_no_premature_stop();
     test_disabled_preserves_turbo();
     test_make_mtl_params_budget_scaling();
     test_make_mtl_params_env_overrides();
