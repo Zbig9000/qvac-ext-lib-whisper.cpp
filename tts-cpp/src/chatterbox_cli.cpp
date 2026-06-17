@@ -2175,6 +2175,15 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     fprintf(stderr, "  [t3 segment %zu/%zu] stop: %s at %zu tokens\n",
                             si + 1, N_SEG, why, generated.size());
                 }
+                // Self-check observability: alignment was active but never
+                // reached end-of-text -> the probed heads may not be tracking
+                // alignment for this model (we relied on the Phase 1 fallback).
+                if (params.verbose && align_on && !align_az.complete() &&
+                    generated.size() > 8) {
+                    fprintf(stderr, "  [t3 segment %zu/%zu] note: alignment never completed; "
+                                    "relied on fallback (aligned heads may need recalibration)\n",
+                            si + 1, N_SEG);
+                }
 
                 // Keep the longest attempt as the fallback in case every
                 // retry still comes out short.

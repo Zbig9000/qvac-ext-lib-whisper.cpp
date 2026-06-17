@@ -23,6 +23,7 @@
 
 #include "chatterbox_t3_internal.h"
 #include "t3_mtl.h"
+#include "t3_alignment_analyzer.h"
 
 #include "backend_util.h"
 #include "ggml.h"
@@ -1462,10 +1463,21 @@ int t3_align_begin_generation(const chatterbox_model & model, int n_text_tokens)
     // Very short inputs do not produce a reliable monotonic alignment; leave
     // them to the natural stop token + the Phase 1 controller.
     if (n_text_tokens < 6) { t3_align_reset(); return 0; }
+    // Self-check: only probe (layer, head) pairs that exist in this model.  A
+    // future conversion that shrinks or permutes the layer/head geometry would
+    // leave no valid heads -> disable alignment and fall back to Phase 1 rather
+    // than read out-of-range KV/Q tensors.
+    auto heads = t3_align_valid_heads(model.hparams.n_layer, model.hparams.n_head);
+    if (heads.empty()) {
+        fprintf(stderr, "t3_align: no in-range aligned heads for n_layer=%d n_head=%d; "
+                        "alignment disabled (Phase 1 controller still active)\n",
+                model.hparams.n_layer, model.hparams.n_head);
+        t3_align_reset();
+        return 0;
+    }
     const int len_cond = 1 + model.hparams.perceiver_queries
                        + (model.hparams.emotion_adv ? 1 : 0);
-    t3_align_configure(/*enabled=*/true, len_cond, len_cond + n_text_tokens,
-                       {{9, 2}, {12, 15}, {13, 11}});
+    t3_align_configure(/*enabled=*/true, len_cond, len_cond + n_text_tokens, heads);
     return n_text_tokens;
 }
 
