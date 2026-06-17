@@ -1,8 +1,38 @@
 #include "t3_alignment_analyzer.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <unordered_map>
 
 namespace tts_cpp::chatterbox::detail {
+
+namespace {
+
+int env_int(const char * name, int fallback) {
+    const char * v = std::getenv(name);
+    if (!v || v[0] == '\0') return fallback;
+    char * end = nullptr;
+    long parsed = std::strtol(v, &end, 10);
+    return end == v ? fallback : (int) parsed;
+}
+
+float env_float(const char * name, float fallback) {
+    const char * v = std::getenv(name);
+    if (!v || v[0] == '\0') return fallback;
+    char * end = nullptr;
+    float parsed = std::strtof(v, &end);
+    return end == v ? fallback : parsed;
+}
+
+bool env_is_false(const char * name) {
+    const char * v = std::getenv(name);
+    if (!v || v[0] == '\0') return false;
+    return std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+           std::strcmp(v, "off") == 0;
+}
+
+} // namespace
 
 void t3_alignment_analyzer::reset(const t3_align_analyzer_params & p) {
     p_             = p;
@@ -100,6 +130,38 @@ t3_align_action t3_alignment_analyzer::step(const std::vector<float> & row,
         return t3_align_action::suppress_eos;
     }
     return t3_align_action::none;
+}
+
+t3_align_analyzer_params t3_align_params_for_language(const std::string & lang, int text_len) {
+    // Start from the English-validated defaults.
+    t3_align_analyzer_params p;
+    p.text_len = text_len;
+
+    // Per-language calibration table.  The defaults were validated on English
+    // (round-trip ASR WER ~1.4%); other languages can expand differently
+    // (e.g. resemble-ai/chatterbox #519 notes German needs more lenient
+    // long-tail thresholds).  Populate an entry to tune a language; absent
+    // languages fall back to the validated defaults.  Kept explicit + data-
+    // driven rather than guessing numbers without per-language ground truth.
+    struct LangCal { int complete_margin; float long_tail; float rep_thresh; };
+    static const std::unordered_map<std::string, LangCal> kTable = {
+        // {"de", {3, 8.0f, 6.0f}},  // example: looser long-tail for German
+    };
+    auto it = kTable.find(lang);
+    if (it != kTable.end()) {
+        p.complete_margin  = it->second.complete_margin;
+        p.long_tail_thresh = it->second.long_tail;
+        p.rep_thresh       = it->second.rep_thresh;
+    }
+
+    // Environment overrides (on-device tuning without a recompile).
+    p.complete_margin     = env_int  ("CHATTERBOX_ALIGN_COMPLETE_MARGIN", p.complete_margin);
+    p.long_tail_thresh    = env_float("CHATTERBOX_ALIGN_LONG_TAIL",       p.long_tail_thresh);
+    p.rep_thresh          = env_float("CHATTERBOX_ALIGN_REP_THRESH",      p.rep_thresh);
+    p.min_text_len        = env_int  ("CHATTERBOX_ALIGN_MIN_TEXT",        p.min_text_len);
+    if (env_is_false("CHATTERBOX_ALIGN_SUPPRESS")) p.suppress_eos_enabled = false;
+
+    return p;
 }
 
 } // namespace tts_cpp::chatterbox::detail

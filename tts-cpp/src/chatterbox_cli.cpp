@@ -2078,9 +2078,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 t3_alignment_analyzer align_az;
                 const bool align_on = (align_S > 0);
                 if (align_on) {
-                    t3_align_analyzer_params ap;
-                    ap.text_len = align_S;
-                    align_az.reset(ap);
+                    align_az.reset(t3_align_params_for_language(params.language, align_S));
                 }
                 bool align_forced_eos = false;
 

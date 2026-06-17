@@ -14,6 +14,7 @@
 #include "t3_alignment_analyzer.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 using namespace tts_cpp::chatterbox::detail;
@@ -184,6 +185,36 @@ void test_short_text_and_empty_row_noop() {
           "empty alignment row must be a no-op");
 }
 
+void test_params_for_language() {
+    // Defaults (English-validated) for a known and an unknown language.
+    for (const char * lang : {"en", "xx"}) {
+        t3_align_analyzer_params p = t3_align_params_for_language(lang, 20);
+        CHECK(p.text_len == 20, "%s: text_len propagated", lang);
+        CHECK(p.complete_margin == 3, "%s: default complete_margin", lang);
+        CHECK(p.long_tail_thresh == 5.0f, "%s: default long_tail", lang);
+        CHECK(p.rep_thresh == 5.0f, "%s: default rep_thresh", lang);
+        CHECK(p.min_text_len == 6, "%s: default min_text_len", lang);
+        CHECK(p.suppress_eos_enabled, "%s: suppress on by default", lang);
+    }
+
+    // Environment overrides (on-device tuning).
+    setenv("CHATTERBOX_ALIGN_COMPLETE_MARGIN", "2", 1);
+    setenv("CHATTERBOX_ALIGN_LONG_TAIL", "9.5", 1);
+    setenv("CHATTERBOX_ALIGN_MIN_TEXT", "10", 1);
+    setenv("CHATTERBOX_ALIGN_SUPPRESS", "0", 1);
+    {
+        t3_align_analyzer_params p = t3_align_params_for_language("en", 20);
+        CHECK(p.complete_margin == 2, "env complete_margin override");
+        CHECK(p.long_tail_thresh == 9.5f, "env long_tail override");
+        CHECK(p.min_text_len == 10, "env min_text override");
+        CHECK(!p.suppress_eos_enabled, "env suppress disable");
+    }
+    unsetenv("CHATTERBOX_ALIGN_COMPLETE_MARGIN");
+    unsetenv("CHATTERBOX_ALIGN_LONG_TAIL");
+    unsetenv("CHATTERBOX_ALIGN_MIN_TEXT");
+    unsetenv("CHATTERBOX_ALIGN_SUPPRESS");
+}
+
 } // namespace
 
 int main() {
@@ -193,6 +224,7 @@ int main() {
     test_token_repetition_gated_by_complete();
     test_small_input_not_clipped();
     test_suppress_eos_midtext();
+    test_params_for_language();
     test_short_text_and_empty_row_noop();
 
     fprintf(stderr, "\n%s: %d/%d checks passed\n",
