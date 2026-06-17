@@ -547,11 +547,10 @@ struct Engine::Impl {
                 throw std::runtime_error("Engine: T3 step eval failed");
             }
             ++n_past;
-            bool force_eos_now = false;
-            if (align_on &&
-                align_az.step(t3_align_last_row(), current) == t3_align_action::force_eos) {
-                force_eos_now = true;
-            }
+            const t3_align_action aa = align_on
+                ? align_az.step(t3_align_last_row(), current)
+                : t3_align_action::none;
+            bool force_eos_now = (aa == t3_align_action::force_eos);
             if (!force_eos_now && is_mtl &&
                 stop_ctrl.force_eos((int) generated.size(), logits_c, logits_u)) {
                 force_eos_now = true;
@@ -559,9 +558,10 @@ struct Engine::Impl {
             if (force_eos_now) {
                 current = model.hparams.stop_speech_token;
             } else {
+                const bool suppress = (aa == t3_align_action::suppress_eos);
                 current = is_mtl
                     ? sample_next_token_mtl(logits_c, logits_u, generated, sp, rng,
-                                            model.hparams.stop_speech_token)
+                                            model.hparams.stop_speech_token, suppress)
                     : sample_next_token_ex(logits, generated, sp, rng);
             }
             generated.push_back(current);

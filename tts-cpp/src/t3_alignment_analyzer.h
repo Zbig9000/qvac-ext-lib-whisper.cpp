@@ -53,6 +53,12 @@ struct t3_align_analyzer_params {
     int   min_text_len = 6;
 
     bool  enabled = true;
+
+    // When true, `step` may return `suppress_eos` while the text is still being
+    // spoken so the caller can stop the model from terminating early (the
+    // "dropped first/last word / near-empty output" failure mode).  When false
+    // the analyzer only ever forces EOS; it never suppresses.
+    bool  suppress_eos_enabled = true;
 };
 
 enum class t3_align_action {

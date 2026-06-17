@@ -96,7 +96,7 @@ t3_align_action t3_alignment_analyzer::step(const std::vector<float> & row,
         return t3_align_action::force_eos;
     }
     // Not yet near the end: tell the caller to hold off on an early stop.
-    if (cur < S - p_.complete_margin && S > p_.min_text_len) {
+    if (p_.suppress_eos_enabled && cur < S - p_.complete_margin && S > p_.min_text_len) {
         return t3_align_action::suppress_eos;
     }
     return t3_align_action::none;

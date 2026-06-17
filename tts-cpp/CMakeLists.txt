@@ -613,6 +613,14 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_apply_ccache(test-t3-alignment-analyzer)
     tts_cpp_register_test(test-t3-alignment-analyzer LABEL "cpu")
 
+    # QVAC-20616 #1: MTL sampler EOS-suppression.  Pure logit math but links the
+    # library (sample_next_token_mtl lives in the t3_mtl TU); no model required.
+    add_executable(test-mtl-sampler test/test_mtl_sampler.cpp)
+    target_link_libraries(test-mtl-sampler PRIVATE tts-cpp ggml tts-cpp-backend-defs)
+    target_include_directories(test-mtl-sampler PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-mtl-sampler)
+    tts_cpp_register_test(test-mtl-sampler LABEL "cpu")
+
     add_executable(test-mtl-tokenizer test/test_mtl_tokenizer.cpp)
     target_link_libraries(test-mtl-tokenizer PRIVATE tts-cpp)
     target_include_directories(test-mtl-tokenizer PRIVATE src)
