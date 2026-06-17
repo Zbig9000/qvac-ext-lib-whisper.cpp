@@ -743,6 +743,30 @@ if (TTS_CPP_BUILD_TESTS)
         endif()
     endforeach()
 
+    # QVAC-20616 #2: end-to-end EOS round-trip regression.  Drives tts-cli to
+    # synthesize a set of English phrases, transcribes with whisper-cli, and
+    # asserts the transcription is close to the input (CER guard -> catches
+    # clipping) and not much longer (ramble guard -> catches the trailing-token
+    # bug re-appearing).  Pure orchestration; auto-disabled unless the MTL
+    # GGUFs + whisper-cli + a Whisper model + tts-cli are all present.
+    add_executable(test-eos-roundtrip test/test_eos_roundtrip.cpp)
+    target_include_directories(test-eos-roundtrip PRIVATE src)
+    tts_cpp_apply_ccache(test-eos-roundtrip)
+    if (_mtl_asr_enabled AND TARGET tts-cli)
+        tts_cpp_register_test(test-eos-roundtrip
+            LABEL    "fixture;asr"
+            ARGS     --tts-cli       "$<TARGET_FILE:tts-cli>"
+                     --t3            "${_tcb_t3_mtl_gguf}"
+                     --s3gen         "${_tcb_s3gen_mtl_gguf}"
+                     --whisper-cli   "${WHISPER_CLI}"
+                     --whisper-model "${WHISPER_MODEL}"
+                     --lang          "en"
+                     --tmp           "${_mtl_out_dir}"
+            REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}")
+    else()
+        message(STATUS "tts-cpp: test-eos-roundtrip built but not registered (needs whisper-cli + model + tts-cli)")
+    endif()
+
     add_executable(test-streaming
         test/test_streaming.cpp
         src/chatterbox_tts.cpp
