@@ -2035,11 +2035,18 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
                               const std::vector<int32_t> & generated,
                               const chatterbox_sampling_params & p,
                               std::mt19937 & rng,
-                              int32_t stop_token) {
+                              int32_t stop_token,
+                              bool suppress_stop_token) {
     const size_t V = logits_cond.size();
     std::vector<float> l(V);
     for (size_t i = 0; i < V; ++i) {
         l[i] = logits_cond[i] + p.cfg_weight * (logits_cond[i] - logits_uncond[i]);
+    }
+
+    // QVAC-20616: hard-suppress the stop token while the text is mid-utterance
+    // so sampling cannot terminate before the alignment reaches the end.
+    if (suppress_stop_token && stop_token >= 0 && (size_t) stop_token < V) {
+        l[(size_t) stop_token] = -INFINITY;
     }
 
     if (p.repeat_penalty != 1.0f) {

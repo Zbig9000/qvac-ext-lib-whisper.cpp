@@ -142,6 +142,32 @@ void test_small_input_not_clipped() {
     }
 }
 
+void test_suppress_eos_midtext() {
+    const int S = 13;
+    // Default (suppress enabled): while still mid-text (alignment far from the
+    // end) the analyzer asks the caller to hold off on stopping -> anti early
+    // truncation.
+    {
+        t3_alignment_analyzer az;
+        az.reset(params(S));
+        t3_align_action a = t3_align_action::none;
+        for (int f = 0; f < 5; ++f) a = az.step(row_at(S, f), 600 + f);  // cur = 0..4 < S-3
+        CHECK(a == t3_align_action::suppress_eos,
+              "mid-text should request EOS suppression (anti-truncation)");
+        CHECK(!az.complete(), "must not be complete mid-text");
+    }
+    // suppress_eos_enabled = false: analyzer never suppresses (only forces).
+    {
+        t3_align_analyzer_params p = params(S);
+        p.suppress_eos_enabled = false;
+        t3_alignment_analyzer az;
+        az.reset(p);
+        t3_align_action a = t3_align_action::none;
+        for (int f = 0; f < 5; ++f) a = az.step(row_at(S, f), 600 + f);
+        CHECK(a == t3_align_action::none, "suppress disabled -> none mid-text");
+    }
+}
+
 void test_short_text_and_empty_row_noop() {
     // Short text (< min_text_len) -> disabled.
     t3_alignment_analyzer az;
@@ -166,6 +192,7 @@ int main() {
     test_ramble_backtrack_forces();
     test_token_repetition_gated_by_complete();
     test_small_input_not_clipped();
+    test_suppress_eos_midtext();
     test_short_text_and_empty_row_noop();
 
     fprintf(stderr, "\n%s: %d/%d checks passed\n",

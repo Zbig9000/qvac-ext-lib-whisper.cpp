@@ -2130,12 +2130,11 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     // spoken (long tail / backtracking), emit the stop token
                     // instead of sampling.  Falls back to the Phase 1
                     // controller's EOS-confidence when the probe is unavailable.
-                    bool force_eos_now = false;
-                    if (align_on &&
-                        align_az.step(t3_align_last_row(), current) == t3_align_action::force_eos) {
-                        force_eos_now    = true;
-                        align_forced_eos = true;
-                    }
+                    const t3_align_action aa = align_on
+                        ? align_az.step(t3_align_last_row(), current)
+                        : t3_align_action::none;
+                    bool force_eos_now = (aa == t3_align_action::force_eos);
+                    if (force_eos_now) align_forced_eos = true;
                     if (!force_eos_now && is_mtl &&
                         stop_ctrl.force_eos((int) generated.size(), logits_c, logits_u)) {
                         force_eos_now   = true;
@@ -2144,9 +2143,10 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     if (force_eos_now) {
                         current = model.hparams.stop_speech_token;
                     } else {
+                        const bool suppress = (aa == t3_align_action::suppress_eos);
                         current = is_mtl
                             ? sample_next_token_mtl(logits_c, logits_u, generated, sp_mtl, rng,
-                                                    model.hparams.stop_speech_token)
+                                                    model.hparams.stop_speech_token, suppress)
                             : sample_next_token(logits, generated, params, rng);
                     }
                     generated.push_back(current);
