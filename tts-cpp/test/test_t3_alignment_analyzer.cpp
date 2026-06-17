@@ -118,6 +118,30 @@ void test_token_repetition_gated_by_complete() {
     CHECK(!forced, "repeated token mid-text must NOT force EOS (avoids #587 early cut)");
 }
 
+void test_small_input_not_clipped() {
+    // A very small input (smallest text length the analyzer acts on, e.g. "Hi."
+    // => SOT + graphemes + EOT) must never be cut before its alignment reaches
+    // the end of the text — i.e. force-EOS must not fire before `complete`.
+    // That is the structural no-clipping guarantee (verified end-to-end on the
+    // model: align-on speech-end == natural speech-end for "Hi.", "Yes.", ...).
+    for (int S = 6; S <= 8; ++S) {
+        t3_alignment_analyzer az;
+        az.reset(params(S));
+        int force_frame = -1, complete_frame = -1;
+        for (int f = 0; f < 30; ++f) {
+            const int peak = f < S - 1 ? f : S - 1;   // climb to the last col, then dwell
+            t3_align_action a = az.step(row_at(S, peak), /*token=*/500 + (f % 5));
+            if (complete_frame < 0 && az.complete()) complete_frame = f;
+            if (force_frame < 0 && a == t3_align_action::force_eos) force_frame = f;
+        }
+        CHECK(complete_frame >= 0, "S=%d: short input should reach completion", S);
+        CHECK(force_frame >= 0, "S=%d: short input should eventually stop", S);
+        CHECK(force_frame > complete_frame,
+              "S=%d: must NOT force before completion (no clip): force=%d complete=%d",
+              S, force_frame, complete_frame);
+    }
+}
+
 void test_short_text_and_empty_row_noop() {
     // Short text (< min_text_len) -> disabled.
     t3_alignment_analyzer az;
@@ -141,6 +165,7 @@ int main() {
     test_healthy_long_tail_forces_after_completion();
     test_ramble_backtrack_forces();
     test_token_repetition_gated_by_complete();
+    test_small_input_not_clipped();
     test_short_text_and_empty_row_noop();
 
     fprintf(stderr, "\n%s: %d/%d checks passed\n",
