@@ -19,6 +19,7 @@
 // (see test/test_t3_alignment_analyzer.cpp).
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace tts_cpp::chatterbox::detail {
@@ -100,5 +101,19 @@ private:
 
     std::vector<int32_t> recent_tokens_;
 };
+
+// Build calibrated analyzer params for a generation in the given language.
+// Starts from the English-validated defaults, applies any per-language
+// calibration entry (the table is structured so a language can be tuned with
+// a one-line edit; all languages currently use the validated defaults), then
+// applies CHATTERBOX_ALIGN_* environment overrides for on-device tuning
+// without a recompile:
+//   CHATTERBOX_ALIGN_COMPLETE_MARGIN (int)
+//   CHATTERBOX_ALIGN_LONG_TAIL       (float)
+//   CHATTERBOX_ALIGN_REP_THRESH      (float)
+//   CHATTERBOX_ALIGN_MIN_TEXT        (int)
+//   CHATTERBOX_ALIGN_SUPPRESS        (0 disables EOS suppression)
+// `text_len` is the alignment row length (number of text tokens).
+t3_align_analyzer_params t3_align_params_for_language(const std::string & lang, int text_len);
 
 } // namespace tts_cpp::chatterbox::detail
