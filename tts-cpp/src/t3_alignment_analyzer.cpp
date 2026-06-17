@@ -164,4 +164,17 @@ t3_align_analyzer_params t3_align_params_for_language(const std::string & lang, 
     return p;
 }
 
+std::vector<std::pair<int, int>> t3_align_valid_heads(int n_layer, int n_head) {
+    // LLAMA_ALIGNED_HEADS from the reference; the converter preserves head
+    // ordering, so these map directly to our GGUF.
+    static const std::pair<int, int> kRef[] = {{9, 2}, {12, 15}, {13, 11}};
+    std::vector<std::pair<int, int>> out;
+    for (const auto & h : kRef) {
+        if (h.first >= 0 && h.first < n_layer && h.second >= 0 && h.second < n_head) {
+            out.push_back(h);
+        }
+    }
+    return out;
+}
+
 } // namespace tts_cpp::chatterbox::detail

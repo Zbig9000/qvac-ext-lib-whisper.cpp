@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tts_cpp::chatterbox::detail {
@@ -115,5 +116,13 @@ private:
 //   CHATTERBOX_ALIGN_SUPPRESS        (0 disables EOS suppression)
 // `text_len` is the alignment row length (number of text tokens).
 t3_align_analyzer_params t3_align_params_for_language(const std::string & lang, int text_len);
+
+// Reference aligned (layer, head) pairs (LLAMA_ALIGNED_HEADS from
+// resemble-ai/chatterbox), filtered to those valid for a model with `n_layer`
+// layers and `n_head` attention heads.  Returns the in-range subset; an empty
+// result (e.g. a model too small, or a future conversion that changed the
+// layer/head geometry) signals the caller to disable the alignment probe and
+// fall back to the Phase 1 controller rather than reading out-of-range tensors.
+std::vector<std::pair<int, int>> t3_align_valid_heads(int n_layer, int n_head);
 
 } // namespace tts_cpp::chatterbox::detail

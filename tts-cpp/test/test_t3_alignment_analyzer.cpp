@@ -215,6 +215,19 @@ void test_params_for_language() {
     unsetenv("CHATTERBOX_ALIGN_SUPPRESS");
 }
 
+void test_valid_heads() {
+    // Full MTL geometry: all 3 reference heads valid.
+    CHECK(t3_align_valid_heads(30, 16).size() == 3, "full model -> 3 aligned heads");
+    // 13 layers: the layer-13 head (13,11) drops out.
+    CHECK(t3_align_valid_heads(13, 16).size() == 2, "13 layers -> 2 heads");
+    // Too few layers for any reference head -> empty -> alignment disabled.
+    CHECK(t3_align_valid_heads(9, 16).empty(), "9 layers -> no aligned heads");
+    // Fewer heads: only (9,2) survives a head<11 model.
+    CHECK(t3_align_valid_heads(30, 11).size() == 1, "11 heads -> only (9,2)");
+    // Degenerate geometry.
+    CHECK(t3_align_valid_heads(0, 0).empty(), "0x0 -> empty");
+}
+
 } // namespace
 
 int main() {
@@ -225,6 +238,7 @@ int main() {
     test_small_input_not_clipped();
     test_suppress_eos_midtext();
     test_params_for_language();
+    test_valid_heads();
     test_short_text_and_empty_row_noop();
 
     fprintf(stderr, "\n%s: %d/%d checks passed\n",
