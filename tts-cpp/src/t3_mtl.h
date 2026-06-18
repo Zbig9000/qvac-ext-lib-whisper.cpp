@@ -15,7 +15,7 @@
 namespace tts_cpp::chatterbox::detail {
 
 // ---------------------------------------------------------------------------
-// QVAC-20616 Phase 2: text<->speech alignment probe.
+// Phase 2: text<->speech alignment probe.
 //
 // Some self-attention heads of the T3 Llama backbone implicitly solve the
 // monotonic text->speech alignment.  The Python reference

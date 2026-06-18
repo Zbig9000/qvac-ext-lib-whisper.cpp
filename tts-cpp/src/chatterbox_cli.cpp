@@ -2061,7 +2061,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             constexpr int MAX_RETRIES = 3;
             auto rng_snapshot = rng;
 
-            // QVAC-20616: shared end-of-speech stop controller (same logic as
+            // Shared end-of-speech stop controller (same logic as
             // chatterbox::Engine::run_t3).  Disabled for Turbo so that path is
             // unchanged.  Params depend only on the (constant-across-retries)
             // segment text length, so build once and reset per attempt.
@@ -2076,7 +2076,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 rng = rng_snapshot;
                 rng.discard((size_t)attempt * 1009);   // move to a different RNG stream each retry
 
-                // QVAC-20616 Phase 2: alignment-based EOS.  Configure the
+                // Phase 2: alignment-based EOS.  Configure the
                 // in-graph probe and reset the analyzer for this segment.  The
                 // probe leaves the forward graph unchanged when alignment is
                 // disabled / unsupported (Turbo, very short text, env override,
@@ -2131,7 +2131,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     if (!step_ok) throw std::runtime_error("step eval failed");
                     ++n_past;
 
-                    // QVAC-20616 Phase 2: alignment-based force-EOS.  Feed the
+                    // Phase 2: alignment-based force-EOS.  Feed the
                     // alignment row for the just-evaluated position (token
                     // `current`); if the analyzer reports the text is fully
                     // spoken (long tail / backtracking), emit the stop token

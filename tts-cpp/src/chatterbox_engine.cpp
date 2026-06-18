@@ -497,7 +497,7 @@ struct Engine::Impl {
         std::vector<int32_t> generated;
         generated.reserve((size_t) opts.n_predict + 1);
 
-        // QVAC-20616: attention-free end-of-speech stop controller.  The MTL
+        // Attention-free end-of-speech stop controller.  The MTL
         // T3 often fails to emit stop_speech_token after it has finished the
         // input text and rambles — a repeated near-silent cadence (audible as
         // gutural / empty sounds) or fresh hallucinated content — until it
@@ -514,7 +514,7 @@ struct Engine::Impl {
                                    (int) text_tokens.size(), opts.n_predict)
             : t3_stop_params{});
 
-        // QVAC-20616 Phase 2: alignment-based EOS (primary signal on the CPU
+        // Phase 2: alignment-based EOS (primary signal on the CPU
         // path).  Configures the in-graph probe; a no-op (graph unchanged) for
         // Turbo / short text / the batched GPU path, where the Phase 1
         // controller above remains the stop signal.

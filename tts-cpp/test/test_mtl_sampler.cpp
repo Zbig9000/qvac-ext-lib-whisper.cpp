@@ -1,4 +1,4 @@
-// Unit test for the MTL sampler's EOS-suppression option (QVAC-20616 Phase 2,
+// Unit test for the MTL sampler's EOS-suppression option (Phase 2,
 // improvement #1).  Pure logit math — no model load — but it links libtts-cpp
 // because sample_next_token_mtl lives in the t3_mtl translation unit.
 //

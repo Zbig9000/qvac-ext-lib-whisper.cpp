@@ -595,7 +595,7 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}/wav_16k.npy" "${_tcb_s3gen_ref}/log_mel.npy" "${_tcb_s3gen_ref}/speech_tokens.npy"
         REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}/wav_16k.npy" "${_tcb_s3gen_ref}/log_mel.npy" "${_tcb_s3gen_ref}/speech_tokens.npy")
 
-    # QVAC-20616: attention-free end-of-speech stop controller.  Pure host
+    # Attention-free end-of-speech stop controller.  Pure host
     # logic with no model / ggml dependency, so it links only its own source
     # and always runs (no fixture REQUIRES).
     add_executable(test-t3-stop-controller
@@ -605,7 +605,7 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_apply_ccache(test-t3-stop-controller)
     tts_cpp_register_test(test-t3-stop-controller LABEL "cpu")
 
-    # QVAC-20616 Phase 2: alignment analyzer state machine.  Pure host logic,
+    # Phase 2: alignment analyzer state machine.  Pure host logic,
     # no model / ggml dependency, so it always runs.
     add_executable(test-t3-alignment-analyzer
         test/test_t3_alignment_analyzer.cpp
@@ -614,7 +614,7 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_apply_ccache(test-t3-alignment-analyzer)
     tts_cpp_register_test(test-t3-alignment-analyzer LABEL "cpu")
 
-    # QVAC-20616 #1: MTL sampler EOS-suppression.  Pure logit math but links the
+    # MTL sampler EOS-suppression.  Pure logit math but links the
     # library (sample_next_token_mtl lives in the t3_mtl TU); no model required.
     add_executable(test-mtl-sampler test/test_mtl_sampler.cpp)
     target_link_libraries(test-mtl-sampler PRIVATE tts-cpp ggml tts-cpp-backend-defs)
@@ -744,7 +744,7 @@ if (TTS_CPP_BUILD_TESTS)
         endif()
     endforeach()
 
-    # QVAC-20616 #2: end-to-end EOS round-trip regression.  Drives tts-cli to
+    # End-to-end EOS round-trip regression.  Drives tts-cli to
     # synthesize a set of English phrases, transcribes with whisper-cli, and
     # asserts the transcription is close to the input (CER guard -> catches
     # clipping) and not much longer (ramble guard -> catches the trailing-token
@@ -765,7 +765,7 @@ if (TTS_CPP_BUILD_TESTS)
                      --tmp           "${_mtl_out_dir}"
             REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}")
 
-        # QVAC-20616 #3: same round-trip on the quantized (Q4_0) T3 the mobile
+        # Same round-trip on the quantized (Q4_0) T3 the mobile
         # app ships, to confirm the aligned heads still track under
         # quantization.  Uses the f16 S3Gen (the S3Gen Q4_0 path is a separate
         # converter limitation).  Auto-disabled until the Q4_0 T3 GGUF exists.

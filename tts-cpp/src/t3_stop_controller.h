@@ -1,7 +1,7 @@
 #pragma once
 
 // Robust end-of-speech stop controller for the Chatterbox T3 autoregressive
-// decode loop (QVAC-20616).
+// decode loop.
 //
 // Background
 // ----------

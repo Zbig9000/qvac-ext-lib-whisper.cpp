@@ -1,6 +1,6 @@
 #pragma once
 
-// QVAC-20616 Phase 2: text<->speech alignment analyzer.
+// Phase 2: text<->speech alignment analyzer.
 //
 // Host-side port of resemble-ai/chatterbox's AlignmentStreamAnalyzer.step
 // (src/chatterbox/models/t3/inference/alignment_stream_analyzer.py).  It

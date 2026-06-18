@@ -1,4 +1,4 @@
-// Unit tests for the host-side T3 alignment analyzer (QVAC-20616 Phase 2).
+// Unit tests for the host-side T3 alignment analyzer (Phase 2).
 // Pure logic, no model/ggml dependency:
 //
 //   g++ -std=c++17 -I src test/test_t3_alignment_analyzer.cpp src/t3_alignment_analyzer.cpp -o /tmp/t && /tmp/t

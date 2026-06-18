@@ -50,7 +50,7 @@ namespace tts_cpp::chatterbox::detail {
 namespace {
 
 // ---------------------------------------------------------------------------
-// QVAC-20616 Phase 2: alignment-probe state (thread-local, one generation per
+// Phase 2: alignment-probe state (thread-local, one generation per
 // thread).  Set via t3_align_configure(); read back via t3_align_last_row().
 // See t3_mtl.h for the rationale.
 // ---------------------------------------------------------------------------
@@ -672,7 +672,7 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
                       HD, rope_mode, hp.rope_orig_max_pos,
                       hp.rope_theta, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 
-    // QVAC-20616 Phase 2: alignment probe (cond pass, B==1 only).  Recompute
+    // Phase 2: alignment probe (cond pass, B==1 only).  Recompute
     // softmax(scale * q . K_text^T) over the text-token key columns for the
     // configured (layer, head) and export it as "align_L<il>".  Uses the
     // post-RoPE Q/K (pre-permute) so it matches what flash-attention consumes.
@@ -1355,7 +1355,7 @@ bool run_step_pass_b2(const chatterbox_model & model,
     ggml_backend_tensor_get(logits, logits_cond_out.data(),   0,                per_batch_bytes);
     ggml_backend_tensor_get(logits, logits_uncond_out.data(), per_batch_bytes, per_batch_bytes);
 
-    // QVAC-20616 Phase 2: capture the cond-batch (b=0) alignment row from the
+    // Phase 2: capture the cond-batch (b=0) alignment row from the
     // batched GPU step graph so the analyzer works on Metal/Vulkan/OpenCL too.
     if (g_t3_align.enabled) {
         t3_align_capture_from_graph(gf);
@@ -1426,7 +1426,7 @@ bool run_step_pass(const chatterbox_model & model,
 
 } // namespace
 
-// -- QVAC-20616 Phase 2 alignment-probe hooks (see t3_mtl.h) ----------------
+// -- Phase 2 alignment-probe hooks (see t3_mtl.h) ----------------
 
 void t3_align_configure(bool enabled, int text_i, int text_j,
                         const std::vector<std::pair<int, int>> & layer_heads) {
@@ -2055,7 +2055,7 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
         l[i] = logits_cond[i] + p.cfg_weight * (logits_cond[i] - logits_uncond[i]);
     }
 
-    // QVAC-20616: hard-suppress the stop token while the text is mid-utterance
+    // Hard-suppress the stop token while the text is mid-utterance
     // so sampling cannot terminate before the alignment reaches the end.
     if (suppress_stop_token && stop_token >= 0 && (size_t) stop_token < V) {
         l[(size_t) stop_token] = -INFINITY;

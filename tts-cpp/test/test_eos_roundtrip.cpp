@@ -1,4 +1,4 @@
-// QVAC-20616 round-trip regression test: synthesize -> ASR -> compare.
+// End-to-end round-trip regression test: synthesize -> ASR -> compare.
 //
 // This is the end-to-end guard for the end-of-speech fix.  For a fixed set of
 // English phrases it drives `tts-cli` to synthesize a wav, transcribes it with

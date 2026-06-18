@@ -361,7 +361,7 @@ void t3_release_caches();
 // cascade), returns `stop_token` so the caller's stop check fires cleanly
 // instead of emitting a pseudo-random in-vocab id.  Pass
 // `model.hparams.stop_speech_token` from the speech-decode loop.
-// `suppress_stop_token` (QVAC-20616 Phase 2): when true, the stop token's
+// `suppress_stop_token` (Phase 2): when true, the stop token's
 // (CFG-combined) logit is forced to -inf before the sampling cascade so it
 // cannot be drawn this step.  The alignment analyzer sets this while the text
 // is still being spoken (alignment has not reached the end), preventing the

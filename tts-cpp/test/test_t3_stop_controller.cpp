@@ -1,5 +1,5 @@
-// Unit tests for the attention-free T3 end-of-speech stop controller
-// (QVAC-20616).  Pure host logic — no model or ggml dependency — so it builds
+// Unit tests for the attention-free T3 end-of-speech stop controller.
+// Pure host logic — no model or ggml dependency — so it builds
 // and runs standalone:
 //
 //   g++ -std=c++17 -I src test/test_t3_stop_controller.cpp src/t3_stop_controller.cpp -o /tmp/t && /tmp/t
