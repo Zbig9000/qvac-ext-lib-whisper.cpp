@@ -78,15 +78,27 @@ bool load_enhancer_gguf(const std::string & path, EnhancerWeights & out,
         if (!t) {
             return cleanup(fail(std::string("missing tensor handle '") + name + "'"));
         }
-        if (t->type != GGML_TYPE_F32) {
-            // The converter emits f32 by default; an f16 GGUF would need
-            // dequant here.  Keep the loader strict until f16 is wired.
-            return cleanup(fail(std::string("tensor '") + name + "' is not f32"));
-        }
         EnhTensor et;
-        et.data.resize(ggml_nelements(t));
-        if (!reader.to_host(name, et.data.data(), ggml_nbytes(t))) {
-            return cleanup(fail(std::string("failed to read tensor '") + name + "'"));
+        const int64_t n = ggml_nelements(t);
+        et.data.resize(static_cast<size_t>(n));
+        if (t->type == GGML_TYPE_F32) {
+            if (!reader.to_host(name, et.data.data(), ggml_nbytes(t))) {
+                return cleanup(fail(std::string("failed to read tensor '") + name + "'"));
+            }
+        } else if (t->type == GGML_TYPE_F16) {
+            // f16 GGUF (--ftype f16): stream the raw halves and dequant to the
+            // f32 the scalar core operates on. The scalar enhancer is the only
+            // consumer, so we never keep the f16 copy resident.
+            std::vector<ggml_fp16_t> tmp(static_cast<size_t>(n));
+            if (!reader.to_host(name, tmp.data(), ggml_nbytes(t))) {
+                return cleanup(fail(std::string("failed to read tensor '") + name + "'"));
+            }
+            for (int64_t i = 0; i < n; i++) {
+                et.data[static_cast<size_t>(i)] = ggml_fp16_to_fp32(tmp[static_cast<size_t>(i)]);
+            }
+        } else {
+            return cleanup(fail(std::string("tensor '") + name +
+                                "' has unsupported dtype (expected f32/f16)"));
         }
         for (int d = GGML_MAX_DIMS - 1; d >= 0; d--) {
             if (t->ne[d] > 1 || !et.shape.empty()) {

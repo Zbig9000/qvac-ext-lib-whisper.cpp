@@ -863,6 +863,21 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${TTS_CPP_TEST_REF_DIR}/lavasr-enhancer"
         REQUIRES "${TTS_CPP_TEST_REF_DIR}/lavasr-enhancer/real.npy")
 
+    # LavaSR enhancer GGUF round-trip (QVAC-16579): load the converted GGUF
+    # via load_enhancer_gguf() + the public tts_cpp::lavasr::Enhancer API and
+    # compare backbone/spec-head output to the onnxruntime golden. Links ggml
+    # for GGUF I/O (mirrors test-gguf-stream). DISABLED until the GGUF +
+    # fixtures exist (convert-lavasr-enhancer-to-gguf.py +
+    # dump-lavasr-enhancer-fixtures.py).
+    add_executable(test-lavasr-enhancer-gguf test/test_lavasr_enhancer_gguf.cpp)
+    target_link_libraries(test-lavasr-enhancer-gguf PRIVATE tts-cpp ggml)
+    target_include_directories(test-lavasr-enhancer-gguf PRIVATE include src ggml/include)
+    tts_cpp_apply_ccache(test-lavasr-enhancer-gguf)
+    tts_cpp_register_test(test-lavasr-enhancer-gguf
+        LABEL    "fixture"
+        ARGS     "${TTS_CPP_TEST_MODEL_DIR}/lavasr-enhancer.gguf" "${TTS_CPP_TEST_REF_DIR}/lavasr-enhancer"
+        REQUIRES "${TTS_CPP_TEST_MODEL_DIR}/lavasr-enhancer.gguf" "${TTS_CPP_TEST_REF_DIR}/lavasr-enhancer/real.npy")
+
     # QVAC-20979 — voice-clone test harness.
     #
     # Two header-only, model-free harnesses that every later cloning task builds
