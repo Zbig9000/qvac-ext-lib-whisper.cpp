@@ -252,6 +252,15 @@ set(TTS_CPP_LIB_SOURCES
     src/supertonic_chunker.cpp
     src/mtl_tokenizer.cpp
     src/text_preprocess.cpp
+    # LavaSR neural speech enhancement (QVAC-16579) — CPU/GGML post-process.
+    src/lavasr/dsp/resampler.cpp
+    src/lavasr/dsp/stft_processor.cpp
+    src/lavasr/dsp/mel_filterbank.cpp
+    src/lavasr/dsp/fastlr_merge.cpp
+    src/lavasr/enhancer_core.cpp
+    src/lavasr/enhancer.cpp
+    src/lavasr/enhancer_gguf.cpp
+    src/lavasr/enhancer_api.cpp
 )
 
 if (TTS_CPP_BUILD_LIBRARY)
@@ -820,6 +829,39 @@ if (TTS_CPP_BUILD_TESTS)
     target_include_directories(test-text-split PRIVATE src)
     tts_cpp_apply_ccache(test-text-split)
     tts_cpp_register_test(test-text-split LABEL "cpu")
+
+    # LavaSR DSP primitives (QVAC-16579): resampler, STFT/ISTFT, Slaney mel,
+    # FastLR crossover merge.  Pure host math (no model / no ggml), compiled
+    # straight from the lavasr/dsp sources so it always runs in CI.
+    add_executable(test-lavasr-dsp
+        test/test_lavasr_dsp.cpp
+        src/lavasr/dsp/resampler.cpp
+        src/lavasr/dsp/stft_processor.cpp
+        src/lavasr/dsp/mel_filterbank.cpp
+        src/lavasr/dsp/fastlr_merge.cpp)
+    target_include_directories(test-lavasr-dsp PRIVATE src)
+    tts_cpp_apply_ccache(test-lavasr-dsp)
+    tts_cpp_register_test(test-lavasr-dsp LABEL "unit")
+
+    # LavaSR enhancer scalar-core parity test (QVAC-16579): backbone + spec
+    # head + full enhance() pipeline vs an onnxruntime golden.  Pure host math
+    # (no ggml); the weights/golden fixtures are produced by
+    # scripts/dump-lavasr-enhancer-fixtures.py.  DISABLED until the fixtures
+    # dir exists (REQUIRES the golden real.npy).
+    add_executable(test-lavasr-enhancer-core
+        test/test_lavasr_enhancer_core.cpp
+        src/lavasr/enhancer_core.cpp
+        src/lavasr/enhancer.cpp
+        src/lavasr/dsp/resampler.cpp
+        src/lavasr/dsp/stft_processor.cpp
+        src/lavasr/dsp/mel_filterbank.cpp
+        src/lavasr/dsp/fastlr_merge.cpp)
+    target_include_directories(test-lavasr-enhancer-core PRIVATE src)
+    tts_cpp_apply_ccache(test-lavasr-enhancer-core)
+    tts_cpp_register_test(test-lavasr-enhancer-core
+        LABEL    "fixture"
+        ARGS     "${TTS_CPP_TEST_REF_DIR}/lavasr-enhancer"
+        REQUIRES "${TTS_CPP_TEST_REF_DIR}/lavasr-enhancer/real.npy")
 
     # QVAC-20979 — voice-clone test harness.
     #
