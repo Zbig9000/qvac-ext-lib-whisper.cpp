@@ -193,6 +193,18 @@ struct EngineOptions {
     // S3Gen side.  0 = library default (2-step meanflow).
     int cfm_steps = 0;
 
+    // QVAC-21483 — desired output sample rate in Hz.  The Chatterbox pipeline
+    // natively emits 24 kHz mono float32; when this is a positive rate other
+    // than 24000 the engine resamples the final PCM (Kaiser-windowed sinc, the
+    // same primitive used for reference-audio preprocessing) to the requested
+    // rate and reports it on SynthesisResult::sample_rate.  In streaming mode
+    // each callback chunk is delivered already at the requested rate, so the
+    // documented `result.pcm == concat(chunks)` invariant still holds (chunks
+    // are resampled independently — a sub-millisecond-kernel operation, so the
+    // seams stay inaudible).  0 keeps the native 24 kHz (default; zero
+    // behaviour change).  Validated at construction to 0 or [8000, 192000] Hz.
+    int output_sample_rate = 0;
+
     // ---------------- Streaming synthesis ----------------------------
     //
     // When `stream_chunk_tokens > 0` AND the caller passes a non-empty

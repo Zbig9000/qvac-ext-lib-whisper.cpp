@@ -90,6 +90,8 @@ struct Engine::Impl {
             !std::filesystem::is_directory(opts.voice_dir)) {
             throw std::runtime_error("Engine: voice_dir not found: " + opts.voice_dir);
         }
+        // QVAC-21483 — fail fast on an unsupported output frequency.
+        validate_output_sample_rate(opts.output_sample_rate, "chatterbox::Engine");
 
         ggml_time_init();
         g_log_verbose = opts.verbose ? 1 : 0;
@@ -781,13 +783,19 @@ struct Engine::Impl {
             // chunk_index is the global monotonic counter (post-incremented so
             // the first chunk is index 0, matching the single-segment legacy).
             const bool is_final_chunk = is_last_in_seg && is_last_segment;
-            on_chunk(chunk_pcm.data(), chunk_pcm.size(), global_chunk_idx, is_final_chunk);
+            // QVAC-21483 — deliver + accumulate each chunk at the requested
+            // output rate (0 / 24000 = native passthrough).  The mel
+            // bookkeeping below stays on the NATIVE 24 kHz sample count
+            // (480-sample hop), so snapshot it before any resample.
+            const size_t native_chunk_samples = chunk_pcm.size();
+            std::vector<float> emit = resample_for_output(
+                std::move(chunk_pcm), 24000, opts.output_sample_rate);
+            on_chunk(emit.data(), emit.size(), global_chunk_idx, is_final_chunk);
             ++global_chunk_idx;
 
-            result.pcm.insert(result.pcm.end(), chunk_pcm.begin(), chunk_pcm.end());
+            result.pcm.insert(result.pcm.end(), emit.begin(), emit.end());
             hift_cache_source = std::move(tail_out);
-            const size_t chunk_samples = chunk_pcm.size();
-            prev_mels_emitted += (int)(chunk_samples / 480);
+            prev_mels_emitted += (int)(native_chunk_samples / 480);
         }
 
         result.t3_tokens += (int) speech_tokens.size();
@@ -820,8 +828,14 @@ struct Engine::Impl {
 
         const bool use_streaming = on_chunk && opts.stream_chunk_tokens > 0;
 
+        // QVAC-21483 — resolve the output rate once.  0 keeps the native
+        // 24 kHz.  Streaming resamples per chunk (inside the segment loop);
+        // the batch path resamples the assembled PCM once at the end.
+        constexpr int kNativeSr = 24000;
+        const int out_sr = opts.output_sample_rate > 0 ? opts.output_sample_rate : kNativeSr;
+
         SynthesisResult result;
-        result.sample_rate   = 24000;
+        result.sample_rate   = out_sr;
         int global_chunk_idx = 0;  // monotonic across all segments
 
         for (size_t si = 0; si < segments.size(); ++si) {
@@ -844,6 +858,13 @@ struct Engine::Impl {
             } else {
                 synthesize_batch_segment(speech_tokens, result);
             }
+        }
+
+        // QVAC-21483 — the batch path assembles + crossfades segments at the
+        // native 24 kHz; resample the whole utterance once for best quality.
+        // The streaming path already emitted/accumulated at out_sr per chunk.
+        if (!use_streaming) {
+            result.pcm = resample_for_output(std::move(result.pcm), kNativeSr, out_sr);
         }
 
         result.audio_samples = (int) result.pcm.size();

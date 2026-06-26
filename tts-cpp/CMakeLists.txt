@@ -914,6 +914,18 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_t3_turbo_gguf}" "${_tcb_s3gen_gguf}"
         REQUIRES "${_tcb_t3_turbo_gguf}" "${_tcb_s3gen_gguf}")
 
+    # QVAC-21483 — output-frequency selection on the chatterbox::Engine API
+    # (batch + streaming + validation).  Uses the multilingual fixtures so it
+    # runs anywhere the mtl-synth tests do; auto-disabled when they're absent.
+    add_executable(test-output-sample-rate test/test_output_sample_rate.cpp)
+    target_link_libraries(test-output-sample-rate PRIVATE tts-cpp ggml tts-cpp-backend-defs)
+    target_include_directories(test-output-sample-rate PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-output-sample-rate)
+    tts_cpp_register_test(test-output-sample-rate
+        LABEL    "fixture"
+        ARGS     "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}"
+        REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}")
+
     # CPU-side persistent-cache validation.
     # Exercises the time_mlp / time_emb / cfm_estimator / weight_mirror
     # caches that amortise per-synth overhead on the multilingual CPU

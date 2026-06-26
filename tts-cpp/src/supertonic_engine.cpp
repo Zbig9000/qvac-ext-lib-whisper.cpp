@@ -6,6 +6,7 @@
 #include "supertonic_internal.h"
 #include "supertonic_voice_json.h"
 #include "npy.h"
+#include "voice_features.h"  // resample_for_output / validate_output_sample_rate (QVAC-21483)
 // Vulkan adapter description in `backend_name()` is now resolved
 // through the registry API (`ggml_backend_get_device` +
 // `ggml_backend_dev_description`) so no per-backend header include
@@ -180,6 +181,8 @@ struct Engine::Impl {
         if (!std::filesystem::exists(opts.model_gguf_path)) {
             throw std::runtime_error(supertonic_setup_hint(opts.model_gguf_path));
         }
+        // QVAC-21483 — fail fast on an unsupported output frequency.
+        validate_output_sample_rate(opts.output_sample_rate, "supertonic::Engine");
         // Wire backends_dir + opencl_cache_dir BEFORE any backend
         // init. First-Engine-wins across the whole process; second
         // and later Engines reuse the already-loaded registry. See
@@ -555,10 +558,19 @@ struct Engine::Impl {
         }
 
         SynthesisResult result;
-        result.sample_rate = sample_rate;
         result.duration_s  = duration_s;
         result.pcm.assign(wav_full.begin(),
                           wav_full.begin() + std::min((size_t) wav_len, wav_full.size()));
+
+        // QVAC-21483 — optional output-frequency conversion.  The vocoder emits
+        // at the model's native rate; resample to opts.output_sample_rate when
+        // the caller requested a specific rate (0 = keep native).  Runs for
+        // both the batch and streaming paths since both flow through here; in
+        // streaming mode the downstream seam-fade keys off result.sample_rate,
+        // so it stays correct at the resampled rate.
+        const int out_sr = opts.output_sample_rate > 0 ? opts.output_sample_rate : sample_rate;
+        result.pcm        = resample_for_output(std::move(result.pcm), sample_rate, out_sr);
+        result.sample_rate = out_sr;
         return result;
     }
 

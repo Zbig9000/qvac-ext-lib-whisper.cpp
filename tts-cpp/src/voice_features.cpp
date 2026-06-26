@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #define DR_WAV_IMPLEMENTATION
@@ -117,6 +119,30 @@ std::vector<float> resample_sinc(const std::vector<float> & in,
         out[n] = acc;
     }
     return out;
+}
+
+// ============================================================================
+// Output-frequency selection (QVAC-21483)
+// ============================================================================
+
+void validate_output_sample_rate(int sr, const char * who) {
+    if (sr == 0) return;  // keep native rate
+    if (sr < kOutputSampleRateMin || sr > kOutputSampleRateMax) {
+        throw std::runtime_error(
+            std::string(who ? who : "tts-cpp") +
+            ": output_sample_rate must be 0 (native) or in [" +
+            std::to_string(kOutputSampleRateMin) + ", " +
+            std::to_string(kOutputSampleRateMax) + "] Hz, got " +
+            std::to_string(sr));
+    }
+}
+
+std::vector<float> resample_for_output(std::vector<float> pcm,
+                                       int native_sr, int target_sr) {
+    if (target_sr <= 0 || target_sr == native_sr) {
+        return pcm;  // keep native rate (moved out — no copy)
+    }
+    return resample_sinc(pcm, native_sr, target_sr);
 }
 
 // ============================================================================

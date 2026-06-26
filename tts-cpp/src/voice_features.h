@@ -42,6 +42,31 @@ std::vector<float> resample_sinc(const std::vector<float> & in,
                                  int taps_half = 16);
 
 // -----------------------------------------------------------------------------
+// Output-frequency selection (QVAC-21483)
+// -----------------------------------------------------------------------------
+
+// Supported explicit output sample-rate window, in Hz.  A value of 0 is also
+// accepted everywhere and means "keep the engine's native rate".  The bounds
+// mirror the @qvac/tts-ggml addon's JS-side validation so the contract is
+// identical from the JS API down through the C++ engines and CLIs.
+constexpr int kOutputSampleRateMin = 8000;
+constexpr int kOutputSampleRateMax = 192000;
+
+// Validate a requested output sample rate.  Accepts 0 (keep native) or any
+// rate in [kOutputSampleRateMin, kOutputSampleRateMax]; throws
+// std::runtime_error (prefixed with `who`) on anything else so callers fail
+// fast at construction / arg-parse time rather than emitting a malformed wav.
+void validate_output_sample_rate(int sr, const char * who = "tts-cpp");
+
+// Resample final synthesized `pcm` from `native_sr` to `target_sr`.  Returns
+// `pcm` unchanged (moved through) when `target_sr <= 0` or
+// `target_sr == native_sr` — the "keep native rate" fast path — otherwise
+// delegates to resample_sinc.  Centralises the output-frequency policy shared
+// by the Chatterbox and Supertonic engines so both behave identically.
+std::vector<float> resample_for_output(std::vector<float> pcm,
+                                       int native_sr, int target_sr);
+
+// -----------------------------------------------------------------------------
 // Loudness normalisation (ITU-R BS.1770-4 / EBU R 128)
 // -----------------------------------------------------------------------------
 

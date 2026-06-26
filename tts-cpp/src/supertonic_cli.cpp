@@ -17,6 +17,8 @@ void usage(const char * argv0) {
         "          [--language en] [--voice NAME] [--steps N] [--speed X]\n"
         "          (voice/steps/speed default to GGUF metadata when omitted)\n"
         "          [--seed 42] [--threads N] [--n-gpu-layers N]\n"
+        "          [--output-sample-rate HZ] (resample output; 0 = native model\n"
+        "                            rate, else 8000..192000; default 0)\n"
         "          [--vulkan-device N] (Vulkan adapter index; ignored unless\n"
         "                            built with -DGGML_VULKAN=ON; default 0,\n"
         "                            -1 = auto-pick adapter with most free VRAM)\n"
@@ -141,6 +143,7 @@ int main(int argc, char ** argv) {
         else if (arg == "--seed") opts.seed = std::stoi(next("--seed"));
         else if (arg == "--threads") opts.n_threads = std::stoi(next("--threads"));
         else if (arg == "--n-gpu-layers") opts.n_gpu_layers = std::stoi(next("--n-gpu-layers"));
+        else if (arg == "--output-sample-rate") opts.output_sample_rate = std::stoi(next("--output-sample-rate"));
         else if (arg == "--vulkan-device") opts.vulkan_device = std::stoi(next("--vulkan-device"));
         else if (arg == "--f16-attn") opts.f16_attn = std::stoi(next("--f16-attn"));
         else if (arg == "--kv-attn-type") {
