@@ -2374,15 +2374,22 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 const int  osr          = params.output_sample_rate;
                 const bool resample_out = osr > 0 && osr != sr;
                 const int  egress_sr    = resample_out ? osr : sr;
+                // QVAC-21483 — one utterance-spanning resampler for the stdout
+                // egress stream, so streamed bytes equal a whole-utterance
+                // resample (no per-chunk seam artifacts).  Passthrough when osr
+                // is 0/native.  File mode (below) resamples the assembled buffer
+                // once via write_wav_out_rate, so it doesn't use this.
+                OutputResampler stdout_rs(sr, osr);
+                const std::string stdout_note = to_stdout
+                    ? " → stdout (raw s16le @ " + std::to_string(egress_sr) + " Hz mono)"
+                    : std::string();
 
                 if (multi_seg) {
                     fprintf(stderr, "\n=== streaming synthesis: %zu segments, %d-token chunks%s ===\n",
-                            N_SEG, chunk_n,
-                            to_stdout ? " → stdout (raw s16le @ 24 kHz mono)" : "");
+                            N_SEG, chunk_n, stdout_note.c_str());
                 } else {
                     fprintf(stderr, "\n=== streaming synthesis: %d-token chunks%s ===\n",
-                            chunk_n,
-                            to_stdout ? " → stdout (raw s16le @ 24 kHz mono)" : "");
+                            chunk_n, stdout_note.c_str());
                 }
 
                 std::vector<float> full_streamed_wav;   // only used in file mode
@@ -2492,15 +2499,13 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                             first_chunk_t_ms = 1e-3 * ggml_time_us() - stream_t0_ms;
 
                         if (to_stdout) {
-                            // Resample the chunk for stdout egress; the native
-                            // chunk_pcm is still accumulated below so the mel
-                            // hop bookkeeping stays correct.
-                            if (resample_out) {
-                                std::vector<float> r = resample_sinc(chunk_pcm, sr, osr);
-                                stream_emit_pcm_stdout(r);
-                            } else {
-                                stream_emit_pcm_stdout(chunk_pcm);
-                            }
+                            // Stream through the utterance-spanning resampler;
+                            // it returns only the now-stable output samples (no
+                            // per-chunk seams).  The native chunk_pcm is still
+                            // accumulated below so the mel hop bookkeeping stays
+                            // correct.
+                            std::vector<float> e = stdout_rs.process(chunk_pcm);
+                            if (!e.empty()) stream_emit_pcm_stdout(e);
                         }
                         seg_streamed_wav.insert(seg_streamed_wav.end(),
                                                 chunk_pcm.begin(), chunk_pcm.end());
@@ -2530,11 +2535,15 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                         const bool more = (si + 1 < N_SEG);
                         if (more && params.crossfade_ms > 0) {
                             const int gap_ms = std::max(150, 2 * params.crossfade_ms);
-                            // Silence is rate-agnostic — emit it directly at the
-                            // egress rate (no resample needed).
-                            const int gap_samples = egress_sr * gap_ms / 1000;
-                            std::vector<float> gap(gap_samples, 0.0f);
-                            stream_emit_pcm_stdout(gap);
+                            // QVAC-21483 — feed the inter-segment silence through
+                            // the same resampler as native-rate silence, so it
+                            // slots into the continuous egress stream in order
+                            // (flushing the previous segment's tail) and comes
+                            // out at the egress rate.
+                            const int gap_native = sr * gap_ms / 1000;
+                            std::vector<float> gap(gap_native, 0.0f);
+                            std::vector<float> e = stdout_rs.process(gap);
+                            if (!e.empty()) stream_emit_pcm_stdout(e);
                         }
                     } else {
                         // File mode: concatenate segments with a raised-cosine
@@ -2545,7 +2554,13 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     }
                 }
 
-                if (!to_stdout) write_wav_out_rate(params.out_wav, full_streamed_wav, osr);
+                if (to_stdout) {
+                    // QVAC-21483 — flush the resampler's final tail samples.
+                    std::vector<float> e = stdout_rs.finish();
+                    if (!e.empty()) stream_emit_pcm_stdout(e);
+                } else {
+                    write_wav_out_rate(params.out_wav, full_streamed_wav, osr);
+                }
                 fprintf(stderr, "\n=== streaming done: %d chunks, first-chunk latency=%.1f ms, total=%.1f ms ===\n",
                         global_chunk_idx, first_chunk_t_ms,
                         1e-3 * ggml_time_us() - stream_t0_ms);

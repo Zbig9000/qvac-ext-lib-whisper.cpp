@@ -198,11 +198,13 @@ struct EngineOptions {
     // than 24000 the engine resamples the final PCM (Kaiser-windowed sinc, the
     // same primitive used for reference-audio preprocessing) to the requested
     // rate and reports it on SynthesisResult::sample_rate.  In streaming mode
-    // each callback chunk is delivered already at the requested rate, so the
-    // documented `result.pcm == concat(chunks)` invariant still holds (chunks
-    // are resampled independently — a sub-millisecond-kernel operation, so the
-    // seams stay inaudible).  0 keeps the native 24 kHz (default; zero
-    // behaviour change).  Validated at construction to 0 or [8000, 192000] Hz.
+    // every chunk is fed through one utterance-spanning resampler that emits an
+    // output sample only once its sinc window is fully covered by the audio seen
+    // so far, so the delivered chunks concatenate to exactly the same PCM as
+    // resampling the whole utterance once — no per-chunk seam artifacts — and
+    // the documented `result.pcm == concat(chunks)` invariant still holds.
+    // 0 keeps the native 24 kHz (default; zero behaviour change).  Validated at
+    // construction to 0 or [8000, 192000] Hz.
     int output_sample_rate = 0;
 
     // ---------------- Streaming synthesis ----------------------------

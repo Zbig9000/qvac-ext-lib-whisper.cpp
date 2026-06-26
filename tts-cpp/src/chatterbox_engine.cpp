@@ -691,7 +691,8 @@ struct Engine::Impl {
         SynthesisResult & result,
         bool is_first_segment,
         bool is_last_segment,
-        int & global_chunk_idx) {
+        int & global_chunk_idx,
+        OutputResampler & out_resampler) {
 
         std::vector<int32_t> seg_toks = speech_tokens;
         for (int i = 0; i < kS3GenLookaheadTokens; ++i) {
@@ -783,13 +784,20 @@ struct Engine::Impl {
             // chunk_index is the global monotonic counter (post-incremented so
             // the first chunk is index 0, matching the single-segment legacy).
             const bool is_final_chunk = is_last_in_seg && is_last_segment;
-            // QVAC-21483 — deliver + accumulate each chunk at the requested
-            // output rate (0 / 24000 = native passthrough).  The mel
-            // bookkeeping below stays on the NATIVE 24 kHz sample count
-            // (480-sample hop), so snapshot it before any resample.
+            // QVAC-21483 — feed the native chunk through the utterance-spanning
+            // resampler (0 / 24000 = passthrough).  process() returns only the
+            // now-stable output samples and finish() flushes the tail on the
+            // final chunk, so the emitted chunks concatenate to the exact same
+            // PCM as resampling the whole utterance once — no per-chunk seam
+            // artifacts, while result.pcm == concat(chunks) still holds.  The
+            // mel bookkeeping below stays on the NATIVE 24 kHz sample count
+            // (480-sample hop), so snapshot it before resampling.
             const size_t native_chunk_samples = chunk_pcm.size();
-            std::vector<float> emit = resample_for_output(
-                std::move(chunk_pcm), 24000, opts.output_sample_rate);
+            std::vector<float> emit = out_resampler.process(chunk_pcm);
+            if (is_final_chunk) {
+                std::vector<float> tail = out_resampler.finish();
+                emit.insert(emit.end(), tail.begin(), tail.end());
+            }
             on_chunk(emit.data(), emit.size(), global_chunk_idx, is_final_chunk);
             ++global_chunk_idx;
 
@@ -829,10 +837,13 @@ struct Engine::Impl {
         const bool use_streaming = on_chunk && opts.stream_chunk_tokens > 0;
 
         // QVAC-21483 — resolve the output rate once.  0 keeps the native
-        // 24 kHz.  Streaming resamples per chunk (inside the segment loop);
-        // the batch path resamples the assembled PCM once at the end.
+        // 24 kHz.  Streaming flows every chunk through a single utterance-
+        // spanning resampler (so the streamed output equals the batch resample
+        // with no per-chunk seams); the batch path resamples the assembled PCM
+        // once at the end.
         constexpr int kNativeSr = 24000;
         const int out_sr = opts.output_sample_rate > 0 ? opts.output_sample_rate : kNativeSr;
+        OutputResampler out_resampler(kNativeSr, opts.output_sample_rate);
 
         SynthesisResult result;
         result.sample_rate   = out_sr;
@@ -854,7 +865,7 @@ struct Engine::Impl {
                     speech_tokens, on_chunk, result,
                     /*is_first_segment=*/si == 0,
                     /*is_last_segment=*/si + 1 == segments.size(),
-                    global_chunk_idx);
+                    global_chunk_idx, out_resampler);
             } else {
                 synthesize_batch_segment(speech_tokens, result);
             }

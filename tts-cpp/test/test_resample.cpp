@@ -70,10 +70,86 @@ static void test_output_helpers() {
     CHECK(up.size() == expect_up, "44.1k->48k output length matches ratio");
 }
 
+// --- QVAC-21483: stateful streaming resampler ------------------------------
+
+// Stream `in` through an OutputResampler, cutting it into chunks whose sizes
+// cycle through `sizes`; `trim` samples are dropped from the very first chunk to
+// mimic the pipeline's trim-faded first chunk (a non-ratio-aligned boundary).
+// Returns the concatenation of every process() result followed by finish().
+static std::vector<float> stream_all(const std::vector<float> & in,
+                                     int native_sr, int target_sr,
+                                     const std::vector<int> & sizes, int trim) {
+    OutputResampler rs(native_sr, target_sr);
+    std::vector<float> out;
+    size_t pos = 0, si = 0;
+    bool first = true;
+    while (pos < in.size()) {
+        int want = sizes[si % sizes.size()] - (first ? trim : 0);
+        if (want < 1) want = 1;
+        const size_t end = std::min(in.size(), pos + (size_t) want);
+        std::vector<float> chunk(in.begin() + pos, in.begin() + end);
+        std::vector<float> e = rs.process(chunk);
+        out.insert(out.end(), e.begin(), e.end());
+        pos = end;
+        ++si;
+        first = false;
+    }
+    std::vector<float> tail = rs.finish();
+    out.insert(out.end(), tail.begin(), tail.end());
+    return out;
+}
+
+static void test_streaming_resampler() {
+    std::printf("\nQVAC-21483 streaming resampler (batch-exact, seam-free):\n");
+
+    // Broadband signal with energy up near the 24 kHz Nyquist, so any per-chunk
+    // seam (window truncation / fractional-phase reset / length drift) would
+    // surface as a mismatch against the whole-buffer resample.
+    std::vector<float> sig(20000);
+    for (size_t i = 0; i < sig.size(); ++i) {
+        const double t = (double) i / 24000.0;
+        sig[i] = 0.4f * (float) std::sin(2.0 * M_PI *  600.0 * t)
+               + 0.3f * (float) std::sin(2.0 * M_PI * 4000.0 * t)
+               + 0.3f * (float) std::sin(2.0 * M_PI * 9000.0 * t);
+    }
+
+    // Passthrough (0 / == native): process() returns input verbatim, finish() empty.
+    CHECK(OutputResampler(24000, 0).passthrough(),     "target 0 is passthrough");
+    CHECK(OutputResampler(24000, 24000).passthrough(), "target == native is passthrough");
+    CHECK(stream_all(sig, 24000, 0,     {1000}, 0) == sig, "passthrough(0) streams input verbatim");
+    CHECK(stream_all(sig, 24000, 24000, {333},  0) == sig, "passthrough(native) streams input verbatim");
+
+    // For every rate / chunking the streamed result must be BIT-IDENTICAL to
+    // resampling the whole signal once.  These cover the cases per-chunk
+    // resampling corrupts: misaligned chunk lengths, a trim-faded first chunk,
+    // and a "hostile" rate (11025, whose denominator does not divide the chunk
+    // grid).  Bit-equality also proves there is no length drift.
+    struct Case { int tgt; std::vector<int> sizes; int trim; const char * name; };
+    const Case cases[] = {
+        {16000, {4800},        0,  "24k->16k  uniform aligned chunks    == batch"},
+        {16000, {4799},        0,  "24k->16k  misaligned chunks         == batch"},
+        {16000, {4800},        33, "24k->16k  trim-faded first chunk    == batch"},
+        { 8000, {1920, 2400},  7,  "24k->8k   varied/misaligned chunks  == batch"},
+        {48000, {4800},        0,  "24k->48k  upsample                  == batch"},
+        {44100, {4801},        0,  "24k->44.1k upsample, ugly ratio     == batch"},
+        {11025, {4800},        13, "24k->11025 hostile rate + trim      == batch"},
+    };
+    for (const Case & c : cases) {
+        const std::vector<float> streamed = stream_all(sig, 24000, c.tgt, c.sizes, c.trim);
+        const std::vector<float> batch    = resample_for_output(sig, 24000, c.tgt);
+        const bool same = (streamed == batch);
+        CHECK(same, c.name);
+        if (!same) {
+            std::printf("    (streamed=%zu batch=%zu)\n", streamed.size(), batch.size());
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     (void)argc; (void)argv;
 
     test_output_helpers();
+    test_streaming_resampler();
 
     // 4 seconds of a multi-tone signal at 24 kHz.
     const int sr = 24000;
