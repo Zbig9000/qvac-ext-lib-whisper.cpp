@@ -74,18 +74,53 @@ int main(int argc, char ** argv) {
     if (cmp("real", real, real_gold) >= tol) ++failures;
     if (cmp("imag", imag, imag_gold) >= tol) ++failures;
 
-    // Public Enhancer API smoke test.
+    // Public Enhancer API + end-to-end DSP golden: enhance(pcm_in) is compared
+    // against the numpy reference pipeline output (resample + mel + ISTFT +
+    // FastLR + neural), so the DSP front/back-end is checked, not just the
+    // neural core. Falls back to a finite/length smoke test if the e2e fixtures
+    // are absent (older fixture dumps). argv[4] overrides the e2e tolerance.
     try {
         auto enh = tts_cpp::lavasr::Enhancer::load(gguf);
-        std::vector<float> pcm(12000, 0.0f);
-        for (int i = 0; i < 12000; i++) pcm[i] = 0.2f * std::sin(2.0f * 3.14159265f * 200.0f * i / 24000.0f);
-        auto out = enh->enhance(pcm, 24000);
-        const size_t expect = static_cast<size_t>(std::lround(pcm.size() * 48000.0 / 24000.0));
-        bool finite = true;
-        for (float v : out) if (!std::isfinite(v)) { finite = false; break; }
-        std::printf("  Enhancer::enhance: out=%zu (expect %zu) sr=%d finite=%d\n",
-                    out.size(), expect, enh->output_sample_rate(), finite ? 1 : 0);
-        if (out.size() != expect || !finite || enh->output_sample_rate() != 48000) ++failures;
+        std::vector<float> pcm_in;
+        bool have_e2e = true;
+        try {
+            pcm_in = load_f32(dir + "/pcm_in.npy");
+        } catch (...) {
+            have_e2e = false;
+        }
+        if (have_e2e) {
+            const float e2e_tol = argc > 4 ? std::strtof(argv[4], nullptr) : 5e-2f;
+            std::vector<float> golden = load_f32(dir + "/enhanced_48k.npy");
+            auto out = enh->enhance(pcm_in, 24000);
+            std::printf("Enhancer::enhance e2e (in=%zu @24k -> out=%zu @%d, tol=%.0e):\n",
+                        pcm_in.size(), out.size(), enh->output_sample_rate(), e2e_tol);
+            if (enh->output_sample_rate() != 48000) {
+                std::fprintf(stderr, "FAIL: enhance() reports %d, expected 48000\n",
+                             enh->output_sample_rate());
+                ++failures;
+            }
+            if (out.size() != golden.size()) {
+                std::fprintf(stderr, "FAIL: enhance() length %zu != golden %zu\n",
+                             out.size(), golden.size());
+                ++failures;
+            } else {
+                const float d = cmp("e2e", out, golden);
+                if (d >= e2e_tol) {
+                    std::fprintf(stderr, "FAIL: e2e exceeds tolerance %.0e\n", e2e_tol);
+                    ++failures;
+                }
+            }
+        } else {
+            std::vector<float> pcm(12000, 0.0f);
+            for (int i = 0; i < 12000; i++)
+                pcm[i] = 0.2f * std::sin(2.0f * 3.14159265f * 200.0f * i / 24000.0f);
+            auto out = enh->enhance(pcm, 24000);
+            bool finite = true;
+            for (float v : out) if (!std::isfinite(v)) { finite = false; break; }
+            std::printf("  (e2e golden absent) smoke: out=%zu sr=%d finite=%d\n",
+                        out.size(), enh->output_sample_rate(), finite ? 1 : 0);
+            if (out.empty() || !finite || enh->output_sample_rate() != 48000) ++failures;
+        }
     } catch (const std::exception & e) {
         std::fprintf(stderr, "FAIL: Enhancer API: %s\n", e.what());
         ++failures;

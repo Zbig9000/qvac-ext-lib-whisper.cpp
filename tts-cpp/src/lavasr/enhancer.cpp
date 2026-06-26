@@ -10,9 +10,9 @@
 namespace tts_cpp::lavasr {
 
 int enhancer_work_sample_rate(const EnhancerWeights & w) {
-    // The enhancer network is trained for 48 kHz output; work_sample_rate is
-    // carried in the GGUF metadata (default 48000).
-    return 48000;
+    // Carried in the GGUF metadata (lavasr.enhancer.work_sample_rate; default
+    // 48000 for the current LavaSR enhancer).
+    return w.work_sample_rate;
 }
 
 std::vector<float> enhance(const EnhancerWeights & w,
@@ -26,10 +26,11 @@ std::vector<float> enhance(const EnhancerWeights & w,
     // 1) Upsample to the enhancer working rate (48 kHz).
     std::vector<float> wav = dsp::Resampler::resample(pcm_in, sr_in, work_sr);
 
-    // 2) Log-mel (Slaney mel computed at the 44.1k reference rate, on 48k audio
-    //    — matches the upstream LavaSR / Vocos training configuration).
-    dsp::MelFilterbank mel_fb(/*sample_rate=*/44100, w.n_fft, w.n_mels,
-                              /*f_min=*/0.0f, /*f_max=*/8000.0f);
+    // 2) Log-mel (Slaney mel computed at the reference rate from GGUF metadata
+    //    — 44.1k on 48k audio for the current model, matching the upstream
+    //    LavaSR / Vocos training configuration).
+    dsp::MelFilterbank mel_fb(/*sample_rate=*/w.mel_ref_sample_rate, w.n_fft,
+                              w.n_mels, /*f_min=*/0.0f, /*f_max=*/8000.0f);
     const auto mel = mel_fb.mel_spectrogram(wav, w.hop); // [n_mels][T]
     const int  T   = mel.empty() ? 0 : static_cast<int>(mel[0].size());
     if (T == 0) {

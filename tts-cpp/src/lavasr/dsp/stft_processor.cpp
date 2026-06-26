@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 namespace tts_cpp::lavasr::dsp {
 
@@ -16,6 +18,14 @@ void StftProcessor::fft(ComplexVec & x, bool inverse) {
     const int N = static_cast<int>(x.size());
     if (N <= 1) {
         return;
+    }
+    // Radix-2 only: a non-power-of-two N would silently corrupt the result.
+    // n_fft/win are validated at GGUF load; this guards every other caller
+    // (and FastLRMerge, which always pads to a power of two).
+    if ((N & (N - 1)) != 0) {
+        throw std::invalid_argument(
+            "StftProcessor::fft: size must be a power of two (got " +
+            std::to_string(N) + ")");
     }
 
     // Bit-reversal permutation.

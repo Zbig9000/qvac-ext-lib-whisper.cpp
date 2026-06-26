@@ -843,11 +843,14 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_apply_ccache(test-lavasr-dsp)
     tts_cpp_register_test(test-lavasr-dsp LABEL "unit")
 
-    # LavaSR enhancer scalar-core parity test (QVAC-16579): backbone + spec
-    # head + full enhance() pipeline vs an onnxruntime golden.  Pure host math
-    # (no ggml); the weights/golden fixtures are produced by
-    # scripts/dump-lavasr-enhancer-fixtures.py.  DISABLED until the fixtures
-    # dir exists (REQUIRES the golden real.npy).
+    # LavaSR enhancer scalar-core parity test (QVAC-16579): numerical parity of
+    # the neural core (mel -> backbone -> spec head -> real/imag) against an
+    # onnxruntime golden, plus a finite/length smoke test of the full enhance()
+    # pipeline. Pure host math (no ggml); fixtures from
+    # scripts/dump-lavasr-enhancer-fixtures.py. The end-to-end DSP comparison
+    # (resampler/mel/ISTFT/FastLR vs the numpy reference) lives in
+    # test-lavasr-enhancer-gguf below. DISABLED until the fixtures exist
+    # (REQUIRES the golden real.npy).
     add_executable(test-lavasr-enhancer-core
         test/test_lavasr_enhancer_core.cpp
         src/lavasr/enhancer_core.cpp
@@ -863,12 +866,13 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${TTS_CPP_TEST_REF_DIR}/lavasr-enhancer"
         REQUIRES "${TTS_CPP_TEST_REF_DIR}/lavasr-enhancer/real.npy")
 
-    # LavaSR enhancer GGUF round-trip (QVAC-16579): load the converted GGUF
-    # via load_enhancer_gguf() + the public tts_cpp::lavasr::Enhancer API and
-    # compare backbone/spec-head output to the onnxruntime golden. Links ggml
-    # for GGUF I/O (mirrors test-gguf-stream). DISABLED until the GGUF +
-    # fixtures exist (convert-lavasr-enhancer-to-gguf.py +
-    # dump-lavasr-enhancer-fixtures.py).
+    # LavaSR enhancer GGUF round-trip (QVAC-16579): load the converted GGUF via
+    # load_enhancer_gguf() + the public tts_cpp::lavasr::Enhancer API, compare
+    # the neural core to the onnxruntime golden, AND compare the full
+    # enhance(pcm_in) output (resampler + mel + ISTFT + FastLR + neural) against
+    # the numpy end-to-end golden (enhanced_48k.npy). Links ggml for GGUF I/O
+    # (mirrors test-gguf-stream). DISABLED until the GGUF + fixtures exist
+    # (convert-lavasr-enhancer-to-gguf.py + dump-lavasr-enhancer-fixtures.py).
     add_executable(test-lavasr-enhancer-gguf test/test_lavasr_enhancer_gguf.cpp)
     target_link_libraries(test-lavasr-enhancer-gguf PRIVATE tts-cpp ggml)
     target_include_directories(test-lavasr-enhancer-gguf PRIVATE include src ggml/include)

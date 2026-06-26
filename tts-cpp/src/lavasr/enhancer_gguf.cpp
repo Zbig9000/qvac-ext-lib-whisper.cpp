@@ -5,6 +5,8 @@
 #include "gguf.h"
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace tts_cpp::lavasr {
 
@@ -66,6 +68,18 @@ bool load_enhancer_gguf(const std::string & path, EnhancerWeights & out,
     out.spec_bins = u32("lavasr.enhancer.spec_bins", 1025);
     out.clip_max  = f32("lavasr.enhancer.clip_max", 1000.0f);
     out.ln_eps    = f32("lavasr.enhancer.layernorm_eps", 1e-6f);
+    out.work_sample_rate    = u32("lavasr.enhancer.work_sample_rate", 48000);
+    out.mel_ref_sample_rate = u32("lavasr.enhancer.mel_ref_sample_rate", 44100);
+
+    // The radix-2 FFT requires power-of-two n_fft/win. Fail loudly here rather
+    // than let StftProcessor silently corrupt output on a future odd-n_fft
+    // GGUF (the FFT also self-guards, this is the friendly early error).
+    auto is_pow2 = [](int v) { return v > 0 && (v & (v - 1)) == 0; };
+    if (!is_pow2(out.n_fft) || !is_pow2(out.win)) {
+        return cleanup(fail("n_fft and win must be powers of two (got n_fft=" +
+                            std::to_string(out.n_fft) + ", win=" +
+                            std::to_string(out.win) + ")"));
+    }
 
     const int n_tensors = static_cast<int>(gguf_get_n_tensors(g));
     if (n_tensors <= 0) {
@@ -108,9 +122,33 @@ bool load_enhancer_gguf(const std::string & path, EnhancerWeights & out,
         out.t.emplace(name, std::move(et));
     }
 
-    // Sanity: a couple of must-have tensors.
-    if (!out.has("enhancer.embed.weight") || !out.has("spec_head.out.weight")) {
-        return cleanup(fail("GGUF missing core enhancer tensors"));
+    // Validate key tensor ranks/dims against the metadata so a malformed GGUF
+    // fails loudly here instead of indexing past the end in the forward core.
+    // Shapes are in numpy/C order (matching the converter): conv weights are
+    // [out, in/groups, K]; linear weights are [out, in].
+    auto check_shape = [&](const std::string & name,
+                           const std::vector<int> & want) -> bool {
+        if (!out.has(name)) {
+            return fail("GGUF missing tensor '" + name + "'");
+        }
+        const std::vector<int> & got = out.get(name).shape;
+        if (got != want) {
+            std::string g;
+            for (int d : got) {
+                g += (g.empty() ? "" : ",") + std::to_string(d);
+            }
+            return fail("tensor '" + name + "' has unexpected shape [" + g + "]");
+        }
+        return true;
+    };
+
+    const int C = out.dim, M = out.n_mels, K = out.kernel, F = out.ffn_dim;
+    if (!check_shape("enhancer.embed.weight", {C, M, K}) ||
+        !check_shape("enhancer.block.0.dwconv.weight", {C, 1, K}) ||
+        !check_shape("enhancer.block.0.pwconv1.weight", {F, C}) ||
+        !check_shape("enhancer.block.0.pwconv2.weight", {C, F}) ||
+        !check_shape("spec_head.out.weight", {2 * out.spec_bins, C})) {
+        return cleanup(false); // check_shape() already set *err via fail()
     }
 
     return cleanup(true);

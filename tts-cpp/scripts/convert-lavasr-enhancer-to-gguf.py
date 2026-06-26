@@ -104,12 +104,21 @@ def main():
     si = init_map(sh)
     bb_by_out = node_by_output(bb)
 
-    # Validate the clip_max constant in the spec head (exp clamp upper bound).
+    # The spec head clamps the log-magnitude via Clip(exp(x), None, max) before
+    # the cos/sin polar reconstruction (see the graph: Exp -> Clip -> Mul). Read
+    # the clamp upper bound straight from that Clip node's `max` input (Clip's
+    # 3rd input in opset >= 11) rather than scanning all scalar constants, so a
+    # re-export carrying another scalar can't silently change the clamp. Falls
+    # back to 1000.0 (with a warning) only if the graph shape ever changes.
     clip_max = 1000.0
-    for t in sh.initializer:
-        a = numpy_helper.to_array(t)
-        if a.size == 1 and 100.0 <= float(a.reshape(-1)[0]) <= 1e6:
-            clip_max = float(a.reshape(-1)[0])
+    clip_nodes = [n for n in sh.node if n.op_type == "Clip"]
+    if (len(clip_nodes) == 1 and len(clip_nodes[0].input) >= 3
+            and clip_nodes[0].input[2] in si):
+        # si values are already numpy arrays (init_map -> numpy_helper.to_array).
+        clip_max = float(si[clip_nodes[0].input[2]].reshape(-1)[0])
+    else:
+        print(f"WARNING: could not uniquely resolve the spec-head Clip max input "
+              f"({len(clip_nodes)} Clip node(s)); using fallback clip_max={clip_max}")
 
     writer = GGUFWriter(args.out, ARCH)
     writer.add_uint32("lavasr.enhancer.dim", DIM)

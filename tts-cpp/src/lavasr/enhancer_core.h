@@ -41,6 +41,11 @@ struct EnhancerWeights {
     int   hop       = 512;
     int   win       = 2048;
     int   spec_bins = 1025;
+    // Working sample rate the network operates at (enhance() output rate) and
+    // the Slaney-mel reference rate, both read from GGUF metadata so a future
+    // converter change to these constants stays in sync with the C++.
+    int   work_sample_rate    = 48000;
+    int   mel_ref_sample_rate = 44100;
     float clip_max  = 1000.0f;
     float ln_eps    = 1e-6f;
 

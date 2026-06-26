@@ -134,10 +134,8 @@ std::vector<float> tc_to_ct(const std::vector<float> & x, int T, int C) {
 void enhancer_spec_forward(const EnhancerWeights & w,
                            const std::vector<float> & mel, int T,
                            std::vector<float> & real, std::vector<float> & imag) {
-    const int C   = w.dim;
-    const int F   = w.ffn_dim;
-    const int eps = 0; // (placeholder to avoid unused warning patterns)
-    (void) eps;
+    const int C = w.dim;
+    const int F = w.ffn_dim;
 
     auto vec = [&](const std::string & n) -> const std::vector<float> & {
         return w.get(n).data;
