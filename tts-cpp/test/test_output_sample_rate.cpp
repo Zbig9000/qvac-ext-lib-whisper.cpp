@@ -12,6 +12,7 @@
 //     `result.pcm == concat(chunks)` invariant and reports the requested rate.
 
 #include "tts-cpp/chatterbox/engine.h"
+#include "voice_features.h"  // resample_for_output (QVAC-21483)
 
 #include <cmath>
 #include <cstddef>
@@ -100,6 +101,59 @@ int main(int argc, char ** argv) {
         CHECK(!r.pcm.empty(),                  "streaming produced audio");
     } catch (const std::exception & e) {
         std::fprintf(stderr, "streaming synth threw: %s\n", e.what());
+        return 1;
+    }
+
+    // --- streaming resampling is batch-exact (the OutputResampler property) ---
+    // GustavoA1604 review: assert that a non-native streamed rate equals
+    // resampling the streamed NATIVE audio in one shot — the invariant the
+    // utterance-spanning OutputResampler guarantees (test_resample proves it
+    // model-free; this exercises it end-to-end through the engine, and would
+    // catch a regression to per-chunk resampling: seams + length drift).
+    //
+    // We compare streamed-16k against a whole-buffer resample of the streamed-
+    // NATIVE run rather than against the batch path: chatterbox batch and
+    // streaming synthesis legitimately differ (sliding-window context, HiFT
+    // cache continuity, first-chunk trim-fade, floored streaming CFM steps), so
+    // batch.pcm != stream.pcm even at the native rate.  output_sample_rate only
+    // changes the final resample, so both streamed runs share the same native
+    // signal and the comparison is bit-exact.
+    try {
+        EngineOptions on = base;          // native streaming
+        on.stream_chunk_tokens  = 25;
+        EngineOptions o16 = base;         // 16 kHz streaming
+        o16.stream_chunk_tokens = 25;
+        o16.output_sample_rate  = 16000;
+
+        std::vector<float> stream_native;
+        {
+            Engine eng(on);
+            StreamCallback cb = [&](const float * p, std::size_t n, int, bool) {
+                stream_native.insert(stream_native.end(), p, p + n);
+            };
+            eng.synthesize(text, cb);
+        }
+        std::vector<float> stream_16k;
+        {
+            Engine eng(o16);
+            StreamCallback cb = [&](const float * p, std::size_t n, int, bool) {
+                stream_16k.insert(stream_16k.end(), p, p + n);
+            };
+            eng.synthesize(text, cb);
+        }
+
+        const std::vector<float> expect =
+            resample_for_output(stream_native, 24000, 16000);
+        bool exact = (stream_16k.size() == expect.size());
+        for (std::size_t i = 0; exact && i < expect.size(); ++i) {
+            if (stream_16k[i] != expect[i]) exact = false;
+        }
+        std::printf("  streamed native=%zu, streamed 16k=%zu, whole-buffer resample=%zu\n",
+                    stream_native.size(), stream_16k.size(), expect.size());
+        CHECK(exact,
+              "streaming 16k == whole-buffer resample of streamed native (no per-chunk seams)");
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "streaming-resample-invariant synth threw: %s\n", e.what());
         return 1;
     }
 
