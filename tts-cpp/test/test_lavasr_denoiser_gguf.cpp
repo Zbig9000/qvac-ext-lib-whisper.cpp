@@ -92,13 +92,59 @@ int main(int argc, char ** argv) {
         ++failures;
     }
 
-    // --- full pipeline via the public API (rate-preserving) ---
+    auto dn = tts_cpp::lavasr::Denoiser::load(gguf);
+    if (dn->native_sample_rate() != w.work_sample_rate) {
+        std::fprintf(stderr, "FAIL: native_sample_rate mismatch\n");
+        ++failures;
+    }
+
+    // --- FULL pipeline parity vs the reference golden (STFT + multi-chunk
+    //     squared-Hann overlap-add + ISTFT).  pcm_in/pcm_out are 16 kHz, so the
+    //     resampler is identity and this isolates the STFT/OLA/ISTFT math that
+    //     the spec-level core parity above can't see.  The golden is produced by
+    //     scripts/dump-lavasr-denoiser-pipeline-fixtures.py (T>63 -> exercises
+    //     the overlap-add seams). ---
     {
-        auto dn = tts_cpp::lavasr::Denoiser::load(gguf);
-        if (dn->native_sample_rate() != w.work_sample_rate) {
-            std::fprintf(stderr, "FAIL: native_sample_rate mismatch\n");
+        std::vector<int> pshape;
+        std::vector<float> pcm_in  = load_f32(dir + "/pcm_in.npy", &pshape);
+        std::vector<float> pcm_out = load_f32(dir + "/pcm_out.npy");
+        std::vector<float> got     = dn->denoise(pcm_in, w.work_sample_rate);
+        if (got.size() != pcm_in.size() || pcm_out.size() != pcm_in.size()) {
+            std::fprintf(stderr, "FAIL: pipeline length %zu / golden %zu / in %zu\n",
+                         got.size(), pcm_out.size(), pcm_in.size());
             ++failures;
+        } else {
+            float pmax = 0.0f, psig = 0.0f;
+            double se = 0.0, sg = 0.0;
+            bool   finite = true;
+            for (size_t i = 0; i < got.size(); i++) {
+                if (!std::isfinite(got[i])) { finite = false; break; }
+                const float e = std::fabs(got[i] - pcm_out[i]);
+                pmax = std::max(pmax, e);
+                psig = std::max(psig, std::fabs(pcm_out[i]));
+                se += static_cast<double>(e) * e;
+                sg += static_cast<double>(pcm_out[i]) * pcm_out[i];
+            }
+            const float rrms = static_cast<float>(std::sqrt(se / std::max<double>(sg, 1e-12)));
+            std::printf("  pipeline parity (N=%zu, T>63): max_abs_err=%.3e rel_rms=%.3e (sig<=%.3f)\n",
+                        got.size(), pmax, rrms, psig);
+            // f32 radix-2 STFT/ISTFT vs the numpy f64 golden: allow a small
+            // absolute margin (the OLA + ISTFT reconstruction is well within it).
+            const float tol_pipe = 2e-3f;
+            if (!finite) {
+                std::fprintf(stderr, "FAIL: pipeline produced non-finite samples\n");
+                ++failures;
+            }
+            if (!(pmax < tol_pipe)) {
+                std::fprintf(stderr, "FAIL: pipeline exceeds tolerance %.0e\n", tol_pipe);
+                ++failures;
+            }
         }
+    }
+
+    // --- pipeline smoke at a non-work rate (exercises the resampler in+out and
+    //     the rate-preserving length/finiteness contract). ---
+    {
         const int          sr_in = 24000;
         std::vector<float> pcm(sr_in, 0.0f);
         for (int i = 0; i < sr_in; i++) {
@@ -110,7 +156,7 @@ int main(int argc, char ** argv) {
         for (float v : out) {
             if (!std::isfinite(v)) { finite = false; break; }
         }
-        std::printf("  pipeline: in=%zu @24k -> out=%zu (rate-preserving)\n", pcm.size(), out.size());
+        std::printf("  pipeline smoke: in=%zu @24k -> out=%zu (rate-preserving)\n", pcm.size(), out.size());
         if (out.size() != pcm.size()) {
             std::fprintf(stderr, "FAIL: denoise() length %zu != %zu\n", out.size(), pcm.size());
             ++failures;
@@ -119,7 +165,6 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "FAIL: denoise() produced non-finite samples\n");
             ++failures;
         }
-        // empty input -> empty output
         if (!dn->denoise({}, sr_in).empty()) {
             std::fprintf(stderr, "FAIL: denoise({}) not empty\n");
             ++failures;

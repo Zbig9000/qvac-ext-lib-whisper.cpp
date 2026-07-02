@@ -111,10 +111,17 @@ bool load_denoiser_gguf(const std::string & path, DenoiserWeights & out,
             return cleanup(fail(std::string("tensor '") + name +
                                 "' has unsupported dtype (expected f32/f16)"));
         }
-        for (int d = GGML_MAX_DIMS - 1; d >= 0; d--) {
-            if (t->ne[d] > 1 || !et.shape.empty()) {
-                et.shape.push_back(static_cast<int>(t->ne[d]));
-            }
+        // Rebuild the numpy/C tensor shape from ggml's ne[] (reversed and
+        // right-padded with unit dims).  Use ggml_n_dims() so the rank matches
+        // the ONNX rank and interior unit dims are preserved (e.g. depthwise
+        // conv [12,1,3,3]); only ggml's trailing unit padding is dropped.
+        // Caveat: ggml cannot represent a *leading* numpy unit dim ([1,N] and
+        // [N] share the same ne[]), so a mismatched export is caught by the
+        // converter's fail-fast shape asserts + check_shape() below, not here.
+        const int nd = ggml_n_dims(t) > 0 ? ggml_n_dims(t) : 1;
+        et.shape.resize(static_cast<size_t>(nd));
+        for (int d = 0; d < nd; d++) {
+            et.shape[d] = static_cast<int>(t->ne[nd - 1 - d]);
         }
         out.t.emplace(name, std::move(et));
     }

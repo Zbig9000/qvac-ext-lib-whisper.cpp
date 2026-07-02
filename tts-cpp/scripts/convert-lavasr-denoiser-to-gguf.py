@@ -31,6 +31,8 @@ Usage:
       --ftype    f32            # or f16
 """
 import argparse
+import hashlib
+import os
 import sys
 
 import numpy as np
@@ -55,6 +57,44 @@ CHUNK_FRAMES = 63
 CHUNK_HOP = 21
 BN_EPS = 1e-5              # nn.BatchNorm2d default
 LN_EPS = 1e-8             # DPGRNN LayerNorm eps
+
+# The C++ scalar core (denoiser_core.cpp) hardwires the default ULUNAS() topology
+# (5 encoder/decoder blocks, 12-ch depthwise convs, erb 65/64, 2x DPGRNN 16-wide,
+# cTFA r=4). Fail fast at conversion if the ONNX doesn't match, so a differently
+# NAS'd export can't produce a "valid" GGUF that the loader accepts but the
+# forward silently mis-runs. Names are post-"model."-strip; this is a superset of
+# the loader's check_shape() guard.
+EXPECTED_TENSOR_COUNT = 409
+EXPECTED_SHAPES = {
+    "erb.erb_fc.weight": (ERB_HIGH, SPEC_BINS - ERB_LOW),    # (64, 192)
+    "erb.ierb_fc.weight": (SPEC_BINS - ERB_LOW, ERB_HIGH),   # (192, 64)
+    "encoder.en_convs.0.ops.1.weight": (12, 1, 3, 3),        # first enc depthwise (12 ch)
+    "encoder.en_convs.4.pconv.0.weight": (16, 16, 1, 1),     # last enc pointwise (16 ch)
+    "decoder.de_convs.0.pconv.0.weight": (32, 8, 1, 1),      # first dec pointwise (skip-concat)
+    "decoder.de_convs.4.ops.1.weight": (12, 1, 3, 3),        # last dec conv -> mask
+    "dpgrnn.0.intra_fc.weight": (16, 16),
+    "dpgrnn.1.intra_fc.weight": (16, 16),
+}
+
+
+def check_topology(inits: dict) -> list:
+    """Return a list of human-readable problems if `inits` (raw ONNX initializer
+    name -> array) doesn't match the expected UL-UNAS topology; empty == OK."""
+    stripped = {
+        (n[len("model."):] if n.startswith("model.") else n): a
+        for n, a in inits.items()
+    }
+    problems = []
+    for name, want in EXPECTED_SHAPES.items():
+        if name not in stripped:
+            problems.append(f"missing tensor '{name}'")
+        elif tuple(stripped[name].shape) != want:
+            problems.append(f"'{name}' shape {tuple(stripped[name].shape)} != {want}")
+    if ERB_LOW + ERB_HIGH != 129:
+        problems.append(f"erb_low+erb_high={ERB_LOW + ERB_HIGH} != 129")
+    if len(inits) != EXPECTED_TENSOR_COUNT:
+        problems.append(f"tensor count {len(inits)} != {EXPECTED_TENSOR_COUNT}")
+    return problems
 
 
 def f16_ok(name: str, arr: np.ndarray) -> bool:
@@ -86,6 +126,22 @@ def main() -> int:
         sys.stderr.write("error: ONNX has no initializers\n")
         return 1
 
+    problems = check_topology(inits)
+    if problems:
+        sys.stderr.write(
+            "error: ONNX does not match the expected UL-UNAS topology that the "
+            "tts-cpp core hardwires:\n"
+        )
+        for p in problems:
+            sys.stderr.write(f"  - {p}\n")
+        sys.stderr.write(
+            "Refusing to write a GGUF the C++ forward would silently mis-run.\n"
+        )
+        return 1
+
+    with open(args.denoiser, "rb") as fh:
+        src_md5 = hashlib.md5(fh.read()).hexdigest()
+
     writer = GGUFWriter(args.out, ARCH)
     writer.add_uint32("lavasr.denoiser.n_fft", N_FFT)
     writer.add_uint32("lavasr.denoiser.hop", HOP)
@@ -99,6 +155,10 @@ def main() -> int:
     writer.add_uint32("lavasr.denoiser.chunk_hop", CHUNK_HOP)
     writer.add_float32("lavasr.denoiser.batchnorm_eps", BN_EPS)
     writer.add_float32("lavasr.denoiser.layernorm_eps", LN_EPS)
+    # Provenance: which ONNX this GGUF was converted from (name + MD5), so a
+    # baked model can be traced back to its source export.
+    writer.add_string("lavasr.denoiser.source_onnx", os.path.basename(args.denoiser))
+    writer.add_string("lavasr.denoiser.source_md5", src_md5)
 
     print("tensors:")
     n_f16 = 0
@@ -120,6 +180,7 @@ def main() -> int:
     writer.close()
     print(f"\nWrote {args.out} (arch={ARCH}, ftype={args.ftype}, "
           f"tensors={len(inits)}, f16={n_f16})")
+    print(f"source: {os.path.basename(args.denoiser)} md5={src_md5}")
     return 0
 
 

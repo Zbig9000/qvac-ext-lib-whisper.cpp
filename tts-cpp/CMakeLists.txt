@@ -908,7 +908,9 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_register_test(test-lavasr-denoiser-gguf
         LABEL    "fixture"
         ARGS     "${TTS_CPP_TEST_MODEL_DIR}/lavasr-denoiser.gguf" "${TTS_CPP_TEST_REF_DIR}/lavasr-denoiser"
-        REQUIRES "${TTS_CPP_TEST_MODEL_DIR}/lavasr-denoiser.gguf" "${TTS_CPP_TEST_REF_DIR}/lavasr-denoiser/spec_in.npy")
+        REQUIRES "${TTS_CPP_TEST_MODEL_DIR}/lavasr-denoiser.gguf"
+                 "${TTS_CPP_TEST_REF_DIR}/lavasr-denoiser/spec_in.npy"
+                 "${TTS_CPP_TEST_REF_DIR}/lavasr-denoiser/pcm_in.npy")
 
     # QVAC-20979 — voice-clone test harness.
     #

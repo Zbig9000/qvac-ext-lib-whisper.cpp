@@ -18,7 +18,12 @@ int denoiser_work_sample_rate(const DenoiserWeights & w) {
 
 namespace {
 
-// Squared periodic-Hann chunk weights (matches @qvac/tts-onnx LavaSRDenoiser).
+// Squared symmetric-Hann chunk-blend weights for the overlap-add stitch of the
+// fixed-L chunks.  This is the SYMMETRIC Hann (denominator L-1, endpoints -> 0),
+// squared, with a small floor — a byte-for-byte match of the reference
+// @qvac/tts-onnx LavaSRDenoiser::buildChunkWeights().  Note this is deliberately
+// a different window from the STFT analysis window (StftProcessor uses the
+// PERIODIC Hann, denominator L); do not "unify" them.
 std::vector<float> chunk_weights(int L) {
     std::vector<float> w(L);
     for (int i = 0; i < L; i++) {

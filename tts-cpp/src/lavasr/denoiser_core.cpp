@@ -256,7 +256,7 @@ struct Runner {
     // causal time-frequency attention: at(temporal) * x * af(frequency).
     T3 ctfa(const T3 & x, const std::string & p) const {
         const int C = x.C, T = x.T, F = x.F;
-        // temporal: mean over freq -> GRU(C->2C) -> FC(2C->C) -> sigmoid
+        // temporal: energy-mean (mean of squares) over freq -> GRU(C->2C) -> FC(2C->C) -> sigmoid
         std::vector<float> zt(static_cast<size_t>(T) * C, 0.0f);
         for (int t = 0; t < T; t++)
             for (int c = 0; c < C; c++) {
@@ -267,7 +267,7 @@ struct Runner {
         std::vector<float> at = gru_uni(zt, T, C, p + ".ta_gru");
         at = linear2d(at, T, 2 * C, W(p + ".ta_fc.weight"), C, Wopt(p + ".ta_fc.bias"));
         for (float & v : at) v = sigmoidf(v);
-        // frequency: mean over chan -> fold by r -> BiGRU(r->r) -> FC(2r->r) -> sigmoid
+        // frequency: energy-mean (mean of squares) over chan -> fold by r -> BiGRU(r->r) -> FC(2r->r) -> sigmoid
         const int r = w.freq_comp_ratio;
         const int pad_len = (r - (F % r)) % r;
         const int Fp = F + pad_len, Hh = Fp / r;
