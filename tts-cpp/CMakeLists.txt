@@ -389,6 +389,15 @@ if (TTS_CPP_BUILD_LIBRARY)
             $<$<COMPILE_LANGUAGE:C>:-O3>
             $<$<COMPILE_LANGUAGE:CXX>:-ffast-math>
             $<$<COMPILE_LANGUAGE:C>:-ffast-math>
+            # -ffast-math implies -ffinite-math-only, which lets the compiler
+            # assume no NaN/Inf and optimise away the LavaSR DSP's numerical
+            # guards (e.g. the sinc `x != 0` and `weight_sum > 0` guards in the
+            # resampler). On the denoiser -> enhancer chain that produced NaNs in
+            # the denoiser output which the FastLR FFT merge then spread across
+            # the whole enhancer result -> silent output. Keep the fast-math
+            # speedups but restore IEEE NaN/Inf handling so those guards hold.
+            $<$<COMPILE_LANGUAGE:CXX>:-fno-finite-math-only>
+            $<$<COMPILE_LANGUAGE:C>:-fno-finite-math-only>
             $<$<COMPILE_LANGUAGE:CXX>:-funroll-loops>
             $<$<COMPILE_LANGUAGE:C>:-funroll-loops>
         )
