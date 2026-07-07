@@ -22,12 +22,17 @@
 #include "lavasr/enhancer_core.h"
 #include "lavasr/enhancer_ggml.h"
 #include "npy.h"
+#include "tts-cpp/lavasr/enhancer.h" // public Enhancer::load() API under test
 
+#include "ggml.h"
 #include "ggml-backend.h"
+#include "gguf.h"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -402,9 +407,189 @@ static int golden_test(const std::string & dir) {
     return parity_over_backends(w, mel, T, &re_gold, &im_gold);
 }
 
+// ---------------------------------------------------------------------------
+// Public Enhancer::load() API smoke test (writes a synthetic GGUF)
+// ---------------------------------------------------------------------------
+// The parity tests above drive the internal enhancer_ggml_* / free-function
+// enhance() directly; they never touch the public Enhancer class.  This test
+// covers that load-time wiring — which the downstream JS suite otherwise
+// exercises only indirectly: with default options Enhancer::load() must select
+// the ggml-CPU backend (backend_device()==CPU, non-empty backend_name()), and
+// enhance() must return a non-empty 48 kHz signal.  It also guards the
+// "graph created -> enhance() runs the graph" path end to end.  Self-contained:
+// synthesises a small but DSP-consistent enhancer GGUF in a temp file, loads it
+// through the public API, then removes the file.
+
+// Create an F32 tensor with the given ggml-order dims, copy the host weights in,
+// and register it in the gguf context under `name`.
+static void add_gguf_tensor(ggml_context * ctx, gguf_context * g,
+                            const EnhancerWeights & w, const std::string & name,
+                            const std::vector<int64_t> & ne) {
+    ggml_tensor * t =
+        ggml_new_tensor(ctx, GGML_TYPE_F32, static_cast<int>(ne.size()), ne.data());
+    ggml_set_name(t, name.c_str());
+    const std::vector<float> & src = w.get(name).data;
+    std::memcpy(t->data, src.data(), src.size() * sizeof(float));
+    gguf_add_tensor(g, t);
+}
+
+// Write `w` to a temp enhancer GGUF matching convert-lavasr-enhancer-to-gguf.py's
+// schema (arch key, dim metadata, and tensors in [out,in,K]/[out,in] numpy order
+// — i.e. reversed ggml ne).  Returns the path, or "" on failure.
+static std::string write_enhancer_gguf(const EnhancerWeights & w) {
+    const int C = w.dim, F = w.ffn_dim, M = w.n_mels, K = w.kernel, B = w.spec_bins;
+
+    struct Entry {
+        std::string          name;
+        std::vector<int64_t> ne; // ggml order (element count == fill_random_weights)
+    };
+    std::vector<Entry> roster;
+    roster.push_back({"enhancer.embed.weight", {K, M, C}});
+    roster.push_back({"enhancer.embed.bias", {C}});
+    roster.push_back({"enhancer.norm.weight", {C}});
+    roster.push_back({"enhancer.norm.bias", {C}});
+    for (int i = 0; i < w.n_blocks; i++) {
+        const std::string p = "enhancer.block." + std::to_string(i) + ".";
+        roster.push_back({p + "dwconv.weight", {K, 1, C}});
+        roster.push_back({p + "dwconv.bias", {C}});
+        roster.push_back({p + "norm.weight", {C}});
+        roster.push_back({p + "norm.bias", {C}});
+        roster.push_back({p + "pwconv1.weight", {C, F}});
+        roster.push_back({p + "pwconv1.bias", {F}});
+        roster.push_back({p + "pwconv2.weight", {F, C}});
+        roster.push_back({p + "pwconv2.bias", {C}});
+        roster.push_back({p + "gamma", {C}});
+    }
+    roster.push_back({"enhancer.final_norm.weight", {C}});
+    roster.push_back({"enhancer.final_norm.bias", {C}});
+    roster.push_back({"spec_head.out.weight", {C, 2 * B}});
+    roster.push_back({"spec_head.out.bias", {2 * B}});
+
+    size_t bytes = 0;
+    for (const Entry & e : roster) {
+        int64_t n = 1;
+        for (int64_t d : e.ne) {
+            n *= d;
+        }
+        bytes += static_cast<size_t>(n) * sizeof(float);
+    }
+    // +32 B/tensor covers ggml's per-object data alignment padding.
+    ggml_init_params ip = {
+        bytes + (roster.size() + 1) * ggml_tensor_overhead() + 32 * roster.size(), nullptr,
+        /*no_alloc=*/false};
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        std::fprintf(stderr, "FAIL: ggml_init for GGUF writer failed\n");
+        return std::string();
+    }
+
+    gguf_context * g = gguf_init_empty();
+    gguf_set_val_str(g, "general.architecture", "lavasr-enhancer");
+    gguf_set_val_u32(g, "lavasr.enhancer.dim", static_cast<uint32_t>(w.dim));
+    gguf_set_val_u32(g, "lavasr.enhancer.ffn_dim", static_cast<uint32_t>(w.ffn_dim));
+    gguf_set_val_u32(g, "lavasr.enhancer.n_blocks", static_cast<uint32_t>(w.n_blocks));
+    gguf_set_val_u32(g, "lavasr.enhancer.n_mels", static_cast<uint32_t>(w.n_mels));
+    gguf_set_val_u32(g, "lavasr.enhancer.kernel", static_cast<uint32_t>(w.kernel));
+    gguf_set_val_u32(g, "lavasr.enhancer.n_fft", static_cast<uint32_t>(w.n_fft));
+    gguf_set_val_u32(g, "lavasr.enhancer.hop", static_cast<uint32_t>(w.hop));
+    gguf_set_val_u32(g, "lavasr.enhancer.win", static_cast<uint32_t>(w.win));
+    gguf_set_val_u32(g, "lavasr.enhancer.spec_bins", static_cast<uint32_t>(w.spec_bins));
+    gguf_set_val_f32(g, "lavasr.enhancer.clip_max", w.clip_max);
+    gguf_set_val_f32(g, "lavasr.enhancer.layernorm_eps", w.ln_eps);
+    gguf_set_val_u32(g, "lavasr.enhancer.work_sample_rate",
+                     static_cast<uint32_t>(w.work_sample_rate));
+    gguf_set_val_u32(g, "lavasr.enhancer.mel_ref_sample_rate",
+                     static_cast<uint32_t>(w.mel_ref_sample_rate));
+
+    for (const Entry & e : roster) {
+        add_gguf_tensor(ctx, g, w, e.name, e.ne);
+    }
+
+    const char * tmpdir = std::getenv("TMPDIR");
+    std::string  path =
+        std::string(tmpdir ? tmpdir : "/tmp") + "/test-lavasr-enhancer-load.gguf";
+    const bool ok = gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+    gguf_free(g);
+    ggml_free(ctx);
+    if (!ok) {
+        std::fprintf(stderr, "FAIL: could not write enhancer GGUF to %s\n", path.c_str());
+        return std::string();
+    }
+    return path;
+}
+
+static int selftest_public_api() {
+    // Small backbone but production-default DSP dims (n_mels/kernel/n_fft/hop/win/
+    // spec_bins/sample-rates), so the loader's shape checks and the enhance()
+    // pipeline run exactly as shipped.
+    EnhancerWeights w;
+    w.dim      = 64;
+    w.ffn_dim  = 128;
+    w.n_blocks = 2;
+
+    std::mt19937 rng(4242u);
+    fill_random_weights(w, rng);
+
+    const std::string path = write_enhancer_gguf(w);
+    if (path.empty()) {
+        return 1;
+    }
+
+    std::printf("LavaSR enhancer public-API test (Enhancer::load, default opts):\n");
+
+    int failures = 0;
+    try {
+        // Default opts => no GPU requested => ggml-CPU backend.
+        std::unique_ptr<tts_cpp::lavasr::Enhancer> enh =
+            tts_cpp::lavasr::Enhancer::load(path);
+        if (!enh) {
+            std::fprintf(stderr, "FAIL: Enhancer::load returned null\n");
+            std::remove(path.c_str());
+            return 1;
+        }
+
+        const tts_cpp::BackendDevice dev = enh->backend_device();
+        const std::string            bn  = enh->backend_name();
+        std::printf("  backend_device=%d backend_name='%s' out_rate=%d\n",
+                    static_cast<int>(dev), bn.c_str(), enh->output_sample_rate());
+
+        if (dev != tts_cpp::BackendDevice::CPU) {
+            std::fprintf(stderr, "FAIL: default-opts load should resolve to CPU (got %d)\n",
+                         static_cast<int>(dev));
+            ++failures;
+        }
+        if (bn.empty()) {
+            std::fprintf(stderr, "FAIL: backend_name() is empty\n");
+            ++failures;
+        }
+
+        // ~0.25 s of 24 kHz mono; enhance() must resample + band-extend to a
+        // non-empty 48 kHz signal — guards the load -> graph -> enhance() wiring.
+        const int          sr_in = 24000;
+        std::vector<float> pcm(static_cast<size_t>(sr_in / 4));
+        for (size_t i = 0; i < pcm.size(); i++) {
+            pcm[i] = 0.1f * std::sin(2.0f * 3.14159265358979f * 220.0f * i / sr_in);
+        }
+        const std::vector<float> out = enh->enhance(pcm, sr_in);
+        if (out.empty()) {
+            std::fprintf(stderr, "FAIL: enhance() returned empty output\n");
+            ++failures;
+        } else {
+            std::printf("  enhance(): %zu in -> %zu out samples\n", pcm.size(), out.size());
+        }
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "FAIL: Enhancer::load/enhance threw: %s\n", e.what());
+        ++failures;
+    }
+
+    std::remove(path.c_str());
+    return failures;
+}
+
 int main(int argc, char ** argv) {
     int failures = selftest();
     failures += selftest_pipeline();
+    failures += selftest_public_api();
 
     // Bonus: when the real fixtures are present, also check the ggml forward
     // against the onnxruntime golden with the production weights.

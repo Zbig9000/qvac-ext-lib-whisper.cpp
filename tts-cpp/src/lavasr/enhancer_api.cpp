@@ -8,6 +8,7 @@
 
 #include "ggml-backend.h"
 
+#include <cstdio>
 #include <mutex>
 #include <stdexcept>
 
@@ -86,8 +87,17 @@ std::unique_ptr<Enhancer> Enhancer::load(const std::string & gguf_path,
             const char * bn        = ggml_backend_name(backend);
             e->impl_->backend_name = bn ? bn : (device == BackendDevice::GPU ? "GPU" : "CPU");
         } else {
-            // Weight declaration/upload failed — drop the backend and run the
-            // scalar core directly.
+            // Graph / weight setup failed — drop the backend and run the scalar
+            // core directly.  Surface it under verbose so a host that asked for a
+            // GPU can tell why backend_device() ends up CPU instead of the
+            // fallback happening silently.
+            if (opts.verbose) {
+                const char * bn = ggml_backend_name(backend);
+                std::fprintf(stderr,
+                             "lavasr-enhancer: ggml graph creation failed on the %s "
+                             "backend; falling back to the scalar CPU core\n",
+                             bn ? bn : "?");
+            }
             ggml_backend_free(backend);
         }
     }

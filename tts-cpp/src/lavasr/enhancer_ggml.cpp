@@ -140,7 +140,7 @@ ggml_tensor * new_3d(ggml_context * ctx, int64_t ne0, int64_t ne1, int64_t ne2,
 }
 
 // Upload a named host weight into a declared tensor, checking the element count.
-bool upload_weight(EnhancerGgml * g, ggml_tensor * t, const EnhancerWeights & w,
+bool upload_weight(ggml_tensor * t, const EnhancerWeights & w,
                    const std::string & name) {
     if (!w.has(name)) {
         std::fprintf(stderr, "lavasr enhancer ggml: missing weight '%s'\n", name.c_str());
@@ -154,7 +154,6 @@ bool upload_weight(EnhancerGgml * g, ggml_tensor * t, const EnhancerWeights & w,
                      static_cast<long long>(ggml_nelements(t)));
         return false;
     }
-    (void) g;
     ggml_backend_tensor_set(t, src.data(), 0, src.size() * sizeof(float));
     return true;
 }
@@ -250,27 +249,27 @@ EnhancerGgml * enhancer_ggml_create(const EnhancerWeights & w, ggml_backend_t ba
     }
 
     bool ok = true;
-    ok = ok && upload_weight(g, g->embed_w, w, "enhancer.embed.weight");
-    ok = ok && upload_weight(g, g->embed_b, w, "enhancer.embed.bias");
-    ok = ok && upload_weight(g, g->norm_g, w, "enhancer.norm.weight");
-    ok = ok && upload_weight(g, g->norm_b, w, "enhancer.norm.bias");
+    ok = ok && upload_weight(g->embed_w, w, "enhancer.embed.weight");
+    ok = ok && upload_weight(g->embed_b, w, "enhancer.embed.bias");
+    ok = ok && upload_weight(g->norm_g, w, "enhancer.norm.weight");
+    ok = ok && upload_weight(g->norm_b, w, "enhancer.norm.bias");
     for (int i = 0; ok && i < g->n_blocks; i++) {
         const std::string p = "enhancer.block." + std::to_string(i) + ".";
         const BlockW &    b = g->blocks[static_cast<size_t>(i)];
-        ok = ok && upload_weight(g, b.dw_w, w, p + "dwconv.weight");
-        ok = ok && upload_weight(g, b.dw_b, w, p + "dwconv.bias");
-        ok = ok && upload_weight(g, b.norm_g, w, p + "norm.weight");
-        ok = ok && upload_weight(g, b.norm_b, w, p + "norm.bias");
-        ok = ok && upload_weight(g, b.pw1_w, w, p + "pwconv1.weight");
-        ok = ok && upload_weight(g, b.pw1_b, w, p + "pwconv1.bias");
-        ok = ok && upload_weight(g, b.pw2_w, w, p + "pwconv2.weight");
-        ok = ok && upload_weight(g, b.pw2_b, w, p + "pwconv2.bias");
-        ok = ok && upload_weight(g, b.gamma, w, p + "gamma");
+        ok = ok && upload_weight(b.dw_w, w, p + "dwconv.weight");
+        ok = ok && upload_weight(b.dw_b, w, p + "dwconv.bias");
+        ok = ok && upload_weight(b.norm_g, w, p + "norm.weight");
+        ok = ok && upload_weight(b.norm_b, w, p + "norm.bias");
+        ok = ok && upload_weight(b.pw1_w, w, p + "pwconv1.weight");
+        ok = ok && upload_weight(b.pw1_b, w, p + "pwconv1.bias");
+        ok = ok && upload_weight(b.pw2_w, w, p + "pwconv2.weight");
+        ok = ok && upload_weight(b.pw2_b, w, p + "pwconv2.bias");
+        ok = ok && upload_weight(b.gamma, w, p + "gamma");
     }
-    ok = ok && upload_weight(g, g->final_norm_g, w, "enhancer.final_norm.weight");
-    ok = ok && upload_weight(g, g->final_norm_b, w, "enhancer.final_norm.bias");
-    ok = ok && upload_weight(g, g->spec_w, w, "spec_head.out.weight");
-    ok = ok && upload_weight(g, g->spec_b, w, "spec_head.out.bias");
+    ok = ok && upload_weight(g->final_norm_g, w, "enhancer.final_norm.weight");
+    ok = ok && upload_weight(g->final_norm_b, w, "enhancer.final_norm.bias");
+    ok = ok && upload_weight(g->spec_w, w, "spec_head.out.weight");
+    ok = ok && upload_weight(g->spec_b, w, "spec_head.out.bias");
     if (!ok) {
         enhancer_ggml_free(g);
         return nullptr;
