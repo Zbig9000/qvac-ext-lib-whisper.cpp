@@ -295,7 +295,7 @@ bool enhancer_ggml_spec_forward(EnhancerGgml * g,
     if (!g || T <= 0) {
         return false;
     }
-    const int C = g->C, M = g->n_mels, K = g->K, B = g->spec_bins;
+    const int M = g->n_mels, K = g->K, B = g->spec_bins;
     if (static_cast<int64_t>(mel.size()) != static_cast<int64_t>(M) * T) {
         std::fprintf(stderr, "lavasr enhancer ggml: mel size %zu != %d*%d\n",
                      mel.size(), M, T);
