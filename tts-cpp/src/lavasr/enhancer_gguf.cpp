@@ -110,9 +110,33 @@ bool load_enhancer_gguf(const std::string & path, EnhancerWeights & out,
             for (int64_t i = 0; i < n; i++) {
                 et.data[static_cast<size_t>(i)] = ggml_fp16_to_fp32(tmp[static_cast<size_t>(i)]);
             }
+        } else if (ggml_is_quantized(t->type)) {
+            // Quantized GGUF (Q4_0 / Q8_0 / Q5_0 — from the enhancer converter's
+            // --ftype q* or scripts/requantize-gguf.py): stream the packed blocks
+            // into a scratch buffer and dequantize to the f32 that both the
+            // scalar core and the ggml-graph weight upload consume. This mirrors
+            // the Supertonic "dequant-at-load" policy: the GGUF ships smaller
+            // (only the big pwconv/spec-head matmul weights are block-quantized;
+            // the K=7 conv kernels stay F16 and the norms/biases/gamma stay F32),
+            // the weights are F32 in RAM, and the forward math is unchanged.
+            // Uses the public ggml_get_type_traits()->to_float entry point:
+            // ggml-quants.h lives under ggml/src/ and isn't shipped by the
+            // ggml-speech vcpkg port, so a direct include would break the
+            // system-ggml build path.
+            const ggml_type_traits * tr = ggml_get_type_traits(t->type);
+            if (!tr || !tr->to_float) {
+                return cleanup(fail(std::string("tensor '") + name +
+                                    "' has unsupported quantized dtype " +
+                                    ggml_type_name(t->type)));
+            }
+            std::vector<uint8_t> packed(static_cast<size_t>(ggml_nbytes(t)));
+            if (!reader.to_host(name, packed.data(), packed.size())) {
+                return cleanup(fail(std::string("failed to read tensor '") + name + "'"));
+            }
+            tr->to_float(packed.data(), et.data.data(), n);
         } else {
             return cleanup(fail(std::string("tensor '") + name +
-                                "' has unsupported dtype (expected f32/f16)"));
+                                "' has unsupported dtype (expected f32/f16/quantized)"));
         }
         for (int d = GGML_MAX_DIMS - 1; d >= 0; d--) {
             if (t->ne[d] > 1 || !et.shape.empty()) {

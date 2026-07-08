@@ -1005,6 +1005,22 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_apply_ccache(test-lavasr-dsp)
     tts_cpp_register_test(test-lavasr-dsp LABEL "unit")
 
+    # LavaSR enhancer quantized-GGUF round-trip: writes a small random enhancer
+    # three ways (F32 / Q8_0 / Q4_0 — block-quantizing only the pwconv/spec-head
+    # matmul weights, exactly like convert-lavasr-enhancer-to-gguf.py --ftype q*),
+    # loads each back through load_enhancer_gguf() and asserts the Q4_0/Q8_0
+    # dequant-at-load path produces finite, well-correlated output vs F32. Links
+    # ggml for the GGUF writer + ggml_quantize_chunk + to_float dequant; no model
+    # download / fixtures, so it always runs in CI.
+    add_executable(test-lavasr-enhancer-quant
+        test/test_lavasr_enhancer_quant.cpp
+        src/lavasr/enhancer_gguf.cpp
+        src/lavasr/enhancer_core.cpp)
+    target_link_libraries(test-lavasr-enhancer-quant PRIVATE ggml)
+    target_include_directories(test-lavasr-enhancer-quant PRIVATE src ggml/include)
+    tts_cpp_apply_ccache(test-lavasr-enhancer-quant)
+    tts_cpp_register_test(test-lavasr-enhancer-quant LABEL "unit")
+
     # LavaSR enhancer scalar-core parity test: numerical parity of
     # the neural core (mel -> backbone -> spec head -> real/imag) against an
     # onnxruntime golden, plus a finite/length smoke test of the full enhance()

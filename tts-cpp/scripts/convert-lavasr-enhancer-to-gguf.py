@@ -20,22 +20,61 @@ Linear (MatMul) weights are stored ONNX-side as [in,out]; we transpose them to
 [out,in] (PyTorch convention) so the C++ loader reads ggml ne=[in,out] and runs
 ggml_mul_mat(W, x) directly.  Conv weights are stored as ONNX [out,in,k].
 
+Quantization (--ftype q4_0 / q5_0 / q8_0): the block-quant tiers reuse the
+shared policy in requantize-gguf.py (should_quantize), so the one-step ONNX->
+GGUF converter and the requantize-an-existing-GGUF path can never drift (the
+drift between them is exactly what broke S3Gen conversion in QVAC-21203). Only
+the big 2-D matmul weights qualify: the 8x ConvNeXt pwconv1/pwconv2 (512<->1536)
+and the spec-head Linear (512->2050), i.e. 17 tensors and ~97% of the weights.
+The K=7 conv kernels (embed + depthwise) are not block-aligned so they stay F16;
+LayerNorm scales, all biases and the per-block layer-scale gamma stay F32. The
+C++ loader (enhancer_gguf.cpp) dequantizes every tensor to F32 at load, so the
+forward math is identical to F32 — the win is a smaller GGUF (Q4_0 ~= 15% of the
+F32 GGUF / ~30% of F16).
+
 Usage:
   python convert-lavasr-enhancer-to-gguf.py \
       --backbone  enhancer_backbone.onnx \
       --spec-head enhancer_spec_head.onnx \
       --out       lavasr-enhancer.gguf \
-      --ftype     f32            # or f16
+      --ftype     f32            # or f16 / q8_0 / q5_0 / q4_0
 """
 import argparse
+import importlib.util
+import os
 import sys
 
+import gguf
 import numpy as np
 import onnx
 from gguf import GGUFWriter
 from onnx import numpy_helper
 
 ARCH = "lavasr-enhancer"
+
+# Map the --ftype quant tiers onto gguf quant types. F32/F16 are handled inline
+# by store(); these are the block-quant tiers that route through should_quantize.
+_QUANT_TYPE = {
+    "q8_0": gguf.GGMLQuantizationType.Q8_0,
+    "q5_0": gguf.GGMLQuantizationType.Q5_0,
+    "q4_0": gguf.GGMLQuantizationType.Q4_0,
+}
+
+
+def _load_should_quantize():
+    """Import should_quantize() from the sibling requantize-gguf.py so the
+    converter and the requantizer share ONE quant policy (name deny-list +
+    block-size gates). The hyphen in the filename blocks a plain import, so
+    load it by path."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "requantize-gguf.py")
+    spec = importlib.util.spec_from_file_location("requantize_gguf", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.should_quantize
+
+
+should_quantize = _load_should_quantize()
 
 # Mel / STFT params (must match src/lavasr/dsp + the @qvac/tts-onnx enhancer).
 N_MELS = 80
@@ -82,6 +121,32 @@ def find_matmul_weight(graph, inits, by_out, bias_name):
 
 def store(writer, name, arr, ftype, allow_f16=True):
     arr = np.ascontiguousarray(arr)
+
+    # Block-quant tiers (q4_0 / q5_0 / q8_0): defer the per-tensor keep/quant
+    # decision to the shared should_quantize policy so this one-step converter
+    # and requantize-gguf.py stay consistent. Only the big 2-D matmul weights
+    # (pwconv1/pwconv2/spec_head.out) clear the block-size gate; the K=7 conv
+    # kernels, LayerNorm scales, biases and gamma fall through to the F16/F32
+    # keep path below (matching requantize-gguf.py's "kept at source dtype").
+    if ftype in _QUANT_TYPE:
+        qtype = _QUANT_TYPE[ftype]
+        if arr.dtype == np.float32 and should_quantize(name, tuple(arr.shape), qtype):
+            qdata = gguf.quants.quantize(arr, qtype)
+            # raw_shape is the BYTE shape (gguf-0.18+ add_tensor_info treats a
+            # uint8 raw tensor's inner dim as bytes/row); raw_dtype=Q* carries
+            # the element dims. qdata.shape already encodes it — same call
+            # requantize-gguf.py uses.
+            writer.add_tensor(name, qdata, raw_shape=qdata.shape, raw_dtype=qtype)
+            print(f"  {name:42s} {qtype.name:8s} {list(arr.shape)}")
+            return
+        if allow_f16 and arr.ndim >= 2 and arr.dtype == np.float32:
+            arr = arr.astype(np.float16)
+        elif arr.dtype != np.float32 and arr.dtype != np.float16:
+            arr = arr.astype(np.float32)
+        writer.add_tensor(name, arr)
+        print(f"  {name:42s} {str(arr.dtype):8s} {list(arr.shape)}")
+        return
+
     if ftype == "f16" and allow_f16 and arr.ndim >= 2 and arr.dtype == np.float32:
         arr = arr.astype(np.float16)
     elif arr.dtype != np.float32 and arr.dtype != np.float16:
@@ -95,7 +160,8 @@ def main():
     ap.add_argument("--backbone", required=True)
     ap.add_argument("--spec-head", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--ftype", choices=["f32", "f16"], default="f32")
+    ap.add_argument("--ftype", choices=["f32", "f16", "q8_0", "q5_0", "q4_0"],
+                    default="f32")
     args = ap.parse_args()
 
     bb = onnx.load(args.backbone, load_external_data=True).graph
