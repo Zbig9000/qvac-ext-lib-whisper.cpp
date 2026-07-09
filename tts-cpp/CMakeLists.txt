@@ -434,6 +434,14 @@ if (TTS_CPP_BUILD_EXECUTABLES)
     add_executable(supertonic-cli src/supertonic_cli.cpp)
     target_link_libraries(supertonic-cli PRIVATE tts-cpp)
     tts_cpp_apply_ccache(supertonic-cli)
+
+    # LavaSR enhancer requantizer (C++ companion to scripts/requantize-gguf.py).
+    # Emits the K-quant tiers (q4_K/q5_K/q6_K) the Python gguf lib can't, via
+    # ggml_quantize_chunk; links ggml only (no tts-cpp) like mel2wav.
+    add_executable(lavasr-requantize src/lavasr/lavasr_requantize.cpp)
+    target_link_libraries(lavasr-requantize PRIVATE ggml)
+    target_include_directories(lavasr-requantize PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(lavasr-requantize)
 endif()
 
 if (TTS_CPP_BUILD_TESTS)

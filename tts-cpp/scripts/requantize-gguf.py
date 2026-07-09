@@ -12,6 +12,11 @@ builtin voice conditioning) at their source dtype.
 Works for both models because the deny-list covers the union of
 patterns that either side uses for "keep-as-F32/F16".
 
+Only the legacy block-quant tiers (Q8_0 / Q5_0 / Q4_0) are reachable here: the
+Python `gguf` library can quantize those but not the K-quants (Q4_K / Q5_K /
+Q6_K).  K-quants need ggml's own quantizer — for the LavaSR enhancer use the C++
+`lavasr-requantize` tool in tts-cpp; the enhancer loader reads either.
+
 Usage:
 
     # T3 Q8_0
