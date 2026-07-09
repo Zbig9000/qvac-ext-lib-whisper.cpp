@@ -1,18 +1,24 @@
 // Self-contained round-trip test for the LavaSR enhancer QUANTIZED GGUF path
-// (Q4_0 / Q8_0 "dequant-at-load", QVAC-21906).
+// ("dequant-at-load", QVAC-21906). Covers the legacy block-quant tiers
+// (Q4_0 / Q8_0) AND the K-quants (Q4_K / Q5_K / Q6_K).
 //
-// scripts/convert-lavasr-enhancer-to-gguf.py --ftype q4_0|q8_0 (and
-// scripts/requantize-gguf.py) block-quantize only the big 2-D matmul weights —
-// the 8x ConvNeXt pwconv1/pwconv2 and the spec-head Linear — and keep the K=7
-// conv kernels + LayerNorm scales + biases + gamma at F16/F32. load_enhancer_gguf()
-// then dequantizes every tensor to F32 at load (ggml_get_type_traits()->to_float),
-// so the scalar/graph forward math is unchanged and the only cost is the
-// quantization error baked into the stored weights.
+// scripts/convert-lavasr-enhancer-to-gguf.py --ftype q4_0|q8_0 and the C++
+// requantizer (scripts/requantize-gguf.py for the legacy tiers, tools/
+// lavasr-requantize for the K-quants the Python gguf lib can't emit)
+// block-quantize only the big 2-D matmul weights — the 8x ConvNeXt pwconv1/
+// pwconv2 and the spec-head Linear — and keep the K=7 conv kernels + LayerNorm
+// scales + biases + gamma at F16/F32. load_enhancer_gguf() then dequantizes
+// every tensor to F32 at load (ggml_get_type_traits()->to_float), so the
+// scalar/graph forward math is unchanged and the only cost is the quantization
+// error baked into the stored weights. The loader path is generic
+// (ggml_is_quantized), so K-quants load with no loader change — this test is
+// what proves that end to end.
 //
 // This test builds a small enhancer with deterministic pseudo-random weights,
-// writes it to a temp GGUF three ways (F32 baseline, Q8_0, Q4_0 — quantizing
-// exactly the pwconv/spec-head tensors), loads each back through the real
-// load_enhancer_gguf() + scalar enhancer_spec_forward(), and asserts:
+// writes it to a temp GGUF six ways (F32 baseline, Q8_0, Q4_0, Q4_K, Q5_K,
+// Q6_K — quantizing exactly the pwconv/spec-head tensors), loads each back
+// through the real load_enhancer_gguf() + scalar enhancer_spec_forward(), and
+// asserts:
 //   * the quantized GGUFs LOAD (exercise the ggml_is_quantized dequant branch),
 //   * their spectral output is finite and well-correlated with the F32 baseline
 //     (a byte-reinterpret / wrong-dtype bug tanks cos-sim to ~0 or NaN),
@@ -231,12 +237,16 @@ static bool forward(const std::string & path, const std::vector<float> & mel, in
 }
 
 int main() {
-    // Small but structurally complete enhancer; dims are multiples of the 32-
-    // element Q4_0/Q8_0 block so ggml_quantize_chunk accepts the reduction dim.
+    // Small but structurally complete enhancer. The quantized weights are the
+    // pwconv/spec-head Linears, whose reduction dim (ne0) is dim (pwconv1,
+    // spec_head) or ffn_dim (pwconv2); both must be a multiple of QK_K = 256 so
+    // ggml_quantize_chunk accepts the K-quants (256-element super-block). 256 is
+    // also a multiple of the 32-element Q4_0/Q8_0 block, so all tiers are
+    // exercised with one set of dims.
     EnhancerWeights w;
-    w.dim       = 64;
-    w.ffn_dim   = 128;
-    w.n_blocks  = 3;
+    w.dim       = 256;
+    w.ffn_dim   = 256;
+    w.n_blocks  = 2;
     w.n_mels    = 32;
     w.kernel    = 7;
     w.spec_bins = 40;
@@ -256,7 +266,14 @@ int main() {
     const std::string p_f32 = write_enhancer_gguf(w, GGML_TYPE_F32, "f32");
     const std::string p_q8  = write_enhancer_gguf(w, GGML_TYPE_Q8_0, "q8_0");
     const std::string p_q4  = write_enhancer_gguf(w, GGML_TYPE_Q4_0, "q4_0");
-    if (p_f32.empty() || p_q8.empty() || p_q4.empty()) {
+    // K-quants: the Python gguf lib can't emit these, but the C++ requantizer
+    // (ggml_quantize_chunk) can, and the loader's generic ggml_is_quantized path
+    // reads them with no code change. This is what proves that.
+    const std::string p_q4k = write_enhancer_gguf(w, GGML_TYPE_Q4_K, "q4_K");
+    const std::string p_q5k = write_enhancer_gguf(w, GGML_TYPE_Q5_K, "q5_K");
+    const std::string p_q6k = write_enhancer_gguf(w, GGML_TYPE_Q6_K, "q6_K");
+    if (p_f32.empty() || p_q8.empty() || p_q4.empty() ||
+        p_q4k.empty() || p_q5k.empty() || p_q6k.empty()) {
         return 1;
     }
 
@@ -271,8 +288,11 @@ int main() {
 
     struct Case { const char * name; std::string path; double cos_min; };
     Case cases[] = {
-        {"q8_0", p_q8, 0.99},  // near-lossless
-        {"q4_0", p_q4, 0.80},  // aggressive but must stay well-correlated (not garbage)
+        {"q8_0", p_q8, 0.99},   // near-lossless
+        {"q4_0", p_q4, 0.80},   // aggressive but must stay well-correlated (not garbage)
+        {"q4_K", p_q4k, 0.80},  // ~4.5 bits, K-quant super-block scaling
+        {"q5_K", p_q5k, 0.85},  // ~5.5 bits
+        {"q6_K", p_q6k, 0.95},  // ~6.5 bits, near-lossless
     };
 
     double q8_cos = 1.0, q4_cos = 1.0;
@@ -307,9 +327,13 @@ int main() {
     std::remove(p_f32.c_str());
     std::remove(p_q8.c_str());
     std::remove(p_q4.c_str());
+    std::remove(p_q4k.c_str());
+    std::remove(p_q5k.c_str());
+    std::remove(p_q6k.c_str());
 
     if (failures == 0) {
-        std::printf("OK: quantized enhancer GGUFs dequantize + run (Q8_0 near-lossless, Q4_0 correlated)\n");
+        std::printf("OK: quantized enhancer GGUFs dequantize + run "
+                    "(Q8_0/Q6_K near-lossless, Q4_0/Q4_K correlated)\n");
         return 0;
     }
     std::fprintf(stderr, "FAILED: %d check(s)\n", failures);
