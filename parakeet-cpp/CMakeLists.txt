@@ -247,6 +247,7 @@ add_library(parakeet-backend-defs INTERFACE)
 
 set(PARAKEET_LIB_SOURCES
     src/parakeet_ctc.cpp
+    src/parakeet_coreml_path.cpp
     src/parakeet_engine.cpp
     src/parakeet_tdt.cpp
     src/parakeet_eou.cpp
@@ -717,6 +718,7 @@ if (PARAKEET_BUILD_TESTS)
     add_executable(test-encoder-coreml-parity
         test/test_encoder_coreml_parity.cpp
         src/parakeet_ctc.cpp
+        src/parakeet_coreml_path.cpp
         src/parakeet_log.cpp
         src/mel_preprocess.cpp
         src/sentencepiece_bpe.cpp)
@@ -737,6 +739,34 @@ if (PARAKEET_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+
+    # Portable unit test for the Core ML sidecar path derivation
+    # (coreml_encoder_sidecar_path). Pure string logic -- no ggml, model, or
+    # Apple frameworks -- so it runs on every CI regardless of PARAKEET_COREML
+    # and locks the `<model>-encoder.mlmodelc` naming (quant tag stripped).
+    add_executable(test-coreml-paths
+        test/test_coreml_paths.cpp
+        src/parakeet_coreml_path.cpp)
+    target_include_directories(test-coreml-paths PRIVATE src)
+    parakeet_apply_ccache(test-coreml-paths)
+    parakeet_register_test(test-coreml-paths LABEL "cpu")
+
+    # End-to-end transcription parity: full Engine::transcribe() with the Core ML
+    # encoder vs the ggml encoder (forced via PARAKEET_COREML_DISABLE) must yield
+    # identical text. Links libparakeet for the public Engine API. Skips at runtime
+    # when the Core ML sidecar is inactive, so it is a no-op on non-Apple /
+    # no-sidecar CI and a real gate on Apple with a sidecar present.
+    if (TARGET parakeet)
+        add_executable(test-transcribe-coreml-parity
+            test/test_transcribe_coreml_parity.cpp)
+        target_link_libraries(test-transcribe-coreml-parity PRIVATE parakeet)
+        target_include_directories(test-transcribe-coreml-parity PRIVATE include)
+        parakeet_apply_ccache(test-transcribe-coreml-parity)
+        parakeet_register_test(test-transcribe-coreml-parity
+            LABEL    "fixture"
+            ARGS     "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}"
+            REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+    endif()
 
     # Regression gate for cached-encoder-graph reuse determinism. Compiles the
     # sources directly (run_encoder is internal, not exported). Runs run_encoder 20x

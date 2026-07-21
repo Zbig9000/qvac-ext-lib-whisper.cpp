@@ -13,7 +13,7 @@ Example:
   python scripts/export-encoder-coreml.py \
       --gguf   models/parakeet-tdt-0.6b-v3.f16.gguf \
       --wav    test/samples/jfk.wav \
-      --out    models/parakeet-tdt-0.6b-v3.f16-encoder.mlpackage \
+      --out    models/parakeet-tdt-0.6b-v3-encoder.mlpackage \
       --compile-dir models
 """
 import argparse

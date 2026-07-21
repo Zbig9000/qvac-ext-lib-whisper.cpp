@@ -11,6 +11,7 @@
 
 #ifdef PARAKEET_USE_COREML
 #include "coreml/parakeet-encoder.h"
+#include "parakeet_coreml_path.h"
 #include <sys/stat.h>
 #endif
 
@@ -864,24 +865,6 @@ static std::vector<ggml_backend_buffer_t> alloc_cpu_repack_weights(
 }
 
 #ifdef PARAKEET_USE_COREML
-// Derives the Core ML encoder sidecar path from the GGUF path, mirroring the
-// whisper.cpp convention: strip the extension and an optional `-qX_X` quant
-// suffix, then append `-encoder.mlmodelc`. So
-// `parakeet-tdt-0.6b-v3.q8_0.gguf` -> `parakeet-tdt-0.6b-v3-encoder.mlmodelc`.
-static std::string coreml_encoder_path_from_gguf(std::string path) {
-    const size_t slash = path.find_last_of("/\\");
-    const size_t dot   = path.rfind('.');
-    if (dot != std::string::npos && (slash == std::string::npos || dot > slash)) {
-        path.erase(dot);
-    }
-    const size_t dash = path.rfind('-');
-    if (dash != std::string::npos && path.size() - dash == 5 &&
-        path[dash + 1] == 'q' && path[dash + 3] == '_') {
-        path.erase(dash);
-    }
-    return path + "-encoder.mlmodelc";
-}
-
 static bool path_is_directory(const std::string & path) {
     struct stat st{};
     return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
@@ -900,7 +883,7 @@ static void maybe_init_coreml_encoder(const std::string & gguf_path,
     if (model.model_type == ParakeetModelType::CTC) {
         return;  // CTC greedy decode reads ggml CTC-head logits, which the sidecar does not emit
     }
-    const std::string path = coreml_encoder_path_from_gguf(gguf_path);
+    const std::string path = coreml_encoder_sidecar_path(gguf_path);
     if (!path_is_directory(path)) {
         if (verbose) PARAKEET_LOG_INFO("parakeet: no Core ML encoder at '%s'; using ggml encoder\n", path.c_str());
         return;
