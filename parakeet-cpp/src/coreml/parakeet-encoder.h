@@ -14,7 +14,11 @@
 //   - Exactly one MLMultiArray input  = log-mel features, dims {n_mels, n_mel_frames}
 //     (either order; the wrapper adapts). This is the offline FastConformer encoder
 //     input, i.e. everything from the subsampling stack through the last Conformer
-//     block; it must NOT include the TDT joint projection.
+//     block; it must NOT include the TDT joint projection. The mel time axis may be
+//     fixed (accelerates only that exact length; other lengths fall back to ggml) or
+//     flexible (RangeDim / enumerated shapes): the wrapper allocates the input at the
+//     caller's length in the model's declared orientation and lets Core ML reject an
+//     unsupported length.
 //   - Exactly one MLMultiArray output = encoder hidden states, dims {n_enc_frames,
 //     d_model} (either order; Float32 or Float16). n_enc_frames is n_mel_frames put
 //     through the three stride-2 subsampling convs (matching run_encoder's sizing).

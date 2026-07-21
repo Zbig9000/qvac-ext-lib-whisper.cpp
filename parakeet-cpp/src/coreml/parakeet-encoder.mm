@@ -76,15 +76,53 @@ bool match_trailing_dims(NSArray<NSNumber *> * shape, int64_t rows, int64_t cols
     return false;
 }
 
+// Rebuilds a concrete model shape (whose feature axis has size `n_mels`) at the
+// requested `n_mel_frames`, preserving axis order and any leading dims. Sets
+// `transpose` for the mel copy: false for a [.., time, features] layout, true for
+// [.., features, time]. Returns nil when neither trailing axis is the feature axis.
+NSArray<NSNumber *> * shape_for_length(NSArray<NSNumber *> * reference,
+                                       int64_t n_mel_frames, int64_t n_mels,
+                                       bool * transpose) {
+    const NSUInteger n = reference.count;
+    if (n < 2) return nil;
+    NSMutableArray<NSNumber *> * shape = [reference mutableCopy];
+    const int64_t d_outer = reference[n - 2].longLongValue;
+    const int64_t d_inner = reference[n - 1].longLongValue;
+    if (d_inner == n_mels) {
+        shape[n - 2] = @(n_mel_frames);
+        shape[n - 1] = @(n_mels);
+        *transpose   = false;
+        return shape;
+    }
+    if (d_outer == n_mels) {
+        shape[n - 2] = @(n_mels);
+        shape[n - 1] = @(n_mel_frames);
+        *transpose   = true;
+        return shape;
+    }
+    return nil;
+}
+
 // Resolves the concrete input shape to allocate and whether it is feature-major.
-// Fixed model shapes are honoured as-is; flexible shapes default to the NeMo-natural
-// features-major [1, n_mels, n_mel_frames]. Returns nil on a fixed-shape size mismatch.
+//
+// A fixed-shape model already sized to this input is honoured verbatim. Otherwise the
+// shape is rebuilt at the requested mel length in the model's declared orientation, so
+// a flexible export (a RangeDim / enumerated time axis) serves variable-length
+// utterances: Core ML validates the rebuilt length against the model's real shape
+// constraint at prediction time, and an unsupported length fails there so the caller
+// falls back to the ggml encoder. Falls back to the NeMo-natural features-major
+// [1, n_mels, n_mel_frames] when the model declares no usable concrete shape.
 NSArray<NSNumber *> * resolve_input_shape(NSArray<NSNumber *> * declared,
                                           int64_t n_mel_frames, int64_t n_mels,
                                           bool * transpose) {
     if (declared != nil && shape_is_concrete(declared)) {
-        if (!match_trailing_dims(declared, n_mel_frames, n_mels, transpose)) return nil;
-        return declared;
+        if (match_trailing_dims(declared, n_mel_frames, n_mels, transpose)) {
+            return declared;
+        }
+        NSArray<NSNumber *> * rebuilt = shape_for_length(declared, n_mel_frames, n_mels, transpose);
+        if (rebuilt != nil) {
+            return rebuilt;
+        }
     }
     *transpose = true;
     return @[ @1, @(n_mels), @(n_mel_frames) ];
