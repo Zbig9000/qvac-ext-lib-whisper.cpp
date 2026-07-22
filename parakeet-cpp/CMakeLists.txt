@@ -248,6 +248,7 @@ add_library(parakeet-backend-defs INTERFACE)
 set(PARAKEET_LIB_SOURCES
     src/parakeet_ctc.cpp
     src/parakeet_coreml_path.cpp
+    src/coreml/parakeet_coreml_shape.cpp
     src/parakeet_engine.cpp
     src/parakeet_tdt.cpp
     src/parakeet_eou.cpp
@@ -719,6 +720,7 @@ if (PARAKEET_BUILD_TESTS)
         test/test_encoder_coreml_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_coreml_path.cpp
+        src/coreml/parakeet_coreml_shape.cpp
         src/parakeet_log.cpp
         src/mel_preprocess.cpp
         src/sentencepiece_bpe.cpp)
@@ -750,6 +752,18 @@ if (PARAKEET_BUILD_TESTS)
     target_include_directories(test-coreml-paths PRIVATE src)
     parakeet_apply_ccache(test-coreml-paths)
     parakeet_register_test(test-coreml-paths LABEL "cpu")
+
+    # Portable unit test for the Core ML input-shape resolution
+    # (coreml_resolve_input_dims). Pure integer logic -- no ggml, model, or Apple
+    # frameworks -- so it runs on every CI regardless of PARAKEET_COREML and locks
+    # the wrapper's variable-length behaviour (fixed verbatim / flexible rebuild /
+    # features-major default).
+    add_executable(test-coreml-shapes
+        test/test_coreml_shapes.cpp
+        src/coreml/parakeet_coreml_shape.cpp)
+    target_include_directories(test-coreml-shapes PRIVATE src)
+    parakeet_apply_ccache(test-coreml-shapes)
+    parakeet_register_test(test-coreml-shapes LABEL "cpu")
 
     # End-to-end transcription parity: full Engine::transcribe() with the Core ML
     # encoder vs the ggml encoder (forced via PARAKEET_COREML_DISABLE) must yield

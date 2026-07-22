@@ -11,6 +11,7 @@
 #endif
 
 #import "coreml/parakeet-encoder.h"
+#include "coreml/parakeet_coreml_shape.h"
 
 #import <CoreML/CoreML.h>
 #import <Foundation/Foundation.h>
@@ -18,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -56,76 +58,34 @@ NSString * sole_multiarray_feature(NSDictionary<NSString *, MLFeatureDescription
     return found;
 }
 
-bool shape_is_concrete(NSArray<NSNumber *> * shape) {
-    if (shape.count < 2) return false;
-    for (NSNumber * dim in shape) {
-        if (dim.longLongValue <= 0) return false;
+std::vector<int64_t> dims_of(NSArray<NSNumber *> * shape) {
+    std::vector<int64_t> dims;
+    if (shape != nil) {
+        dims.reserve(shape.count);
+        for (NSNumber * dim in shape) {
+            dims.push_back(dim.longLongValue);
+        }
     }
-    return true;
-}
-
-// Matches the last two dims of `shape` against the unordered pair {rows, cols}.
-// Sets `transpose` to false for a [.., rows, cols] layout and true for [.., cols, rows].
-bool match_trailing_dims(NSArray<NSNumber *> * shape, int64_t rows, int64_t cols, bool * transpose) {
-    const NSUInteger n = shape.count;
-    if (n < 2) return false;
-    const int64_t d_outer = shape[n - 2].longLongValue;
-    const int64_t d_inner = shape[n - 1].longLongValue;
-    if (d_outer == rows && d_inner == cols) { *transpose = false; return true; }
-    if (d_outer == cols && d_inner == rows) { *transpose = true;  return true; }
-    return false;
-}
-
-// Rebuilds a concrete model shape (whose feature axis has size `n_mels`) at the
-// requested `n_mel_frames`, preserving axis order and any leading dims. Sets
-// `transpose` for the mel copy: false for a [.., time, features] layout, true for
-// [.., features, time]. Returns nil when neither trailing axis is the feature axis.
-NSArray<NSNumber *> * shape_for_length(NSArray<NSNumber *> * reference,
-                                       int64_t n_mel_frames, int64_t n_mels,
-                                       bool * transpose) {
-    const NSUInteger n = reference.count;
-    if (n < 2) return nil;
-    NSMutableArray<NSNumber *> * shape = [reference mutableCopy];
-    const int64_t d_outer = reference[n - 2].longLongValue;
-    const int64_t d_inner = reference[n - 1].longLongValue;
-    if (d_inner == n_mels) {
-        shape[n - 2] = @(n_mel_frames);
-        shape[n - 1] = @(n_mels);
-        *transpose   = false;
-        return shape;
-    }
-    if (d_outer == n_mels) {
-        shape[n - 2] = @(n_mels);
-        shape[n - 1] = @(n_mel_frames);
-        *transpose   = true;
-        return shape;
-    }
-    return nil;
+    return dims;
 }
 
 // Resolves the concrete input shape to allocate and whether it is feature-major.
-//
-// A fixed-shape model already sized to this input is honoured verbatim. Otherwise the
-// shape is rebuilt at the requested mel length in the model's declared orientation, so
-// a flexible export (a RangeDim / enumerated time axis) serves variable-length
-// utterances: Core ML validates the rebuilt length against the model's real shape
-// constraint at prediction time, and an unsupported length fails there so the caller
-// falls back to the ggml encoder. Falls back to the NeMo-natural features-major
-// [1, n_mels, n_mel_frames] when the model declares no usable concrete shape.
+// Thin Objective-C adapter over parakeet::coreml_resolve_input_dims (unit-tested in
+// test-coreml-shapes): a fixed-shape model already sized to this input is honoured
+// verbatim, a flexible export is rebuilt at the requested mel length in the model's
+// declared orientation, and an unknown/non-concrete shape falls back to
+// features-major [1, n_mels, n_mel_frames].
 NSArray<NSNumber *> * resolve_input_shape(NSArray<NSNumber *> * declared,
                                           int64_t n_mel_frames, int64_t n_mels,
                                           bool * transpose) {
-    if (declared != nil && shape_is_concrete(declared)) {
-        if (match_trailing_dims(declared, n_mel_frames, n_mels, transpose)) {
-            return declared;
-        }
-        NSArray<NSNumber *> * rebuilt = shape_for_length(declared, n_mel_frames, n_mels, transpose);
-        if (rebuilt != nil) {
-            return rebuilt;
-        }
+    const parakeet::CoremlInputDims resolved =
+        parakeet::coreml_resolve_input_dims(dims_of(declared), n_mel_frames, n_mels);
+    *transpose = resolved.transpose;
+    NSMutableArray<NSNumber *> * shape = [NSMutableArray arrayWithCapacity:resolved.dims.size()];
+    for (int64_t dim : resolved.dims) {
+        [shape addObject:@(dim)];
     }
-    *transpose = true;
-    return @[ @1, @(n_mels), @(n_mel_frames) ];
+    return shape;
 }
 
 MLMultiArray * build_input_array(NSArray<NSNumber *> * shape, bool transpose,
@@ -167,8 +127,10 @@ bool copy_output_array(MLMultiArray * arr, float * dst, int64_t n_enc_frames, in
     const MLMultiArrayDataType dt    = arr.dataType;
     const int64_t              total = n_enc_frames * d_model;
 
-    bool transpose = false;
-    if (match_trailing_dims(arr.shape, n_enc_frames, d_model, &transpose)) {
+    const parakeet::CoremlTrailingMatch match =
+        parakeet::coreml_match_trailing_dims(dims_of(arr.shape), n_enc_frames, d_model);
+    if (match.matched) {
+        const bool            transpose = match.transpose;
         const NSUInteger      n       = arr.shape.count;
         NSArray<NSNumber *> * strides = arr.strides;
         const int64_t         s_outer = strides[n - 2].longLongValue;
