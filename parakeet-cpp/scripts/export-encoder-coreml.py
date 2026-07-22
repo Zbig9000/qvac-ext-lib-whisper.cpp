@@ -11,16 +11,17 @@ Two input-shape modes:
     or an explicit count). The sidecar then accelerates only utterances whose
     mel length equals that count; every other length falls back to ggml.
   - Flexible (--flexible): export a Core ML RangeDim time axis via torch.export
-    dynamic shapes so one encoder serves any utterance whose mel length is in
-    [--min-frames, --max-frames]; lengths outside the range fall back to the
-    ggml encoder. Needs coremltools>=8 / torch>=2.3. To keep the graph
-    convertible under dynamic shapes, --flexible drops the subsampling time
-    masks (a no-op for the full-valid offline input), bakes the relative
-    positional table as a fixed buffer, and rewrites the attention rel-shift as
-    an int32 gather (see rel_pos_mha_flex) -- all numerically identical to the
-    fixed path. Validated on Apple M3 (identical transcripts and encoder cosine
-    >= 0.999 vs the ggml encoder at several lengths); still worth checking ANE
-    op-placement for perf.
+    so one encoder serves any mel length in [--min-frames, --max-frames] (others
+    fall back to ggml). CORRECTNESS-ONLY, NOT FOR ACCELERATION: measured on Apple
+    M3, the shape-generic graph places 0 ops on the Neural Engine and runs on CPU
+    (~8x slower than the ggml-Metal encoder at ~2000 frames); Core ML only puts
+    the clean fixed-shape jit.trace graph on the ANE. Use --flexible for
+    numerical experiments; for ANE speedup export a fixed single length (the
+    default), which ran ~1.4x faster than ggml-Metal at ~2000 frames. The graph
+    is still numerically identical to the fixed path (masks dropped -- a no-op
+    for full-valid input, positional table baked as a buffer, rel-shift as an
+    int32 gather; see rel_pos_mha_flex). Needs coremltools>=8 / torch>=2.3. The
+    exporter prints the ANE/CPU op placement when --compile-dir is set.
 
 Example:
 
@@ -279,6 +280,47 @@ def compile_mlmodelc(mlpackage_path, compile_dir):
     subprocess.run(
         ["xcrun", "coremlc", "compile", str(mlpackage_path), str(compile_dir)],
         check=True)
+    return Path(compile_dir) / (Path(mlpackage_path).stem + ".mlmodelc")
+
+
+def report_compute_placement(mlmodelc_path):
+    # Report Core ML op placement (Neural Engine / GPU / CPU) so a CPU-bound export
+    # -- which runs far slower than the ggml-Metal encoder -- is caught here instead
+    # of silently shipping a slow sidecar. Requires macOS 14.4+ / coremltools>=8.
+    try:
+        import coremltools as ct
+        from coremltools.models.compute_plan import MLComputePlan
+        plan = MLComputePlan.load_from_path(str(mlmodelc_path), compute_units=ct.ComputeUnit.ALL)
+    except Exception as exc:
+        print(f"[export] compute-plan check skipped ({type(exc).__name__}: {exc})")
+        return
+
+    from collections import Counter
+
+    def device_name(device):
+        if device is None:
+            return "None"
+        return type(device).__name__.replace("ML", "").replace("ComputeDevice", "")
+
+    counts = Counter()
+
+    def walk(block):
+        for op in block.operations:
+            usage = plan.get_compute_device_usage_for_mlprogram_operation(op)
+            counts[device_name(usage.preferred_compute_device) if usage is not None else "None"] += 1
+            nested = getattr(op, "blocks", None) or getattr(op, "block", None)
+            if nested:
+                for inner in (nested if isinstance(nested, (list, tuple)) else [nested]):
+                    walk(inner)
+
+    walk(plan.model_structure.program.functions["main"].block)
+    compute_ops = sum(v for k, v in counts.items() if k != "None")
+    summary = ", ".join(f"{k}={v}" for k, v in counts.most_common())
+    print(f"[export] compute-plan op placement: {summary}")
+    if compute_ops > 0 and counts.get("NeuralEngine", 0) == 0:
+        print("[export] WARNING: 0 ops on the Apple Neural Engine -- this model will run on "
+              "CPU and be much slower than the ggml-Metal encoder. Flexible/dynamic shapes "
+              "force Core ML onto CPU; export a fixed single length for ANE acceleration.")
 
 
 def convert_fixed(ref, weights, meta, example, n_mels, n_mel_frames, d_model,
@@ -370,8 +412,9 @@ def main():
                     help="if set, compile the .mlpackage to a .mlmodelc here via coremlc")
     ap.add_argument("--flexible", action="store_true",
                     help="export a variable-length (Core ML RangeDim) encoder via "
-                         "torch.export; best-effort, needs coremltools>=8 / torch>=2.3 and "
-                         "on-device (ANE) parity validation")
+                         "torch.export. CORRECTNESS-ONLY: runs on CPU (0 ANE ops, ~8x slower "
+                         "than ggml-Metal); export a fixed single length for ANE acceleration. "
+                         "Needs coremltools>=8 / torch>=2.3")
     ap.add_argument("--min-frames", type=int, default=None,
                     help="[--flexible] minimum mel length the RangeDim accepts (default 1)")
     ap.add_argument("--max-frames", type=int, default=None,
@@ -404,8 +447,9 @@ def main():
     print(f"[export] saved {args.out}")
 
     if args.compile_dir is not None:
-        compile_mlmodelc(args.out, args.compile_dir)
+        compiled = compile_mlmodelc(args.out, args.compile_dir)
         print(f"[export] compiled .mlmodelc into {args.compile_dir}")
+        report_compute_placement(compiled)
 
 
 if __name__ == "__main__":
