@@ -11,14 +11,16 @@ Two input-shape modes:
     or an explicit count). The sidecar then accelerates only utterances whose
     mel length equals that count; every other length falls back to ggml.
   - Flexible (--flexible): export a Core ML RangeDim time axis via torch.export
-    dynamic shapes so one encoder serves variable-length utterances. Masking is
-    dropped from the subsampling stack (a no-op for the full-valid offline
-    input) and the relative positional table is baked as a fixed buffer, so the
-    only length-dependent op left in the graph is a dynamic slice. This path is
-    best-effort: it needs coremltools>=8 / torch>=2.3 and MUST be validated on
-    Apple hardware (test-encoder-coreml-parity at several lengths + coreml-cli
-    ANE op-placement), since torch.export / coremltools dynamic-shape support
-    for the attention rel_shift can require model-specific tweaks.
+    dynamic shapes so one encoder serves any utterance whose mel length is in
+    [--min-frames, --max-frames]; lengths outside the range fall back to the
+    ggml encoder. Needs coremltools>=8 / torch>=2.3. To keep the graph
+    convertible under dynamic shapes, --flexible drops the subsampling time
+    masks (a no-op for the full-valid offline input), bakes the relative
+    positional table as a fixed buffer, and rewrites the attention rel-shift as
+    an int32 gather (see rel_pos_mha_flex) -- all numerically identical to the
+    fixed path. Validated on Apple M3 (identical transcripts and encoder cosine
+    >= 0.999 vs the ggml encoder at several lengths); still worth checking ANE
+    op-placement for perf.
 
 Example:
 
@@ -165,10 +167,70 @@ def encoder_frames_for_mel(ref, meta, n_mel_frames):
     return nxt(nxt(nxt(n_mel_frames)))
 
 
+def rel_shift_gather(matrix_bd, T):
+    # Transformer-XL rel-shift + crop to T key positions as a single int32 gather:
+    # out[.., i, j] = matrix_bd[.., i, (j - i) + (T - 1)]. Equivalent to the ref
+    # pad/reshape rel_shift followed by [:, :, :, :T], but with no double-dynamic
+    # reshape (which coremltools cannot build a shape tensor for).
+    i = torch.arange(T, device=matrix_bd.device).unsqueeze(1)
+    j = torch.arange(T, device=matrix_bd.device).unsqueeze(0)
+    idx = (j - i + (T - 1)).to(torch.int32)
+    idx = idx.unsqueeze(0).unsqueeze(0).expand(1, matrix_bd.size(1), -1, -1)
+    return torch.gather(matrix_bd, 3, idx)
+
+
+def rel_pos_mha_flex(x, pos_emb, W, prefix, n_heads):
+    # Export-friendly relative-position attention: head splits reshape the dynamic
+    # time axis via -1 (no sym_size in the shape tensor) and the rel-shift is the
+    # int32 gather above, so the only dynamic-shape ops left are matmul/softmax,
+    # which coremltools handles. Numerically identical to ref.rel_pos_mha.
+    d_model = x.size(-1)
+    head_dim = d_model // n_heads
+    s_d_k = math.sqrt(head_dim)
+
+    q = F.linear(x, W[f"{prefix}.q.weight"], W[f"{prefix}.q.bias"]).reshape(1, -1, n_heads, head_dim)
+    k = F.linear(x, W[f"{prefix}.k.weight"], W[f"{prefix}.k.bias"]).reshape(1, -1, n_heads, head_dim)
+    v = F.linear(x, W[f"{prefix}.v.weight"], W[f"{prefix}.v.bias"]).reshape(1, -1, n_heads, head_dim)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    p = F.linear(pos_emb, W[f"{prefix}.pos.weight"]).reshape(1, -1, n_heads, head_dim).transpose(1, 2)
+
+    q_u = (q + W[f"{prefix}.pos_bias_u"]).transpose(1, 2)
+    q_v = (q + W[f"{prefix}.pos_bias_v"]).transpose(1, 2)
+
+    matrix_ac = torch.matmul(q_u, k.transpose(-2, -1))
+    matrix_bd = torch.matmul(q_v, p.transpose(-2, -1))
+    matrix_bd = rel_shift_gather(matrix_bd, matrix_ac.size(-1))
+
+    scores = (matrix_ac + matrix_bd) / s_d_k
+    attn = torch.softmax(scores, dim=-1)
+    ctx = torch.matmul(attn, v).transpose(1, 2).reshape(1, -1, d_model)
+    return F.linear(ctx, W[f"{prefix}.out.weight"], W[f"{prefix}.out.bias"])
+
+
+def conformer_block_flex(ref, x, pos_emb, weights, index, n_heads):
+    p = f"encoder.blk.{index}"
+    x = x + 0.5 * ref.conformer_ff(
+        ref.layer_norm(x, weights[f"{p}.norm_ff1.weight"], weights[f"{p}.norm_ff1.bias"]),
+        weights, f"{p}.ff1")
+    x = x + rel_pos_mha_flex(
+        ref.layer_norm(x, weights[f"{p}.norm_attn.weight"], weights[f"{p}.norm_attn.bias"]),
+        pos_emb, weights, f"{p}.attn", n_heads)
+    x = x + conformer_conv(
+        ref.layer_norm(x, weights[f"{p}.norm_conv.weight"], weights[f"{p}.norm_conv.bias"]),
+        weights, f"{p}.conv")
+    x = x + 0.5 * ref.conformer_ff(
+        ref.layer_norm(x, weights[f"{p}.norm_ff2.weight"], weights[f"{p}.norm_ff2.bias"]),
+        weights, f"{p}.ff2")
+    return ref.layer_norm(x, weights[f"{p}.norm_out.weight"], weights[f"{p}.norm_out.bias"])
+
+
 def encoder_forward_flexible(ref, mel, weights, meta, pe_table):
     # Variable-length forward: masking-free subsampling + a precomputed relative
-    # positional buffer sliced by the symbolic sequence length, so the only
-    # length-dependent op left in the graph is the dynamic slice.
+    # positional buffer gathered by the symbolic sequence length, feeding an
+    # export-friendly attention (rel_pos_mha_flex) whose only dynamic-shape ops
+    # are matmul/softmax.
     d_model = meta["parakeet.encoder.d_model"]
     n_layers = meta["parakeet.encoder.n_layers"]
     n_heads = meta["parakeet.encoder.n_heads"]
@@ -177,9 +239,16 @@ def encoder_forward_flexible(ref, mel, weights, meta, pe_table):
         x = x * math.sqrt(d_model)
     length = x.size(1)
     center = pe_table.size(1) // 2 + 1
-    pos_emb = pe_table[:, center - length: center + length - 1]
+    # Gather the 2*length-1 relative-position rows [center-length, center+length-1)
+    # with an explicit int64 index rather than a Python slice: the conv-derived
+    # `length` lowers to a float var in Core ML MIL, which makes a slice `begin`
+    # float (a mixed-dtype concat coremltools rejects); an int64 gather index
+    # sidesteps that.
+    offsets = torch.arange(2 * length - 1, device=pe_table.device)
+    pos_index = (center - length + offsets).to(torch.int32)
+    pos_emb = pe_table.index_select(1, pos_index)
     for index in range(n_layers):
-        x = conformer_block(ref, x, pos_emb, weights, index, n_heads)
+        x = conformer_block_flex(ref, x, pos_emb, weights, index, n_heads)
     return x
 
 
@@ -247,11 +316,31 @@ def convert_flexible(ref, weights, meta, example, n_mels, n_mel_frames, d_model,
 
     # torch.export keeps the time axis symbolic (unlike jit.trace, which bakes it),
     # so the dynamic pos-emb slice survives conversion. strict=False uses the
-    # non-strict tracer, which tolerates the Python-level weights dict; flip it if a
-    # given torch version prefers strict capture.
+    # non-strict tracer, which tolerates the Python-level weights dict.
+    #
+    # The three stride-2 subsampling convs make torch.export emit conservative
+    # guards on the mel length (max(1, .), divisibility, reshape-product equality)
+    # that no single range satisfies. backed_size_oblivious treats symbolic sizes
+    # as >= 2, which discharges those guards without changing numerics; draft_export
+    # (guards -> runtime asserts) is the fallback if a build still trips one. The
+    # import is local so a private-config rename can only break --flexible, never
+    # the default fixed export.
+    import torch.fx.experimental._config as fx_config
+    fx_config.backed_size_oblivious = True
     time_dim = torch.export.Dim("mel_t", min=min_frames, max=max_frames)
-    exported = torch.export.export(
-        model, (example,), dynamic_shapes={"mel": {1: time_dim}}, strict=False)
+    dynamic_shapes = {"mel": {1: time_dim}}
+    try:
+        exported = torch.export.export(model, (example,), dynamic_shapes=dynamic_shapes,
+                                       strict=False)
+    except Exception as exc:
+        print(f"[export] export guard violation ({type(exc).__name__}); "
+              f"retrying via draft_export")
+        exported = torch.export.draft_export(model, (example,), dynamic_shapes=dynamic_shapes)
+        if isinstance(exported, tuple):
+            exported = exported[0]
+    # torch>=2.5 export produces a TRAINING-dialect program; coremltools converts
+    # only core ATen / EDGE, so lower it first.
+    exported = exported.run_decompositions({})
     return ct.convert(
         exported,
         inputs=[ct.TensorType(
