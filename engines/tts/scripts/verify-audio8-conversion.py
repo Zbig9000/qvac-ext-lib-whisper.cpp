@@ -35,9 +35,11 @@ from audio8_reference import (  # noqa: E402
     load_codec_module,
     load_config,
     rename_codec_key,
+    split_qkv,
 )
 
 CODEC_PARTS = ("encoder", "decoder")
+ROTATION_POSITIONS = 64
 ABSOLUTE_FLOOR = 1e-8
 # A block-quantised value can miss its original by up to one reconstruction
 # step: q8_0 spreads 255 levels across a block, q4_0 only 16, and q4_0's scale
@@ -125,16 +127,22 @@ def reference_rope(model_dir, length, head_dim, theta):
     return precompute(length, head_dim, theta).float().numpy()
 
 
+def rope_plane_expectations(prefix, table):
+    return {
+        f"{prefix}_cos": np.ascontiguousarray(table[..., 0]),
+        f"{prefix}_sin": np.ascontiguousarray(table[..., 1]),
+    }
+
+
 def lm_rope_expectations(model_dir, config):
     theta = float(config["rope_base"])
-    return {
-        "lm/rope": reference_rope(
-            model_dir, int(config["max_seq_len"]), int(config["head_dim"]), theta
-        ),
-        "fast/rope": reference_rope(
-            model_dir, int(config["num_codebooks"]), int(config["fast_head_dim"]), theta
-        ),
-    }
+    expectations = rope_plane_expectations("lm/rope", reference_rope(
+        model_dir, int(config["max_seq_len"]), int(config["head_dim"]), theta
+    ))
+    expectations.update(rope_plane_expectations("fast/rope", reference_rope(
+        model_dir, int(config["num_codebooks"]), int(config["fast_head_dim"]), theta
+    )))
+    return expectations
 
 
 def lm_expectations(model_dir):
@@ -243,13 +251,98 @@ def missing_from_gguf(emitted, expected, label):
     return [f"{label}: {name} was not emitted" for name in absent]
 
 
+def reference_rotate(heads, table):
+    """The checkpoint's own rotation: adjacent pairs against a complex table."""
+    pairs = heads.reshape(*heads.shape[:-1], -1, 2)
+    return np.stack(
+        (
+            pairs[..., 0] * table[..., 0] - pairs[..., 1] * table[..., 1],
+            pairs[..., 1] * table[..., 0] + pairs[..., 0] * table[..., 1],
+        ),
+        axis=-1,
+    ).reshape(heads.shape)
+
+
+def split_half_rotate(heads, cosine, sine):
+    """The engine's rotation: halves against separate cosine and sine planes."""
+    half = heads.shape[-1] // 2
+    lower, upper = heads[..., :half], heads[..., half:]
+    return np.concatenate(
+        (lower * cosine - upper * sine, upper * cosine + lower * sine), axis=-1
+    )
+
+
+def first_head(rows, activations, head_dim):
+    return (activations @ rows[:head_dim].T)
+
+
+def attention_scores(query, key):
+    return query @ key.T
+
+
+def rotation_deviation(reference, emitted, table, cosine, sine, head_dim):
+    """Attention scores are the only thing the permutation has to preserve, so
+    they are what gets compared: the reference's rotation of the original rows
+    against the engine's rotation of the reordered ones."""
+    rng = np.random.default_rng(0)
+    length = min(int(cosine.shape[0]), ROTATION_POSITIONS)
+    activations = rng.standard_normal(
+        (length, reference["wq"].shape[1]), dtype=np.float32
+    )
+    expected = attention_scores(*(
+        reference_rotate(first_head(reference[part], activations, head_dim), table[:length])
+        for part in ("wq", "wk")
+    ))
+    got = attention_scores(*(
+        split_half_rotate(
+            first_head(emitted[part], activations, head_dim), cosine[:length], sine[:length]
+        )
+        for part in ("wq", "wk")
+    ))
+    return float(np.max(np.abs(expected - got))) / float(np.max(np.abs(expected)))
+
+
+def reference_qk(state, config, head_dim):
+    query, key, _ = split_qkv(
+        state["layers.0.attention.wqkv.weight"], int(config["n_head"]),
+        int(config["n_local_heads"]), head_dim,
+    )
+    return {"wq": query, "wk": key}
+
+
+def verify_rope_layout(model_dir, state, tensors, config):
+    """The reordered q/k rows and the split planes are only correct together,
+    so they are checked together rather than value by value. The bar is what
+    the q/k storage can represent: the scores are computed from the quantised
+    rows but compared against the full-precision reference."""
+    head_dim = int(config["head_dim"])
+    table = reference_rope(
+        model_dir, int(config["max_seq_len"]), head_dim, float(config["rope_base"])
+    )
+    emitted = {part: tensors[f"lm/blk/0/{part}"] for part in ("wq", "wk")}
+    type_name = emitted["wq"][1]
+    deviation = rotation_deviation(
+        reference_qk(state, config, head_dim),
+        {part: value for part, (value, _) in emitted.items()},
+        table, tensors["lm/rope_cos"][0], tensors["lm/rope_sin"][0], head_dim,
+    )
+    tolerance = RELATIVE_TOLERANCE.get(type_name, DEFAULT_RELATIVE_TOLERANCE)
+    print(f"\nrope layout: attention scores match the reference to {deviation:.3e} "
+          f"(q/k stored as {type_name}, tolerance {tolerance:.3e})")
+    if deviation > tolerance:
+        return [f"lm: split-half rotation deviates by {deviation:.3e}"]
+    return []
+
+
 def verify_lm(model_dir, path):
     _, tensors = read_gguf(path)
+    config = load_config(model_dir)
+    state = load_lm_state(model_dir)
     expected = lm_expectations(model_dir)
     worst, counts, failures = compare(tensors, expected, "lm")
     report(f"lm ({path})", worst, counts)
     failures += missing_from_gguf(tensors, expected, "lm")
-    return failures
+    return failures + verify_rope_layout(model_dir, state, tensors, config)
 
 
 def reference_codec_rope(model_dir, length, head_dim, theta):
@@ -263,17 +356,26 @@ def baked_rope_names(tensors):
     return [name for name in tensors if name.startswith("rope/")]
 
 
+def rope_transformer_names(tensors):
+    return sorted({
+        name[len("rope/"): -len("_cos")]
+        for name in tensors if name.startswith("rope/") and name.endswith("_cos")
+    })
+
+
 def codec_rope_expectations(model_dir, fields, tensors):
     frames = int(fields["audio8.codec.max_frames"])
     expectations = {}
-    for name in baked_rope_names(tensors):
-        transformer = name[len("rope/"):]
-        expectations[name] = reference_codec_rope(
-            model_dir,
-            frames,
-            int(fields[f"audio8.codec.{transformer}.head_dim"]),
-            float(fields[f"audio8.codec.{transformer}.rope_theta"]),
-        )
+    for transformer in rope_transformer_names(tensors):
+        expectations.update(rope_plane_expectations(
+            f"rope/{transformer}",
+            reference_codec_rope(
+                model_dir,
+                frames,
+                int(fields[f"audio8.codec.{transformer}.head_dim"]),
+                float(fields[f"audio8.codec.{transformer}.rope_theta"]),
+            ),
+        ))
     return expectations
 
 

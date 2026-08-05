@@ -23,6 +23,15 @@ builds them in bfloat16 even under float32 inference, and that ~2e-3 rounding
 is not cosmetic: recomputing the tables in float32 changes the greedy fast-AR
 codebook choices on the very first frame and the trajectories separate from
 there. Baking the reference's own table is what makes exact parity reachable.
+They are emitted as separate `_cos` and `_sin` planes, which is the shape the
+engine's rotation consumes.
+
+The reference rotates the adjacent pair (2j, 2j+1) of each head; ggml and the
+rest of this tree rotate (j, head_dim / 2 + j). Rather than pay for a strided
+gather in every attention block, the q and k projection rows are reordered here
+into the split-half layout. Attention cannot tell the difference, because the
+same permutation lands on q and k and their dot product does not depend on the
+order of the terms.
 
 The Qwen2 byte-level BPE vocabulary, merges and added tokens are embedded so
 the GGUF is self-contained.
@@ -50,15 +59,13 @@ from audio8_reference import (  # noqa: E402
     QUANT_BLOCK,
     ROPE_PRECISIONS,
     STORAGE_TYPES,
+    expand_fused,
     flush,
     format_tally,
     load_config,
-    precompute_rope,
-    split_qkv,
+    rope_planes,
     write_tensors,
 )
-
-ROPE_TYPE_INTERLEAVED = 0
 
 EMBEDDING_TABLES = ("lm/tok_emb", "lm/codebook_emb", "fast/emb")
 
@@ -152,21 +159,17 @@ def load_state_dict(model_dir):
 
 
 def attention_tensors(prefix, block, n_head, n_kv, head_dim, has_bias):
-    query, key, value = split_qkv(block["attention.wqkv.weight"], n_head, n_kv, head_dim)
     named = {
-        f"{prefix}/wq": query,
-        f"{prefix}/wk": key,
-        f"{prefix}/wv": value,
         f"{prefix}/wo": block["attention.wo.weight"],
         f"{prefix}/attn_norm": block["attention_norm.weight"],
     }
+    named.update(expand_fused(
+        prefix, block["attention.wqkv.weight"], n_head, n_kv, head_dim
+    ))
     if has_bias:
-        bias_q, bias_k, bias_v = split_qkv(
-            block["attention.wqkv.bias"], n_head, n_kv, head_dim
-        )
-        named[f"{prefix}/wq_b"] = bias_q
-        named[f"{prefix}/wk_b"] = bias_k
-        named[f"{prefix}/wv_b"] = bias_v
+        named.update(expand_fused(
+            prefix, block["attention.wqkv.bias"], n_head, n_kv, head_dim, suffix="_b"
+        ))
     return named
 
 
@@ -200,14 +203,11 @@ def semantic_head(embeddings, hp):
 
 
 def rope_tables(hp, precision):
-    return {
-        "lm/rope": precompute_rope(
-            hp.max_seq_len, hp.head_dim, hp.rope_theta, precision
-        ),
-        "fast/rope": precompute_rope(
-            hp.num_codebooks, hp.fast_head_dim, hp.rope_theta, precision
-        ),
-    }
+    tables = rope_planes("lm/rope", hp.max_seq_len, hp.head_dim, hp.rope_theta, precision)
+    tables.update(rope_planes(
+        "fast/rope", hp.num_codebooks, hp.fast_head_dim, hp.rope_theta, precision
+    ))
+    return tables
 
 
 def model_tensors(state, hp):
@@ -240,7 +240,7 @@ def write_metadata(writer, hp):
         num_codebooks=hp.num_codebooks, codebook_size=hp.codebook_size,
         semantic_begin=hp.semantic_begin, semantic_end=hp.semantic_end,
         eos=hp.eos, pad=hp.pad, max_seq_len=hp.max_seq_len,
-        ras_window=hp.ras_window, rope_type=ROPE_TYPE_INTERLEAVED,
+        ras_window=hp.ras_window,
     ).items():
         writer.add_uint32(f"{KV}.{key}", int(value))
     for key, value in dict(

@@ -473,6 +473,12 @@ done
 | `q8_0` | 801 MB | 201 MB | 252 MB |
 | `q4_0` | 602 MB | — | — |
 
+**The f16 LM is free.**  The LM checkpoint ships in bfloat16, whose 8 mantissa
+bits fit inside f16's 10, so half precision stores it without loss — f32 and
+f16 builds agree to 3e-8, which is below the f32 rounding of the conversion
+itself.  Prefer f16 over f32 unless you are debugging.  The codec ships in f32
+and its f16 build is genuinely lossy (worst tensor deviation 1.6e-3).
+
 `--dtype` sets a ceiling, not a blanket cast.  Each tensor is classified by
 what it is used for, in `role_of()` in either converter: body matmuls take the
 block format, bulk weights that must stay element-addressable (embedding
@@ -489,7 +495,16 @@ Two things the converters do that are worth knowing before reading them:
   bfloat16 even under float32 inference, and that ~2e-3 rounding is not
   cosmetic — recomputing in float32 changes the greedy fast-AR codebook choices
   on the very first frame and the trajectories separate from there.
-  `--rope-precision f32` is available to reproduce that measurement.
+  `--rope-precision f32` is available to reproduce that measurement.  The
+  tables are emitted as separate `_cos` and `_sin` planes, the shape
+  `apply_rope_in_graph` consumes.
+- **Q and K rows are reordered.**  The reference rotates each head's adjacent
+  pair `(2j, 2j+1)`; ggml and the rest of this tree rotate `(j, head_dim/2+j)`.
+  Reordering the projection rows at conversion time avoids a strided gather in
+  every attention block, and attention cannot tell the difference because the
+  same permutation lands on Q and K and their dot product does not depend on
+  the order of the terms.  `verify-audio8-conversion.py` checks this by
+  comparing attention scores, not tensors.
 - **The text head is replaced by a semantic head.**  The head is tied to the
   155776-row input embedding, but the sampler masks every logit outside
   `[semantic_begin, semantic_end]` plus EOS, so the converter emits just those

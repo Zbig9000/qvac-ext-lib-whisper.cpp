@@ -14,8 +14,11 @@ inference time, so they are emitted separately:
 
 Both halves carry the codebooks, so each file stands alone. Weight
 normalisation is folded into a single `weight` tensor, and every fused `wqkv`
-is split into q/k/v. RoPE tables are baked at the reference's own bfloat16
-precision, matching how the checkpoint builds them under float32 inference.
+is split into q/k/v with the q and k rows reordered into the split-half RoPE
+layout the engine rotates in (see convert-audio8-lm-to-gguf.py for why that
+leaves attention unchanged). RoPE tables are baked as `_cos` / `_sin` planes at
+the reference's own bfloat16 precision, matching how the checkpoint builds them
+under float32 inference.
 
     python3 convert-audio8-codec-to-gguf.py \\
         --model-dir models/Audio8-TTS-Preview-0.6b \\
@@ -47,9 +50,9 @@ from audio8_reference import (  # noqa: E402
     flush,
     format_tally,
     load_config,
-    precompute_rope,
     raw_codec_state,
     rename_codec_key,
+    rope_planes,
     write_tensors,
 )
 
@@ -209,12 +212,12 @@ def check_partition(named, encoder_part, decoder_part):
 
 
 def rope_tables(specs, max_frames, precision):
-    return {
-        f"rope/{name}": precompute_rope(
-            max_frames, spec.head_dim, spec.rope_theta, precision
-        )
-        for name, spec in specs.items()
-    }
+    tables = {}
+    for name, spec in specs.items():
+        tables.update(rope_planes(
+            f"rope/{name}", max_frames, spec.head_dim, spec.rope_theta, precision
+        ))
+    return tables
 
 
 def write_transformer_metadata(writer, name, spec):

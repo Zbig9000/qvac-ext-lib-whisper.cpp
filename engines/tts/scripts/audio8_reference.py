@@ -136,6 +136,40 @@ def precompute_rope(length, head_dim, theta, precision="bf16"):
     return table.to(torch.float32).numpy()
 
 
+def rope_planes(prefix, length, head_dim, theta, precision="bf16"):
+    """The same table as two [length, head_dim / 2] planes.
+
+    Split because the engine multiplies by cosine and sine separately; keeping
+    them interleaved would cost a strided gather in every attention block.
+    """
+    table = precompute_rope(length, head_dim, theta, precision)
+    return {
+        f"{prefix}_cos": np.ascontiguousarray(table[..., 0]),
+        f"{prefix}_sin": np.ascontiguousarray(table[..., 1]),
+    }
+
+
+def interleave_to_split_order(head_dim):
+    """Row order taking a head from the checkpoint's interleaved RoPE layout,
+    which rotates the adjacent pair (2j, 2j+1), to the split-half layout that
+    rotates (j, head_dim / 2 + j)."""
+    order = np.empty(head_dim, dtype=np.int64)
+    order[: head_dim // 2] = np.arange(0, head_dim, 2)
+    order[head_dim // 2:] = np.arange(1, head_dim, 2)
+    return order
+
+
+def permute_rope_layout(rows, head_dim):
+    """Reorder every head's rows of a q or k projection into the split-half
+    layout. Attention is unchanged by this: the same permutation lands on both
+    q and k, and their dot product does not depend on the order of the terms.
+    Doing it here means the engine can use one rotation for every model in the
+    tree, and lets a float32 table be applied by ggml_rope_ext directly."""
+    order = interleave_to_split_order(head_dim)
+    heads = rows.reshape(-1, head_dim, *rows.shape[1:])
+    return np.ascontiguousarray(heads[:, order].reshape(rows.shape))
+
+
 def to_numpy(tensor):
     return tensor.detach().float().cpu().numpy()
 
@@ -155,8 +189,8 @@ def split_qkv(fused, n_head, n_kv, head_dim=HEAD_DIM):
 def expand_fused(prefix, fused, n_head, n_kv, head_dim=HEAD_DIM, suffix=""):
     query, key, value = split_qkv(fused, n_head, n_kv, head_dim)
     return {
-        f"{prefix}/wq{suffix}": query,
-        f"{prefix}/wk{suffix}": key,
+        f"{prefix}/wq{suffix}": permute_rope_layout(query, head_dim),
+        f"{prefix}/wk{suffix}": permute_rope_layout(key, head_dim),
         f"{prefix}/wv{suffix}": value,
     }
 
