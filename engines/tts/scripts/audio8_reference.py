@@ -1,0 +1,250 @@
+"""Shared helpers for the Audio8 TTS conversion and reference scripts.
+
+Holds the pieces every Audio8 script needs: reading the checkpoint config,
+instantiating the reference codec through its own remote code, loading the
+generation model, the tensor-name mapping the GGUF converters use, and the
+storage-type policy they share.
+
+Scripts in this directory import it by adding their own directory to sys.path,
+so they keep working when invoked by absolute path from anywhere.
+"""
+import json
+import os
+from collections import Counter
+
+import numpy as np
+
+HEAD_DIM = 64
+GGML_MAX_NAME = 64
+LM_ARCH = "audio8-lm"
+CODEC_ARCH = "audio8-codec"
+LM_KV = "audio8.lm"
+CODEC_KV = "audio8.codec"
+
+CODEC_RENAMES = (
+    ("encoder.block.", "enc/"),
+    ("decoder.model.", "dec/"),
+    ("quantizer.semantic_quantizer.quantizers.", "q/sem/"),
+    ("quantizer.quantizer.quantizers.", "q/res/"),
+    ("quantizer.downsample.", "q/down/"),
+    ("quantizer.upsample.", "q/up/"),
+    ("quantizer.pre_module.", "q/pre/"),
+    ("quantizer.post_module.", "q/post/"),
+    ("attention_layer_scale.gamma", "attn_scale"),
+    ("ffn_layer_scale.gamma", "ffn_scale"),
+    ("attention_norm.weight", "attn_norm"),
+    ("ffn_norm.weight", "ffn_norm"),
+    ("attention.wo.weight", "wo"),
+    ("feed_forward.w1.weight", "w1"),
+    ("feed_forward.w2.weight", "w2"),
+    ("feed_forward.w3.weight", "w3"),
+    ("layers.", "blk/"),
+)
+
+FUSED_ATTENTION_SUFFIX = "attention/wqkv/weight"
+
+
+ROPE_PRECISIONS = ("bf16", "f32")
+
+QUANT_BLOCK = 32
+QUANT_TYPES = ("q8_0", "q4_0")
+STORAGE_TYPES = ("f32", "f16") + QUANT_TYPES
+
+# What a tensor is used for, which is what decides how far its storage may be
+# degraded. EXACT tensors settle argmax and argmin ties or carry RoPE phases,
+# where one rounding step moves the whole trajectory, and they are small enough
+# that keeping them is free. BLOCK tensors are the body matmuls a block format
+# is designed for. DENSE tensors are bulk weights that must stay addressable
+# element-wise -- embedding tables read by ggml_get_rows, convolution kernels --
+# so they follow the build down to f16 and no further.
+EXACT = "exact"
+BLOCK = "block"
+DENSE = "dense"
+
+
+def storage_encoding(dtype, role):
+    if dtype == "f32" or role == EXACT:
+        return "f32"
+    if role == BLOCK and dtype in QUANT_TYPES:
+        return dtype
+    return "f16"
+
+
+def encode_tensor(array, encoding):
+    import gguf
+
+    if encoding in QUANT_TYPES:
+        quant_type = getattr(gguf.GGMLQuantizationType, encoding.upper())
+        return gguf.quants.quantize(array, quant_type), quant_type
+    if encoding == "f16":
+        return array.astype(np.float16), None
+    return array, None
+
+
+def check_tensor_name(name):
+    if len(name) >= GGML_MAX_NAME:
+        raise ValueError(f"tensor name too long for ggml: {name}")
+
+
+def write_tensors(writer, named, dtype, role_of):
+    """Add every tensor at the storage its role allows, tallying the encodings."""
+    tally = Counter()
+    for name, array in sorted(named.items()):
+        check_tensor_name(name)
+        contiguous = np.ascontiguousarray(array)
+        encoding = storage_encoding(dtype, role_of(name, contiguous))
+        payload, raw_dtype = encode_tensor(contiguous, encoding)
+        writer.add_tensor(name, payload, raw_dtype=raw_dtype)
+        tally[encoding] += 1
+    return tally
+
+
+def format_tally(tally):
+    return ", ".join(f"{count} {name}" for name, count in sorted(tally.items()))
+
+
+def flush(writer):
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+def load_config(model_dir):
+    with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def precompute_rope(length, head_dim, theta, precision="bf16"):
+    """Mirror the checkpoint's own RoPE table construction.
+
+    The phases are accumulated in float32 and the table is rounded to bfloat16,
+    exactly as _precompute_rope and the codec's _rope do. Both details are
+    load-bearing: a float64 phase or a float32 table differs by up to one
+    bfloat16 step, which is enough to change greedy codebook choices.
+    """
+    import torch
+
+    frequencies = 1.0 / (
+        theta ** (torch.arange(0, head_dim, 2).float()[: head_dim // 2] / head_dim)
+    )
+    phases = torch.outer(torch.arange(length), frequencies)
+    values = torch.polar(torch.ones_like(phases), phases)
+    table = torch.stack((values.real, values.imag), dim=-1)
+    if precision == "bf16":
+        table = table.to(torch.bfloat16)
+    return table.to(torch.float32).numpy()
+
+
+def to_numpy(tensor):
+    return tensor.detach().float().cpu().numpy()
+
+
+def rename_codec_key(key):
+    for source, target in CODEC_RENAMES:
+        key = key.replace(source, target)
+    return key.replace(".", "/")
+
+
+def split_qkv(fused, n_head, n_kv, head_dim=HEAD_DIM):
+    query = n_head * head_dim
+    key = query + n_kv * head_dim
+    return fused[:query], fused[query:key], fused[key:]
+
+
+def expand_fused(prefix, fused, n_head, n_kv, head_dim=HEAD_DIM, suffix=""):
+    query, key, value = split_qkv(fused, n_head, n_kv, head_dim)
+    return {
+        f"{prefix}/wq{suffix}": query,
+        f"{prefix}/wk{suffix}": key,
+        f"{prefix}/wv{suffix}": value,
+    }
+
+
+def codec_head_counts(rows, dim, head_dim=HEAD_DIM):
+    n_head = dim // head_dim
+    n_kv = (rows // head_dim - n_head) // 2
+    return n_head, n_kv
+
+
+def strip_generator_prefix(state):
+    if not any("generator." in key for key in state):
+        return state
+    return {
+        key.replace("generator.", ""): value
+        for key, value in state.items()
+        if "generator." in key
+    }
+
+
+def drop_buffers(state):
+    return {
+        key: value
+        for key, value in state.items()
+        if not key.endswith(("freqs_cis", "causal_mask"))
+    }
+
+
+def raw_codec_state(model_dir, codec_file="codec.pth"):
+    import torch
+
+    state = torch.load(
+        os.path.join(model_dir, codec_file), map_location="cpu", weights_only=True
+    )
+    if "state_dict" in state:
+        state = state["state_dict"]
+    return drop_buffers(strip_generator_prefix(state))
+
+
+def is_weight_norm_hook(hook):
+    return hasattr(hook, "compute_weight") and hasattr(hook, "name")
+
+
+def refresh_legacy_weight_norm(module):
+    """torch.nn.utils.weight_norm only recomputes `weight` inside its forward
+    pre-hook, so after load_state_dict the attribute still holds the value from
+    module construction."""
+    for child in module.modules():
+        for hook in child._forward_pre_hooks.values():
+            if is_weight_norm_hook(hook):
+                setattr(child, hook.name, hook.compute_weight(child))
+    return module
+
+
+def load_codec_module(model_dir, codec_file="codec.pth"):
+    from transformers import AutoConfig
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    codec_class = get_class_from_dynamic_module(
+        "modeling_arktts_codec.ArkttsCodec", model_dir
+    )
+    codec = codec_class(config)
+    codec.load_state_dict(raw_codec_state(model_dir, codec_file), strict=True)
+    return refresh_legacy_weight_norm(codec.eval())
+
+
+def load_generation_model(model_dir):
+    import torch
+    from transformers import AutoModel, AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
+    model = AutoModel.from_pretrained(
+        model_dir, trust_remote_code=True, dtype=torch.float32
+    ).eval()
+    return processor, model
+
+
+def save_arrays(out_dir, arrays):
+    os.makedirs(out_dir, exist_ok=True)
+    for name, array in arrays.items():
+        np.save(os.path.join(out_dir, name), array)
+        print(f"  {name}: {array.shape} {array.dtype}")
+
+
+def write_meta(out_dir, meta, name="meta.json"):
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, name)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(meta, handle, indent=2, ensure_ascii=False)
+    print(f"  {name}: {len(meta)} keys")

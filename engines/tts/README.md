@@ -433,6 +433,123 @@ python scripts/bench-supertonic-onnx.py \
   --json-out artifacts/supertonic-onnx-bench.json
 ```
 
+## Audio8
+
+[Audio8](https://github.com/Audio8-AI/Audio8_TTS) is a DualAR zero-shot TTS
+model: a 24-layer Qwen2.5-0.6B-shaped **slow AR** emits one semantic token per
+codec frame, a 4-layer **fast AR** expands each of those into the frame's
+remaining 9 codebooks, and a DAC-style residual-vector-quantised **codec**
+turns the 10-codebook frames into 44.1 kHz audio at 2048 samples (21.5 Hz) per
+frame.  Cloning needs no speaker encoder: the codec *encoder* turns a reference
+wav into codes, and those codes plus the reference transcript are prepended to
+the prompt.
+
+**Status — conversion and parity fixtures only.**  There is no Audio8 C++
+engine yet; this section covers the converters and the reference harness the
+engine will be validated against.
+
+### Convert
+
+Three GGUFs, because the halves have different lifetimes: the LM and the codec
+decoder are needed for every synthesis, the codec encoder only to enrol a voice
+from a wav.  Both codec halves carry the codebooks, so each file stands alone.
+
+```bash
+python3 scripts/convert-audio8-lm-to-gguf.py \
+    --model-dir models/Audio8-TTS-Preview-0.6b \
+    --outfile models/audio8-lm-q8_0.gguf --dtype q8_0
+
+for part in encoder decoder; do
+  python3 scripts/convert-audio8-codec-to-gguf.py \
+      --model-dir models/Audio8-TTS-Preview-0.6b --part $part \
+      --outfile models/audio8-codec-$part-q8_0.gguf --dtype q8_0
+done
+```
+
+| `--dtype` | LM | codec decoder | codec encoder |
+|---|---:|---:|---:|
+| `f32` | 2.3 GB | 499 MB | 793 MB |
+| `f16` | 1.2 GB | 251 MB | 398 MB |
+| `q8_0` | 801 MB | 201 MB | 252 MB |
+| `q4_0` | 602 MB | — | — |
+
+`--dtype` sets a ceiling, not a blanket cast.  Each tensor is classified by
+what it is used for, in `role_of()` in either converter: body matmuls take the
+block format, bulk weights that must stay element-addressable (embedding
+tables, convolution kernels) stop at f16, and tensors that decide a greedy
+choice stay f32 in every build — the RoPE tables, the sampling heads, the
+codebooks (the encoder picks codes by nearest neighbour, so rounding them moves
+the argmin) and every 1-D parameter, the snake alphas among them.  A q4_0 codec
+is not offered: over half the decoder is convolution kernels that block formats
+cannot address, so the tier would buy little and cost audible quality.
+
+Two things the converters do that are worth knowing before reading them:
+
+- **RoPE tables are baked, not recomputed.**  The reference builds them in
+  bfloat16 even under float32 inference, and that ~2e-3 rounding is not
+  cosmetic — recomputing in float32 changes the greedy fast-AR codebook choices
+  on the very first frame and the trajectories separate from there.
+  `--rope-precision f32` is available to reproduce that measurement.
+- **The text head is replaced by a semantic head.**  The head is tied to the
+  155776-row input embedding, but the sampler masks every logit outside
+  `[semantic_begin, semantic_end]` plus EOS, so the converter emits just those
+  4097 rows as `lm/sem_head`.  Masked-out logits contribute nothing to the
+  top-k/top-p renormalisation, so this is exact, and it turns a 155776-row
+  projection per step into a 4097-row one.
+
+### Verify
+
+`verify-audio8-conversion.py` reloads the checkpoint through its own remote
+code and compares every converted tensor against it, at a tolerance derived
+from what the tensor's storage can actually represent — exact for f32, one
+reconstruction step for the block formats.  It recomputes the RoPE tables
+independently rather than trusting the converter's copy.
+
+```bash
+python3 scripts/verify-audio8-conversion.py \
+    --model-dir models/Audio8-TTS-Preview-0.6b \
+    --lm-gguf models/audio8-lm-q8_0.gguf \
+    --codec-encoder-gguf models/audio8-codec-encoder-q8_0.gguf \
+    --codec-decoder-gguf models/audio8-codec-decoder-q8_0.gguf
+```
+
+### Reference fixtures
+
+Three dumpers write the `.npy` fixtures the C++ stages will be checked against.
+They capture stage boundaries, not just endpoints, so a failing stage can be
+located without bisecting the network.
+
+```bash
+python3 scripts/dump-audio8-tokenizer-reference.py \
+    --model-dir models/Audio8-TTS-Preview-0.6b --out-dir artifacts/audio8-ref
+
+# reference-free generation: prompt, embeddings, per-step hidden states,
+# semantic logits before and after filtering, fast-AR logits, emitted codes
+python3 scripts/dump-audio8-lm-reference.py \
+    --model-dir models/Audio8-TTS-Preview-0.6b \
+    --out-dir artifacts/audio8-ref --max-new-tokens 32
+
+# codec both ways: decode the codes above, encode a reference wav
+python3 scripts/dump-audio8-codec-reference.py \
+    --model-dir models/Audio8-TTS-Preview-0.6b \
+    --codes artifacts/audio8-ref/codes.npy \
+    --audio reference.wav --out-dir artifacts/audio8-ref
+
+# the cloning path end to end: reference codes + transcript -> prompt -> codes
+python3 scripts/dump-audio8-lm-reference.py \
+    --model-dir models/Audio8-TTS-Preview-0.6b \
+    --text "Tear in eye, your dress you'll tear." \
+    --reference-codes artifacts/audio8-ref/codec_enc_codes.npy \
+    --reference-text "What these pictures? An elephant with uh so many legs." \
+    --out-dir artifacts/audio8-ref-clone --max-new-tokens 24
+```
+
+The dumps are taken with `do_sample=False`.  The shipped sampler draws Gumbel
+noise and applies repetition-aware resampling, neither of which reproduces
+across runtimes; greedy decoding makes the trajectory comparable, and the
+filtered score vectors are dumped alongside the tokens so everything feeding
+the draw can be checked even where the draw itself cannot.
+
 ## Prerequisites
 
 - C++17 compiler (clang or gcc)
@@ -1320,7 +1437,15 @@ tts-cpp/                         in-tree subtree of github.com/gianni-cor/chatte
     gen-nfkd-table.py            generates src/mtl_unicode_tables.inc
     dump-*-reference.py          PyTorch → .npy intermediates for the
                                    per-stage harnesses (S3Gen, CAMPPlus,
-                                   S3TokenizerV2, streaming, MTL T3)
+                                   S3TokenizerV2, streaming, MTL T3, Audio8)
+    audio8_reference.py          shared Audio8 helpers: config + checkpoint
+                                   loading, tensor renaming, RoPE tables,
+                                   GGUF storage policy
+    convert-audio8-lm-to-gguf.py Audio8 slow + fast AR + Qwen2.5 BPE → LM GGUF
+    convert-audio8-codec-to-gguf.py Audio8 codec → encoder / decoder GGUF
+                                   (weight norm folded, --part)
+    verify-audio8-conversion.py  compares Audio8 GGUFs tensor by tensor
+                                   against the checkpoint
     reference-t3-turbo.py        PyTorch T3 bit-exact compare vs C++
     compare-tokenizer.py         10-case BPE tokenizer compare vs HF
   (no patches/ in this in-tree subtree - the standalone chatterbox.cpp
