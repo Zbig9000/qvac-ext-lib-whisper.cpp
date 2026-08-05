@@ -12,8 +12,6 @@
 
 #include "tts-cpp/audio8/engine.h"
 
-#include "voice_features.h"
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -153,14 +151,9 @@ bool write_wav(const std::string & path, const std::vector<float> & pcm, int sam
     return true;
 }
 
-bool load_voice(const options & opts, tts_cpp::audio8::VoicePrompt & voice) {
-    if (opts.ref_audio.empty()) return true;
-    if (!wav_load(opts.ref_audio, voice.pcm, voice.sample_rate)) {
-        std::fprintf(stderr, "cannot read %s\n", opts.ref_audio.c_str());
-        return false;
-    }
-    voice.transcript = opts.ref_text;
-    return true;
+tts_cpp::audio8::VoicePrompt load_voice(const options & opts) {
+    if (opts.ref_audio.empty()) return {};
+    return tts_cpp::audio8::load_voice_prompt(opts.ref_audio, opts.ref_text);
 }
 
 tts_cpp::audio8::EngineOptions to_engine_options(const options & opts) {
@@ -196,14 +189,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    tts_cpp::audio8::VoicePrompt voice;
-    if (!load_voice(opts, voice)) return 1;
-    if (!voice.empty() && opts.codec_encoder.empty()) {
+    if (!opts.ref_audio.empty() && opts.codec_encoder.empty()) {
         std::fprintf(stderr, "--ref-audio needs --codec-encoder\n");
         return 1;
     }
 
     try {
+        const tts_cpp::audio8::VoicePrompt voice = load_voice(opts);
         tts_cpp::audio8::Engine engine(to_engine_options(opts));
         const tts_cpp::audio8::SynthesisResult result = speak(engine, opts, voice);
         if (!write_wav(opts.out, result.pcm, result.sample_rate)) {

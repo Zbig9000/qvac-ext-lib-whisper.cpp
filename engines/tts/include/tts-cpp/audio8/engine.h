@@ -119,6 +119,12 @@ private:
     std::unique_ptr<Impl> pimpl_;
 };
 
+// Reads a WAV into a VoicePrompt: any bit depth dr_wav handles, downmixed to
+// mono, left at the file's own rate for synthesize() to resample. Throws
+// std::runtime_error when the file cannot be read.
+TTS_CPP_API VoicePrompt load_voice_prompt(const std::string & wav_path,
+                                          const std::string & transcript);
+
 // One-shot convenience wrapper (pays a full model load per call).
 TTS_CPP_API SynthesisResult synthesize(const EngineOptions & opts, const std::string & text);
 

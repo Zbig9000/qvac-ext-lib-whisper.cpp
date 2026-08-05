@@ -313,6 +313,16 @@ BackendDevice Engine::backend_device() const {
                                                                  : BackendDevice::GPU;
 }
 
+VoicePrompt load_voice_prompt(const std::string & wav_path,
+                              const std::string & transcript) {
+    VoicePrompt voice;
+    if (!wav_load(wav_path, voice.pcm, voice.sample_rate)) {
+        throw std::runtime_error("audio8: cannot read the reference wav at " + wav_path);
+    }
+    voice.transcript = transcript;
+    return voice;
+}
+
 SynthesisResult synthesize(const EngineOptions & opts, const std::string & text) {
     Engine engine(opts);
     return engine.synthesize(text);

@@ -602,9 +602,14 @@ opts.codec_encoder_gguf_path = "models/audio8-codec-encoder-q8_0.gguf";  // clon
 tts_cpp::audio8::Engine engine(opts);
 auto plain = engine.synthesize("Hello.");
 
-tts_cpp::audio8::VoicePrompt voice{pcm, 44100, "What the recording says."};
+auto voice = tts_cpp::audio8::load_voice_prompt("voice.wav",
+                                                "What the recording says.");
 auto cloned = engine.synthesize("Now say this instead.", voice);
 ```
+
+`VoicePrompt` is mono float32 plus a transcript, so a caller that already has
+samples can fill it directly; `load_voice_prompt` is there for the common case
+of a file on disk.
 
 The engine holds the models resident across calls and caches the codes for the
 most recent voice prompt, so re-using a reference skips the codec encoder.

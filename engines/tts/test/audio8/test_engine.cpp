@@ -14,7 +14,6 @@
 
 #include "json.hpp"
 #include "npy.h"
-#include "voice_features.h"
 
 #include <cmath>
 #include <cstdio>
@@ -69,12 +68,8 @@ tts_cpp::audio8::EngineOptions options_for(const paths & where, const nlohmann::
 
 tts_cpp::audio8::VoicePrompt voice_from(const std::string & wav_path,
                                         const nlohmann::json & meta) {
-    tts_cpp::audio8::VoicePrompt voice;
-    if (!wav_load(wav_path, voice.pcm, voice.sample_rate)) {
-        throw std::runtime_error("cannot read " + wav_path);
-    }
-    voice.transcript = meta.at("reference_text").get<std::string>();
-    return voice;
+    return tts_cpp::audio8::load_voice_prompt(
+        wav_path, meta.at("reference_text").get<std::string>());
 }
 
 bool check_waveform(const char * tag, const std::vector<float> & got,
