@@ -36,6 +36,7 @@ from audio8_reference import (  # noqa: E402
     load_config,
     rename_codec_key,
     split_qkv,
+    to_engine_layout,
 )
 
 CODEC_PARTS = ("encoder", "decoder")
@@ -208,7 +209,7 @@ def codec_expectations(model_dir):
             expected.update(expand_fused(base, array, n_head, n_kv, HEAD_DIM))
         else:
             expected[name] = array
-    return expected
+    return {name: to_engine_layout(name, array) for name, array in expected.items()}
 
 
 def group_of(name):

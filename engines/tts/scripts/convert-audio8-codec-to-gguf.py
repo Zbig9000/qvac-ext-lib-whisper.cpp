@@ -39,6 +39,7 @@ from audio8_reference import (  # noqa: E402
     CODEC_ARCH as ARCH,
     CODEC_KV as KV,
     DENSE,
+    DEPTHWISE_MARKER,
     EXACT,
     FUSED_ATTENTION_SUFFIX,
     HEAD_DIM,
@@ -53,6 +54,7 @@ from audio8_reference import (  # noqa: E402
     raw_codec_state,
     rename_codec_key,
     rope_planes,
+    to_engine_layout,
     write_tensors,
 )
 
@@ -77,8 +79,10 @@ PARAMETRIZED_WEIGHT_NORM = (
 ENCODER_PREFIXES = ("enc/", "q/down/", "q/pre/")
 DECODER_PREFIXES = ("dec/", "q/up/", "q/post/")
 SHARED_SUFFIXES = ("/codebook/weight",)
-ENCODER_ONLY_PROJECTION = "/in_proj/"
-DECODER_ONLY_PROJECTION = "/out_proj/"
+ANALYSIS_PROJECTION = "/in_proj/"
+# The encoder subtracts each quantiser's reconstruction from the residual it
+# passes on, so it needs the projection back out of the codebook as well.
+RECONSTRUCTION_PROJECTION = "/out_proj/"
 
 
 @dataclass(frozen=True)
@@ -171,19 +175,19 @@ def renamed_tensors(state):
     named = {}
     for key, array in state.items():
         named.update(expand_attention(rename_codec_key(key), array))
-    return named
+    return {name: to_engine_layout(name, array) for name, array in named.items()}
 
 
 def belongs_to_encoder(name):
     if name.startswith(ENCODER_PREFIXES):
         return True
-    return ENCODER_ONLY_PROJECTION in name
+    return ANALYSIS_PROJECTION in name or RECONSTRUCTION_PROJECTION in name
 
 
 def belongs_to_decoder(name):
     if name.startswith(DECODER_PREFIXES):
         return True
-    return DECODER_ONLY_PROJECTION in name
+    return RECONSTRUCTION_PROJECTION in name
 
 
 def is_shared(name):
@@ -270,20 +274,23 @@ def is_body_matmul(name, array):
     )
 
 
-def is_convolution_kernel(array):
-    return array.ndim >= 2
+def is_matmul_operand(name, array):
+    """A depthwise kernel is one scalar per channel per tap, so the engine
+    applies it element-wise rather than contracting with it, and f16 would have
+    to be widened at every use."""
+    return array.ndim >= 2 and DEPTHWISE_MARKER not in name
 
 
 def role_of(name, array):
     """The codebooks stay exact even though they are read like a table: the
     encoder picks codes by nearest neighbour, so rounding them moves the
-    argmin. The same goes for the RoPE tables and every 1-D parameter, the
-    snake alphas among them, which sit inside a sine."""
+    argmin. The same goes for the RoPE tables and every parameter the engine
+    reads element-wise, the snake alphas among them, which sit inside a sine."""
     if is_body_matmul(name, array):
         return BLOCK
     if is_shared(name) or name.startswith("rope/"):
         return EXACT
-    return DENSE if is_convolution_kernel(array) else EXACT
+    return DENSE if is_matmul_operand(name, array) else EXACT
 
 
 def part_specs(config, part):

@@ -20,6 +20,8 @@ Written to --out-dir:
   semantic.npy       [S]     int32   chosen semantic token ids (absolute)
   fast_logits.npy    [S, 9, 4096]    fast-AR logits for codebooks 1..9
   codes.npy          [10, S] int32   the emitted codec frames
+  wav.npy            [N]             with --dump-wav, those frames decoded, which
+                                     is what the end-to-end engine test compares
   meta.json                          text, sampling settings and shapes
 
     python3 dump-audio8-lm-reference.py \\
@@ -138,6 +140,28 @@ def semantic_from_codes(codes, semantic_begin):
     return (codes[0].astype(np.int64) + semantic_begin).astype(np.int32)
 
 
+def waveform_arrays(model, codes, wanted):
+    if not wanted:
+        return {}
+    waveform, _ = model.decode_audio(codes)
+    return {"wav.npy": to_numpy(waveform[0]).astype(np.float32)}
+
+
+def step_arrays(recorder, codes, steps, config):
+    return {
+        "embed.npy": recorder.embed,
+        "slow_hidden.npy": stack_steps(recorder.slow_hidden[:steps], "hidden states"),
+        "sem_logits.npy": stack_steps(recorder.sem_logits[:steps], "semantic logits"),
+        "filtered.npy": stack_steps(recorder.filtered[:steps], "filtered scores"),
+        "fast_logits.npy": reshape_fast_logits(
+            recorder.fast_logits[: steps * (config.num_codebooks - 1)],
+            steps, config.num_codebooks,
+        ),
+        "codes.npy": codes,
+        "semantic.npy": semantic_from_codes(codes, config.semantic_begin_id),
+    }
+
+
 def sampling_settings(model):
     config = model.generation_config
     return {
@@ -156,6 +180,8 @@ def parse_args():
     parser.add_argument("--reference-text")
     parser.add_argument("--out-dir", default="artifacts/audio8-ref")
     parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--dump-wav", action="store_true",
+                        help="also decode the frames, which loads the codec")
     return parser.parse_args()
 
 
@@ -183,22 +209,17 @@ def main():
     steps = int(codes.shape[-1])
     config = model.config
     print(f"dumping {steps} generated frames to {args.out_dir}")
-    save_arrays(args.out_dir, {
+
+    arrays = {
         "prompt.npy": to_numpy(prompt[0]).astype(np.int32),
         "prompt_mask.npy": to_numpy(prompt_mask[0]).astype(np.int32),
-        "embed.npy": recorder.embed,
-        "slow_hidden.npy": stack_steps(recorder.slow_hidden[:steps], "hidden states"),
-        "sem_logits.npy": stack_steps(recorder.sem_logits[:steps], "semantic logits"),
-        "filtered.npy": stack_steps(recorder.filtered[:steps], "filtered scores"),
-        "fast_logits.npy": reshape_fast_logits(
-            recorder.fast_logits[: steps * (config.num_codebooks - 1)],
-            steps, config.num_codebooks,
-        ),
-        "codes.npy": to_numpy(codes[0]).astype(np.int32),
-        "semantic.npy": semantic_from_codes(
-            to_numpy(codes[0]).astype(np.int32), config.semantic_begin_id
-        ),
-    })
+    }
+    arrays.update(step_arrays(
+        recorder, to_numpy(codes[0]).astype(np.int32), steps, config
+    ))
+    arrays.update(waveform_arrays(model, codes, args.dump_wav))
+    save_arrays(args.out_dir, arrays)
+
     write_meta(args.out_dir, {
         "text": args.text,
         "reference_text": args.reference_text,

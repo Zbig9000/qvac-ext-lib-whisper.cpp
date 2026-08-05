@@ -10,6 +10,7 @@ so they keep working when invoked by absolute path from anywhere.
 """
 import json
 import os
+import re
 from collections import Counter
 
 import numpy as np
@@ -43,6 +44,13 @@ CODEC_RENAMES = (
 
 FUSED_ATTENTION_SUFFIX = "attention/wqkv/weight"
 
+# The engine runs the codec channels-inner, so a convolution is a stack of
+# per-tap [in, out] matrices applied to shifted views of the signal rather than
+# ggml's [tap, in, out] im2col kernel. Storing the taps outermost is what makes
+# each of those matrices a contiguous slice.
+DEPTHWISE_MARKER = "/dwconv/"
+TRANSPOSED_CONV = re.compile(r"^(?:q/up/\d+/0|dec/\d+/block/1)/conv/weight$")
+SNAKE_ALPHA_SUFFIX = "/alpha"
 
 ROPE_PRECISIONS = ("bf16", "f32")
 
@@ -178,6 +186,33 @@ def rename_codec_key(key):
     for source, target in CODEC_RENAMES:
         key = key.replace(source, target)
     return key.replace(".", "/")
+
+
+def is_conv_kernel(name, array):
+    return array.ndim == 3 and not name.endswith(SNAKE_ALPHA_SUFFIX)
+
+
+def tap_major_kernel(name, array):
+    """Reorder one convolution kernel from torch's layout to ggml [in, out, tap].
+
+    Torch spells a Conv1d kernel [out, in, tap] and a ConvTranspose1d one
+    [in, out, tap], and a depthwise kernel has no input axis at all.
+    """
+    if DEPTHWISE_MARKER in name:
+        return np.ascontiguousarray(array[:, 0, :].T)
+    if TRANSPOSED_CONV.match(name):
+        return np.ascontiguousarray(array.transpose(2, 1, 0))
+    return np.ascontiguousarray(array.transpose(2, 0, 1))
+
+
+def to_engine_layout(name, array):
+    """Both the converter and the verifier read the codec through this, so the
+    checkpoint is only ever reshaped in one place."""
+    if name.endswith(SNAKE_ALPHA_SUFFIX):
+        return array.reshape(-1)
+    if is_conv_kernel(name, array):
+        return tap_major_kernel(name, array)
+    return array
 
 
 def split_qkv(fused, n_head, n_kv, head_dim=HEAD_DIM):

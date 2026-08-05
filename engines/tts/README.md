@@ -444,9 +444,9 @@ frame.  Cloning needs no speaker encoder: the codec *encoder* turns a reference
 wav into codes, and those codes plus the reference transcript are prepended to
 the prompt.
 
-**Status — conversion and parity fixtures only.**  There is no Audio8 C++
-engine yet; this section covers the converters and the reference harness the
-engine will be validated against.
+**Status — CPU engine, validated against the reference.**  Text-to-speech and
+voice cloning both run in-process; the backend plumbing mirrors the other
+engines so a GPU path can be added without touching the graphs.
 
 ### Convert
 
@@ -556,14 +556,110 @@ python3 scripts/dump-audio8-lm-reference.py \
     --text "Tear in eye, your dress you'll tear." \
     --reference-codes artifacts/audio8-ref/codec_enc_codes.npy \
     --reference-text "What these pictures? An elephant with uh so many legs." \
-    --out-dir artifacts/audio8-ref-clone --max-new-tokens 24
+    --out-dir artifacts/audio8-ref-clone --max-new-tokens 24 --dump-wav
 ```
 
 The dumps are taken with `do_sample=False`.  The shipped sampler draws Gumbel
 noise and applies repetition-aware resampling, neither of which reproduces
 across runtimes; greedy decoding makes the trajectory comparable, and the
 filtered score vectors are dumped alongside the tokens so everything feeding
-the draw can be checked even where the draw itself cannot.
+the draw can be checked even where the draw itself cannot.  `--dump-wav` runs
+the generated codes back through the codec so the engine test has an
+end-to-end waveform to compare against, not just codes.
+
+### Run
+
+```bash
+# text only: the LM and the codec's synthesis half
+audio8-cli --lm models/audio8-lm-q8_0.gguf \
+           --codec-decoder models/audio8-codec-decoder-q8_0.gguf \
+           --text "Hello from a fully on-device C++ pipeline." \
+           --out out.wav --threads 8
+
+# cloning: add the analysis half, a reference wav and what it says
+audio8-cli --lm models/audio8-lm-q8_0.gguf \
+           --codec-decoder models/audio8-codec-decoder-q8_0.gguf \
+           --codec-encoder models/audio8-codec-encoder-q8_0.gguf \
+           --ref-audio voice.wav --ref-text "What the recording says." \
+           --text "Now say this instead." --out out.wav --threads 8
+```
+
+`--greedy` reproduces the fixtures; otherwise `--seed`, `--temperature`,
+`--top-k` and `--top-p` drive the sampler.  `--max-frames` caps the output at
+2048 samples each (~46 ms), `--output-sample-rate` resamples away from the
+codec's native 44.1 kHz, and `--backends-dir` points a `GGML_BACKEND_DL` build
+at its backend libraries.  The reference wav is resampled and downmixed on the
+way in, so any format `dr_wav` reads will do.
+
+The same thing through the library, from `tts-cpp/audio8/engine.h`:
+
+```cpp
+tts_cpp::audio8::EngineOptions opts;
+opts.lm_gguf_path            = "models/audio8-lm-q8_0.gguf";
+opts.codec_decoder_gguf_path = "models/audio8-codec-decoder-q8_0.gguf";
+opts.codec_encoder_gguf_path = "models/audio8-codec-encoder-q8_0.gguf";  // cloning only
+
+tts_cpp::audio8::Engine engine(opts);
+auto plain = engine.synthesize("Hello.");
+
+tts_cpp::audio8::VoicePrompt voice{pcm, 44100, "What the recording says."};
+auto cloned = engine.synthesize("Now say this instead.", voice);
+```
+
+The engine holds the models resident across calls and caches the codes for the
+most recent voice prompt, so re-using a reference skips the codec encoder.
+`cancel()` stops an in-flight `synthesize()` at the next decoder step.
+
+### Engine notes
+
+Roughly a second of audio per second of CPU on eight cores of a desktop x86-64,
+q8_0 weights: 16 s of speech in 19 s wall, 5.5 s of cloned speech in 10 s
+including enrolment.
+
+**The codec is chunked, in both directions.**  Its convolution stacks, not the
+LM, are what made memory grow with utterance length — a 24 s decode used to
+need a 1.5 GB arena.  Each direction is now split into a whole-sequence graph
+and a block graph that walks the utterance, and each block is re-fed the exact
+receptive field its stack needs (`span_through_*` in `codec_ops.cpp` walks the
+strides and dilations to compute it) and drops the samples that context
+produced.  The result is bit-identical to running in one pass whatever the
+block size, which `test-audio8-codec` asserts by re-running both directions at
+a deliberately tiny block and comparing.  Decode now holds ~130 MB flat, encode
+~140 MB for a 10 s reference.  End to end that is 1.25 GB resident for
+text-only and 1.67 GB for cloning, of which 1.25 GB is the q8_0 weights
+themselves.
+
+The one part that still grows with input length is the encoder's analysis
+transformer: `ggml_soft_max_ext` materialises the full score matrix, so a
+reference much beyond 30 s gets expensive.  References of a few seconds are
+what the model expects anyway.
+
+**Sampling follows the reference's order, which is unusual.**  top-k and top-p
+run on the raw logits and the temperature is applied to what survives, so
+temperature does not affect which candidates are in the running.  Semantic
+tokens additionally go through repetition-aware resampling: drawing a token
+that already appears in a short trailing window triggers one re-draw at a
+narrower nucleus and a higher temperature.  `--greedy` bypasses all of it.
+
+### Test
+
+The C++ stages are checked against the fixtures above, one CTest target per
+stage boundary:
+
+```bash
+ctest -R audio8 --output-on-failure
+```
+
+| target | checks |
+|---|---|
+| `test-audio8-tokenizer` | BPE ids and the ChatML prompt, both cloning and not |
+| `test-audio8-lm` | prompt embeddings, per-step hidden states, semantic and fast-AR logits, emitted codes |
+| `test-audio8-codec` | encode and decode at every stage boundary, plus block-size independence |
+| `test-audio8-sampler` | filtered score vectors, which is the part of the draw that is reproducible |
+| `test-audio8-engine` | both public paths end to end, against the decoded waveforms |
+
+The engine test hands the cloning path a wav rather than pre-computed codes, so
+it exercises the codec encoder the way a caller would.
 
 ## Prerequisites
 
@@ -1406,6 +1502,7 @@ tts-cpp/                         in-tree subtree of github.com/gianni-cor/chatte
     tts-cpp.h                    library entry; declares tts_cpp_cli_main()
     chatterbox/engine.h          Engine + EngineOptions (text → wav)
     chatterbox/s3gen_pipeline.h  low-level S3Gen + HiFT pipeline entries
+    audio8/engine.h              Audio8 Engine + EngineOptions + VoicePrompt
   src/
     main.cpp                     T3 turbo runtime + shared helpers (libtts-cpp)
     t3_mtl.{h,cpp}               T3 multilingual (Llama-520M) runtime + stage builders
@@ -1432,6 +1529,18 @@ tts-cpp/                         in-tree subtree of github.com/gianni-cor/chatte
                                    25-Hz speech tokens
     dr_wav.h                     vendored single-header WAV reader
     npy.h                        minimal .npy load / save + compare
+
+    audio8_cli.cpp               Audio8 CLI entry (`audio8-cli` binary)
+    audio8/engine.cpp            public Engine API impl: prompt → codes → wav
+    audio8/{tokenizer,unicode}.{h,cpp}  Qwen2.5 byte-level BPE + ChatML builder
+    audio8/unicode_tables.inc    embedded NFC + character-category tables
+    audio8/gguf.cpp              hparams, tensors, backend buffers
+    audio8/{graph.h,graph.cpp}   shared ggml blocks (RoPE, attention, norms)
+    audio8/lm.cpp                slow AR with KV cache + fast AR head
+    audio8/codec_ops.{h,cpp}     causal convs, Snake, ConvNeXt, receptive spans
+    audio8/codec_{decode,encode}.cpp  chunked synthesis / analysis stacks
+    audio8/sampling.{h,cpp}      top-k/top-p, Gumbel draw, repetition-aware resample
+    audio8/internal.h            model containers shared by the above
 
     test_*.cpp                   per-stage numerical-parity harnesses
                                    (S3Gen / HiFT / streaming / MTL T3 /
@@ -1461,6 +1570,7 @@ tts-cpp/                         in-tree subtree of github.com/gianni-cor/chatte
                                    (weight norm folded, --part)
     verify-audio8-conversion.py  compares Audio8 GGUFs tensor by tensor
                                    against the checkpoint
+    gen-audio8-unicode-tables.py generates src/audio8/unicode_tables.inc
     reference-t3-turbo.py        PyTorch T3 bit-exact compare vs C++
     compare-tokenizer.py         10-case BPE tokenizer compare vs HF
   (no patches/ in this in-tree subtree - the standalone chatterbox.cpp
