@@ -752,6 +752,19 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_audio8_ref}"
         REQUIRES "${_tcb_audio8_ref}/filtered.npy" "${_tcb_audio8_ref}/meta.json")
 
+    # The repetition-aware window, which the fixture dumps decode greedily and
+    # therefore never exercise.  No fixtures, so it runs on a bare checkout.
+    add_executable(test-audio8-ras test/audio8/test_ras.cpp src/audio8/sampling.cpp)
+    target_include_directories(test-audio8-ras PRIVATE src)
+    # A window of zero used to pop an empty deque, which is undefined rather
+    # than observable: the sampler returns the same tokens either way, so only
+    # a hardened container turns the regression into a failure.  Unlike
+    # _GLIBCXX_DEBUG this leaves the ABI alone, and the target compiles its own
+    # copy of sampling.cpp rather than linking tts-cpp, so nothing else sees it.
+    target_compile_definitions(test-audio8-ras PRIVATE _GLIBCXX_ASSERTIONS)
+    tts_cpp_apply_ccache(test-audio8-ras)
+    tts_cpp_register_test(test-audio8-ras)
+
     # End-to-end through the public engine, both the text path and the cloning
     # path, so it links the whole library rather than the stage sources.
     add_executable(test-audio8-engine test/audio8/test_engine.cpp)

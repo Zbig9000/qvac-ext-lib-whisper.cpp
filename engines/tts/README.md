@@ -539,16 +539,19 @@ python3 scripts/dump-audio8-tokenizer-reference.py \
     --model-dir models/Audio8-TTS-Preview-0.6b --out-dir artifacts/audio8-ref
 
 # reference-free generation: prompt, embeddings, per-step hidden states,
-# semantic logits before and after filtering, fast-AR logits, emitted codes
+# semantic logits before and after filtering, fast-AR logits, emitted codes.
+# --dump-wav also decodes those codes, which test-audio8-engine compares against
 python3 scripts/dump-audio8-lm-reference.py \
     --model-dir models/Audio8-TTS-Preview-0.6b \
-    --out-dir artifacts/audio8-ref --max-new-tokens 32
+    --out-dir artifacts/audio8-ref --max-new-tokens 32 --dump-wav
 
-# codec both ways: decode the codes above, encode a reference wav
+# codec both ways: decode the codes above, encode a reference wav.  This is the
+# recording the cloning fixtures below are enrolled from, so the tests expect it
 python3 scripts/dump-audio8-codec-reference.py \
     --model-dir models/Audio8-TTS-Preview-0.6b \
     --codes artifacts/audio8-ref/codes.npy \
-    --audio reference.wav --out-dir artifacts/audio8-ref
+    --audio test/reference-audio/audio8-reference-en.wav \
+    --out-dir artifacts/audio8-ref
 
 # the cloning path end to end: reference codes + transcript -> prompt -> codes
 python3 scripts/dump-audio8-lm-reference.py \
@@ -566,6 +569,14 @@ filtered score vectors are dumped alongside the tokens so everything feeding
 the draw can be checked even where the draw itself cannot.  `--dump-wav` runs
 the generated codes back through the codec so the engine test has an
 end-to-end waveform to compare against, not just codes.
+
+CTest looks for the results in fixed places, and a fixture it cannot find turns
+its test into a "Not Run (Disabled)" rather than a failure, so the recipe above
+writes where the tests read: the dumps into `artifacts/audio8-ref` and
+`artifacts/audio8-ref-clone`, the GGUFs into `models/`.  `cmake` prints a
+`disabled (missing fixture(s): ...)` line at configure time for whatever is
+still absent, which is the quickest way to see that a run is thinner than it
+looks.
 
 ### Run
 
@@ -661,7 +672,11 @@ ctest -R audio8 --output-on-failure
 | `test-audio8-lm` | prompt embeddings, per-step hidden states, semantic and fast-AR logits, emitted codes |
 | `test-audio8-codec` | encode and decode at every stage boundary, plus block-size independence |
 | `test-audio8-sampler` | filtered score vectors, which is the part of the draw that is reproducible |
+| `test-audio8-ras` | the repetition-aware window: eligibility, eviction, and the retry's nucleus |
 | `test-audio8-engine` | both public paths end to end, against the decoded waveforms |
+
+Every target above except `test-audio8-ras` needs the dumps, so `test-audio8-ras`
+is the only one that runs on a checkout with no models.
 
 The engine test hands the cloning path a wav rather than pre-computed codes, so
 it exercises the codec encoder the way a caller would.

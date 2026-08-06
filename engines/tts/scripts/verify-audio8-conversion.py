@@ -8,8 +8,20 @@ instantiated through the checkpoint's own remote code so the folding is
 compared against what PyTorch itself materialises -- and reports the worst
 absolute deviation per tensor group.
 
+What that does and does not establish is worth being precise about. Values,
+shapes, storage types and the weight-norm folding are compared against the
+checkpoint. The codec's *layout* is not: `codec_expectations` reaches the
+engine's axis order through the same `to_engine_layout` and `expand_fused` the
+converter uses, so a wrong entry in TRANSPOSED_CONV, a wrong axis in the
+tap-major kernel, or a wrong offset in the qkv split cancels on both sides and
+passes. The language model's q/k permutation is the one layout that is checked
+independently, by `verify_rope_layout`, which re-derives attention scores from
+the reference rotation; the codec still wants the same treatment.
+
 An f32 conversion is expected to be exact; f16 and quantised builds are checked
-against the tolerance implied by their storage format.
+against the tolerance implied by their storage format. RoPE tables are only
+compared when the GGUF says it baked them at the reference's own bfloat16
+rounding, since an f32 build is deliberately a different table.
 
     python3 verify-audio8-conversion.py \\
         --model-dir models/Audio8-TTS-Preview-0.6b \\
@@ -28,8 +40,10 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from audio8_reference import (  # noqa: E402
+    CODEC_KV,
     FUSED_ATTENTION_SUFFIX,
     HEAD_DIM,
+    LM_KV,
     codec_head_counts,
     expand_fused,
     load_codec_module,
@@ -40,6 +54,7 @@ from audio8_reference import (  # noqa: E402
 )
 
 CODEC_PARTS = ("encoder", "decoder")
+LM_ROPE_TENSORS = ("lm/rope_cos", "lm/rope_sin", "fast/rope_cos", "fast/rope_sin")
 ROTATION_POSITIONS = 64
 ABSOLUTE_FLOOR = 1e-8
 # A block-quantised value can miss its original by up to one reconstruction
@@ -146,9 +161,7 @@ def lm_rope_expectations(model_dir, config):
     return expectations
 
 
-def lm_expectations(model_dir):
-    config = load_config(model_dir)
-    state = load_lm_state(model_dir)
+def lm_expectations(config, state):
     expected = {
         "lm/tok_emb": state["embeddings.weight"],
         "lm/codebook_emb": state["codebook_embeddings.weight"],
@@ -168,7 +181,6 @@ def lm_expectations(model_dir):
         int(config["fast_n_head"]), int(config["fast_n_local_heads"]),
         int(config["fast_head_dim"]), bool(config["fast_attention_qkv_bias"]),
     ))
-    expected.update(lm_rope_expectations(model_dir, config))
     return expected
 
 
@@ -281,12 +293,15 @@ def attention_scores(query, key):
     return query @ key.T
 
 
-def rotation_deviation(reference, emitted, table, cosine, sine, head_dim):
+def rotation_deviation(reference, emitted, table, head_dim):
     """Attention scores are the only thing the permutation has to preserve, so
     they are what gets compared: the reference's rotation of the original rows
-    against the engine's rotation of the reordered ones."""
+    against the engine's rotation of the reordered ones. Both sides rotate with
+    the reference table, so the permutation is checked whatever precision the
+    GGUF baked its own planes at."""
     rng = np.random.default_rng(0)
-    length = min(int(cosine.shape[0]), ROTATION_POSITIONS)
+    cosine, sine = table[..., 0], table[..., 1]
+    length = min(int(table.shape[0]), ROTATION_POSITIONS)
     activations = rng.standard_normal(
         (length, reference["wq"].shape[1]), dtype=np.float32
     )
@@ -325,7 +340,7 @@ def verify_rope_layout(model_dir, state, tensors, config):
     deviation = rotation_deviation(
         reference_qk(state, config, head_dim),
         {part: value for part, (value, _) in emitted.items()},
-        table, tensors["lm/rope_cos"][0], tensors["lm/rope_sin"][0], head_dim,
+        table, head_dim,
     )
     tolerance = RELATIVE_TOLERANCE.get(type_name, DEFAULT_RELATIVE_TOLERANCE)
     print(f"\nrope layout: attention scores match the reference to {deviation:.3e} "
@@ -335,11 +350,24 @@ def verify_rope_layout(model_dir, state, tensors, config):
     return []
 
 
+def bakes_reference_rope(fields, namespace):
+    return fields.get(f"{namespace}.rope_precision") == "bf16"
+
+
+def drop_lm_rope(tensors):
+    return {n: v for n, v in tensors.items() if n not in LM_ROPE_TENSORS}
+
+
 def verify_lm(model_dir, path):
-    _, tensors = read_gguf(path)
+    fields, tensors = read_gguf(path)
     config = load_config(model_dir)
     state = load_lm_state(model_dir)
-    expected = lm_expectations(model_dir)
+    expected = lm_expectations(config, state)
+    if bakes_reference_rope(fields, LM_KV):
+        expected.update(lm_rope_expectations(model_dir, config))
+    else:
+        print(f"  note: {path} bakes non-reference RoPE tables; skipping their check")
+        tensors = drop_lm_rope(tensors)
     worst, counts, failures = compare(tensors, expected, "lm")
     report(f"lm ({path})", worst, counts)
     failures += missing_from_gguf(tensors, expected, "lm")
@@ -353,10 +381,6 @@ def reference_codec_rope(model_dir, length, head_dim, theta):
     return rope(length, head_dim, theta).float().numpy()
 
 
-def baked_rope_names(tensors):
-    return [name for name in tensors if name.startswith("rope/")]
-
-
 def rope_transformer_names(tensors):
     return sorted({
         name[len("rope/"): -len("_cos")]
@@ -365,7 +389,7 @@ def rope_transformer_names(tensors):
 
 
 def codec_rope_expectations(model_dir, fields, tensors):
-    frames = int(fields["audio8.codec.max_frames"])
+    frames = int(fields[f"{CODEC_KV}.max_frames"])
     expectations = {}
     for transformer in rope_transformer_names(tensors):
         expectations.update(rope_plane_expectations(
@@ -373,8 +397,8 @@ def codec_rope_expectations(model_dir, fields, tensors):
             reference_codec_rope(
                 model_dir,
                 frames,
-                int(fields[f"audio8.codec.{transformer}.head_dim"]),
-                float(fields[f"audio8.codec.{transformer}.rope_theta"]),
+                int(fields[f"{CODEC_KV}.{transformer}.head_dim"]),
+                float(fields[f"{CODEC_KV}.{transformer}.rope_theta"]),
             ),
         ))
     return expectations
@@ -385,10 +409,10 @@ def drop_rope(tensors):
 
 
 def verify_codec(model_dir, path, part, expected, fields, tensors):
-    declared = fields.get("audio8.codec.part")
+    declared = fields.get(f"{CODEC_KV}.part")
     if declared != part:
         return [f"codec: {path} declares part {declared!r}, expected {part!r}"]
-    if fields.get("audio8.codec.rope_precision") == "bf16":
+    if bakes_reference_rope(fields, CODEC_KV):
         expected = dict(expected)
         expected.update(codec_rope_expectations(model_dir, fields, tensors))
     else:
@@ -423,6 +447,9 @@ def verify_codec_halves(model_dir, args):
     if not paths:
         return []
     expected = codec_expectations(model_dir)
+    print("\nnote: the codec expectation is built through the converter's own "
+          "layout helpers,\n      so tensor values are checked but their axis "
+          "order is not")
     failures = []
     emitted = set()
     for path, part in paths:
@@ -445,7 +472,8 @@ def main():
         for line in failures[:40]:
             print(f"  {line}")
         sys.exit(1)
-    print("\nall converted tensors match the reference checkpoint")
+    print("\nevery converted tensor matches the reference checkpoint in value, "
+          "shape and dtype")
 
 
 if __name__ == "__main__":

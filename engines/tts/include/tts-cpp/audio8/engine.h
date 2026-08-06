@@ -53,8 +53,9 @@ struct EngineOptions {
     float top_p = 0.9f;
 
     // Cap on generated frames, each 2048 samples (~46 ms). 0 => 512, the
-    // reference default, which is about 24 s. The prompt has to fit alongside
-    // it in the model's 4096-position context.
+    // reference default, which is about 24 s. The prompt and the frames it
+    // generates share whatever context the language model GGUF declares, so a
+    // long prompt lowers the ceiling.
     int max_frames = 0;
 
     // Rate to deliver the result at; 0 keeps the codec's own 44.1 kHz.

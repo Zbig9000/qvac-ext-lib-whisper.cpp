@@ -51,10 +51,13 @@ private:
     sampling_params narrow_;
     // Empty until the second step: the reference starts the window as zeros
     // after the first draw, so the opening token is never treated as history.
+    // A window of zero keeps it empty and turns the resampling off.
     std::deque<int> recent_;
     bool started_ = false;
 
     bool is_repeat(int token) const;
+    void start_window();
+    void record(int token);
     void remember(int token);
 };
 

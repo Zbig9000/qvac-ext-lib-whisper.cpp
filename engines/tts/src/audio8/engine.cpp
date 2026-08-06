@@ -93,7 +93,7 @@ struct Engine::Impl {
     ~Impl() {
         free_lm(lm);
         free_codec(decoder);
-        if (has_encoder) free_codec(encoder);
+        free_codec(encoder);
     }
 
     void check_cancel() const {
