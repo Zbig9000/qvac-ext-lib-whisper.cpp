@@ -38,14 +38,12 @@ struct Qwen3Config {
     // builds: the four projections, the MLP, and both attention matmuls.
     //
     // GGML_PREC_F32 is required for models whose activations leave fp16 range, otherwise
-    // fp16-based GPU matmul paths clamp them at 65504. The ACE-Step LM reaches ~1.9e6 and
-    // produces repetitive, robotic audio without it.
-    // Only the LM asks for it. The text encoder, cond encoder and detokenizer stay at
-    // GGML_PREC_DEFAULT deliberately: their activations remain well inside fp16 range,
-    // and the default keeps them on the fast coopmat path, bit-identical to before the
-    // LM fix. Raising it for those stages would cost throughput to buy accuracy they do
-    // not currently need -- worth revisiting only with measurements of their activation
-    // ranges, not on the strength of the LM's result.
+    // fp16-based GPU matmul paths saturate them to inf at 65504. The ACE-Step LM reaches
+    // ~1.9e6 and produces repetitive, robotic audio without it; the cond encoder reaches
+    // ~4.2e5 at one hidden channel and, unfixed, returns rows of zeros carrying a single
+    // NaN -- enough to silence a whole song through the DiT cross-attention.
+    // The text encoder and detokenizer stay at GGML_PREC_DEFAULT. That is an untested
+    // assumption about their activation ranges, not a measurement: check before trusting it.
     ggml_prec prec = GGML_PREC_DEFAULT;
 };
 
@@ -130,6 +128,14 @@ static inline void q3_load_f32(ggml_tensor * dst, const DitGGUF & g, const std::
     } else if (mt->type == GGML_TYPE_BF16) {
         const uint16_t * p = (const uint16_t *) s;
         for (size_t i = 0; i < n; i++) w[i] = q3_bf16_to_f32(p[i]);
+    } else if (ggml_is_quantized(mt->type)) {
+        // Same dequantisation ggml_cast would do, hoisted to load time.
+        const ggml_type_traits * tt = ggml_get_type_traits(mt->type);
+        if (!tt || !tt->to_float) {
+            fprintf(stderr, "[qwen3] load_f32: no dequantiser for %s\n", name.c_str());
+            return;
+        }
+        tt->to_float(s, w.data(), (int64_t) n);
     } else {
         fprintf(stderr, "[qwen3] load_f32: unsupported type for %s\n", name.c_str());
         return;
