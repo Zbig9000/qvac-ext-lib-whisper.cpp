@@ -36,6 +36,10 @@ int sample_token(const std::vector<float> & logits, const sampling_params & para
 // from the recent window, the reference re-draws from a narrower nucleus at a
 // higher temperature instead of accepting the repeat. Only semantic tokens are
 // eligible, so an end-of-speech draw is never second-guessed.
+//
+// The window holds codebook indices, where the reference holds vocabulary ids.
+// That is why it can afford to open the window as zeros and this cannot: zero
+// is a real codebook index here and an unreachable id there.
 class RepetitionAwareSampler {
 public:
     RepetitionAwareSampler(int window, int semantic_begin, int semantic_end,
@@ -49,14 +53,15 @@ private:
     int semantic_begin_ = 0;
     int semantic_end_ = 0;
     sampling_params narrow_;
-    // Empty until the second step: the reference starts the window as zeros
-    // after the first draw, so the opening token is never treated as history.
-    // A window of zero keeps it empty and turns the resampling off.
+    // Tokens actually drawn, newest last, never more than `window` of them. A
+    // window of zero keeps it empty and turns the resampling off.
     std::deque<int> recent_;
-    bool started_ = false;
+    // Whether the opening draw has happened. The reference gives that draw no
+    // history and starts the next step's window empty, so the token it chose
+    // never becomes history; this flag is that step.
+    bool opened_ = false;
 
     bool is_repeat(int token) const;
-    void start_window();
     void record(int token);
     void remember(int token);
 };

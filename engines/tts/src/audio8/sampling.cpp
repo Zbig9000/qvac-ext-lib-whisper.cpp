@@ -107,20 +107,15 @@ bool RepetitionAwareSampler::is_repeat(int token) const {
     return std::find(recent_.begin(), recent_.end(), token) != recent_.end();
 }
 
-void RepetitionAwareSampler::start_window() {
-    started_ = true;
-    recent_.assign(window_, 0);
-}
-
 void RepetitionAwareSampler::record(int token) {
-    recent_.pop_front();
+    if (static_cast<int>(recent_.size()) == window_) recent_.pop_front();
     recent_.push_back(token);
 }
 
 void RepetitionAwareSampler::remember(int token) {
     if (window_ <= 0) return;
-    if (!started_) {
-        start_window();
+    if (!opened_) {
+        opened_ = true;
         return;
     }
     record(token);

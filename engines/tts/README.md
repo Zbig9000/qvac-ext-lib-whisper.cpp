@@ -667,7 +667,10 @@ run on the raw logits and the temperature is applied to what survives, so
 temperature does not affect which candidates are in the running.  Semantic
 tokens additionally go through repetition-aware resampling: drawing a token
 that already appears in a short trailing window triggers one re-draw at a
-narrower nucleus and a higher temperature.  `--greedy` bypasses all of it.
+narrower nucleus and a higher temperature.  The window holds tokens the model
+actually drew and nothing else, so an utterance opens with no history at all;
+the opening token stays out of it, as it does in the reference.  `--greedy`
+bypasses all of it.
 
 ### Test
 
@@ -684,7 +687,7 @@ ctest -R audio8 --output-on-failure
 | `test-audio8-lm` | prompt embeddings, per-step hidden states, semantic and fast-AR logits, emitted codes |
 | `test-audio8-codec` | encode and decode at every stage boundary, block-size independence, and that a cancel stops the block loop |
 | `test-audio8-sampler` | filtered score vectors, which is the part of the draw that is reproducible |
-| `test-audio8-ras` | the repetition-aware window: eligibility, eviction, and the retry's nucleus |
+| `test-audio8-ras` | the repetition-aware window: which draws enter it, eligibility, eviction, and the retry's nucleus |
 | `test-audio8-engine` | both public paths end to end against the decoded waveforms, and the refusal of GGUFs that disagree |
 
 Every target above except `test-audio8-ras` needs the dumps, so `test-audio8-ras`
