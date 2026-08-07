@@ -51,6 +51,65 @@ void require(bool condition, const std::string & message) {
     if (!condition) throw std::runtime_error("audio8: " + message);
 }
 
+// Names both sides of a comparison so a mismatch says which two files
+// disagree and by how much.
+struct agreement {
+    const char * left;
+    const char * right;
+
+    void on(const char * field, int left_value, int right_value) const {
+        require(left_value == right_value,
+                std::string(field) + " disagrees: " + left + " says " +
+                    std::to_string(left_value) + ", " + right + " says " +
+                    std::to_string(right_value));
+    }
+};
+
+codec_header read_header(const std::string & path, const char * expected_part) {
+    codec_header header;
+    std::string error;
+    if (!peek_codec_header(path, header, &error)) throw std::runtime_error(error);
+    require(header.part == expected_part,
+            path + " holds the codec's " + header.part + " half, not the " +
+                expected_part);
+    return header;
+}
+
+// The language model emits one code per quantizer, so a half that disagrees
+// with its own bank would hand the other side frames of the wrong width.
+void check_bank(const codec_hparams & hp, const char * half) {
+    require(hp.num_codebooks == hp.residual_codebooks + 1,
+            std::string("the codec ") + half + " declares " +
+                std::to_string(hp.num_codebooks) + " codebooks but " +
+                std::to_string(hp.residual_codebooks) +
+                " residual quantizers alongside the semantic one");
+}
+
+// Codes cross from the encoder into the prompt and from the language model
+// into the decoder, so files from different checkpoints would index one's
+// tables with the other's codes.
+void check_against_lm(const lm_hparams & lm, const codec_hparams & codec,
+                      const char * half) {
+    const agreement pair{"the language model", half};
+    pair.on("the codebook count", lm.num_codebooks, codec.num_codebooks);
+    pair.on("the semantic codebook size", lm.codebook_size, codec.semantic_codebook_size);
+}
+
+void check_halves(const codec_hparams & encoder, const codec_hparams & decoder) {
+    const agreement pair{"the codec encoder", "the decoder"};
+    pair.on("the codebook count", encoder.num_codebooks, decoder.num_codebooks);
+    pair.on("the semantic codebook size", encoder.semantic_codebook_size,
+            decoder.semantic_codebook_size);
+    pair.on("the residual codebook size", encoder.residual_codebook_size,
+            decoder.residual_codebook_size);
+    pair.on("the residual quantizer count", encoder.residual_codebooks,
+            decoder.residual_codebooks);
+    pair.on("the codebook width", encoder.codebook_dim, decoder.codebook_dim);
+    pair.on("the latent width", encoder.latent_dim, decoder.latent_dim);
+    pair.on("the frame size", encoder.frame_size, decoder.frame_size);
+    pair.on("the sample rate", encoder.sample_rate, decoder.sample_rate);
+}
+
 std::vector<float> at_codec_rate(const VoicePrompt & voice, int codec_rate) {
     require(voice.sample_rate > 0, "the voice prompt has no sample rate");
     if (voice.sample_rate == codec_rate) return voice.pcm;
@@ -96,10 +155,18 @@ struct Engine::Impl {
         free_codec(encoder);
     }
 
+    bool wants_cancel() const {
+        return cancel_requested.load(std::memory_order_relaxed);
+    }
+
     void check_cancel() const {
-        if (cancel_requested.load(std::memory_order_relaxed)) {
-            throw std::runtime_error("audio8: synthesis cancelled");
-        }
+        if (wants_cancel()) throw std::runtime_error(CANCELLED);
+    }
+
+    // What the codec asks between blocks, so a long pass stops with the rest
+    // of the pipeline rather than running to the end.
+    cancel_hook cancel_probe() const {
+        return [this] { return wants_cancel(); };
     }
 
     int frame_budget(int prompt_width) const {
@@ -121,7 +188,7 @@ struct Engine::Impl {
         require(!pcm.empty(), "the voice prompt is empty after resampling");
         std::string error;
         if (!encode_audio(encoder, pcm.data(), static_cast<int>(pcm.size()), n_threads,
-                          cached_codes, cached_frames, &error)) {
+                          cancel_probe(), cached_codes, cached_frames, &error)) {
             has_cached_voice = false;
             throw std::runtime_error(error);
         }
@@ -139,6 +206,11 @@ struct Engine::Impl {
         if (!cloning) return build_frames(lm.hp, segments, {}, 0);
         int frames = 0;
         const std::vector<int32_t> & codes = reference_codes(voice, n_threads, frames);
+        require(codes.size() ==
+                    static_cast<size_t>(lm.hp.num_codebooks) * static_cast<size_t>(frames),
+                "the encoder returned " + std::to_string(codes.size()) +
+                    " codes for " + std::to_string(frames) + " frames, not the " +
+                    std::to_string(lm.hp.num_codebooks) + " rows the prompt needs");
         return build_frames(lm.hp, segments, codes, frames);
     }
 
@@ -226,7 +298,7 @@ struct Engine::Impl {
         result.frames = n_frames;
         std::string error;
         if (!decode_codes(decoder, as_codebook_rows(frames, n_frames).data(), n_frames,
-                          n_threads, result.pcm, &error)) {
+                          n_threads, cancel_probe(), result.pcm, &error)) {
             throw std::runtime_error(error);
         }
 
@@ -256,25 +328,33 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(new Impl()) {
     require(!opts.lm_gguf_path.empty(), "lm_gguf_path is required");
     require(!opts.codec_decoder_gguf_path.empty(), "codec_decoder_gguf_path is required");
 
+    // Headers first: a set of GGUFs that does not belong together is rejected
+    // before a gigabyte of weights is read.
+    const bool cloning = !opts.codec_encoder_gguf_path.empty();
+    const codec_header decoder = read_header(opts.codec_decoder_gguf_path, "decoder");
+    check_bank(decoder.hp, "decoder");
+    codec_header encoder;
+    if (cloning) {
+        encoder = read_header(opts.codec_encoder_gguf_path, "encoder");
+        check_bank(encoder.hp, "encoder");
+        check_halves(encoder.hp, decoder.hp);
+    }
+
     std::string error;
     if (!load_lm(opts.lm_gguf_path, pimpl_->lm, &error)) throw std::runtime_error(error);
+    const lm_hparams & lm = pimpl_->lm.hp;
+    check_against_lm(lm, decoder.hp, "the codec decoder");
+    if (cloning) check_against_lm(lm, encoder.hp, "the codec encoder");
+
     if (!load_codec(opts.codec_decoder_gguf_path, pimpl_->decoder, &error)) {
         throw std::runtime_error(error);
     }
-    require(pimpl_->decoder.has_decoder,
-            "the GGUF at codec_decoder_gguf_path has no decoder");
-    if (!opts.codec_encoder_gguf_path.empty()) {
+    if (cloning) {
         if (!load_codec(opts.codec_encoder_gguf_path, pimpl_->encoder, &error)) {
             throw std::runtime_error(error);
         }
-        require(pimpl_->encoder.has_encoder,
-                "the GGUF at codec_encoder_gguf_path has no encoder");
         pimpl_->has_encoder = true;
     }
-    require(pimpl_->lm.hp.num_codebooks == pimpl_->decoder.hp.num_codebooks,
-            "the language model emits " + std::to_string(pimpl_->lm.hp.num_codebooks) +
-                " codebooks but the codec expects " +
-                std::to_string(pimpl_->decoder.hp.num_codebooks));
 
     pimpl_->tokenizer.reset(new Tokenizer(pimpl_->lm.tokenizer));
     pimpl_->sampling = resolve_sampling(opts);

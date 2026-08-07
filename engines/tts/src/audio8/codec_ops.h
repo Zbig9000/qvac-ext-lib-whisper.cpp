@@ -69,6 +69,10 @@ int span_through_convnext(int span, const convnext_weights & block);
 int span_through_units(int span, const std::vector<residual_unit> & units,
                        const std::vector<int> & dilations);
 
+// Asks the hook whether to stop, and writes the cancellation error when it
+// says so. Both directions call it between blocks.
+bool cancelled(const cancel_hook & cancel, std::string * error);
+
 }  // namespace detail
 }  // namespace audio8
 }  // namespace tts_cpp

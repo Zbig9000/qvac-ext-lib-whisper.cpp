@@ -44,6 +44,16 @@ CODEC_RENAMES = (
 
 FUSED_ATTENTION_SUFFIX = "attention/wqkv/weight"
 
+CODEC_PARTS = ("encoder", "decoder")
+ENCODER_PREFIXES = ("enc/", "q/down/", "q/pre/")
+DECODER_PREFIXES = ("dec/", "q/up/", "q/post/")
+# Both halves carry the codebooks, so each file stands alone.
+SHARED_SUFFIXES = ("/codebook/weight",)
+ANALYSIS_PROJECTION = "/in_proj/"
+# The encoder subtracts each quantizer's reconstruction from the residual it
+# passes on, so it needs the projection back out of the codebook as well.
+RECONSTRUCTION_PROJECTION = "/out_proj/"
+
 # The engine runs the codec channels-inner, so a convolution is a stack of
 # per-tap [in, out] matrices applied to shifted views of the signal rather than
 # ggml's [tap, in, out] im2col kernel. Storing the taps outermost is what makes
@@ -213,6 +223,32 @@ def to_engine_layout(name, array):
     if is_conv_kernel(name, array):
         return tap_major_kernel(name, array)
     return array
+
+
+def belongs_to_encoder(name):
+    if name.startswith(ENCODER_PREFIXES):
+        return True
+    return ANALYSIS_PROJECTION in name or RECONSTRUCTION_PROJECTION in name
+
+
+def belongs_to_decoder(name):
+    if name.startswith(DECODER_PREFIXES):
+        return True
+    return RECONSTRUCTION_PROJECTION in name
+
+
+def is_shared(name):
+    return name.endswith(SHARED_SUFFIXES)
+
+
+def select_part(named, part):
+    """Which of the checkpoint's tensors a half carries. The converter splits
+    with this and the verifier rebuilds each file's expectation with it, so
+    neither can drift from the other's idea of where a tensor belongs."""
+    keep = belongs_to_encoder if part == "encoder" else belongs_to_decoder
+    return {
+        name: array for name, array in named.items() if keep(name) or is_shared(name)
+    }
 
 
 def split_qkv(fused, n_head, n_kv, head_dim=HEAD_DIM):

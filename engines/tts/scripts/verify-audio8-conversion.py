@@ -49,11 +49,11 @@ from audio8_reference import (  # noqa: E402
     load_codec_module,
     load_config,
     rename_codec_key,
+    select_part,
     split_qkv,
     to_engine_layout,
 )
 
-CODEC_PARTS = ("encoder", "decoder")
 LM_ROPE_TENSORS = ("lm/rope_cos", "lm/rope_sin", "fast/rope_cos", "fast/rope_sin")
 ROTATION_POSITIONS = 64
 ABSOLUTE_FLOOR = 1e-8
@@ -381,17 +381,29 @@ def reference_codec_rope(model_dir, length, head_dim, theta):
     return rope(length, head_dim, theta).float().numpy()
 
 
-def rope_transformer_names(tensors):
-    return sorted({
-        name[len("rope/"): -len("_cos")]
-        for name in tensors if name.startswith("rope/") and name.endswith("_cos")
-    })
+def declared_transformers(fields):
+    """The transformers this half says it carries. Taken from the metadata the
+    converter writes per part rather than from the tensors, so a missing RoPE
+    table shows up as missing instead of going unlooked-for."""
+    prefix, suffix = f"{CODEC_KV}.", ".head_dim"
+    return sorted(
+        key[len(prefix):-len(suffix)]
+        for key in fields if key.startswith(prefix) and key.endswith(suffix)
+    )
 
 
-def codec_rope_expectations(model_dir, fields, tensors):
+def rope_plane_names(fields):
+    return {
+        f"rope/{transformer}_{plane}"
+        for transformer in declared_transformers(fields)
+        for plane in ("cos", "sin")
+    }
+
+
+def codec_rope_expectations(model_dir, fields):
     frames = int(fields[f"{CODEC_KV}.max_frames"])
     expectations = {}
-    for transformer in rope_transformer_names(tensors):
+    for transformer in declared_transformers(fields):
         expectations.update(rope_plane_expectations(
             f"rope/{transformer}",
             reference_codec_rope(
@@ -408,19 +420,24 @@ def drop_rope(tensors):
     return {n: v for n, v in tensors.items() if not n.startswith("rope/")}
 
 
-def verify_codec(model_dir, path, part, expected, fields, tensors):
+def verify_codec(model_dir, path, part, checkpoint, fields, tensors):
+    label = f"codec/{part}"
     declared = fields.get(f"{CODEC_KV}.part")
     if declared != part:
         return [f"codec: {path} declares part {declared!r}, expected {part!r}"]
+    emitted = set(tensors)
+    expected = select_part(checkpoint, part)
+    # RoPE tables are the one thing the checkpoint does not hold, so their
+    # names are required even in a build whose values cannot be compared.
+    required = set(expected) | rope_plane_names(fields)
     if bakes_reference_rope(fields, CODEC_KV):
-        expected = dict(expected)
-        expected.update(codec_rope_expectations(model_dir, fields, tensors))
+        expected.update(codec_rope_expectations(model_dir, fields))
     else:
         print(f"  note: {path} bakes non-reference RoPE tables; skipping their check")
         tensors = drop_rope(tensors)
-    worst, counts, failures = compare(tensors, expected, f"codec/{part}")
-    report(f"codec/{part} ({path})", worst, counts)
-    return failures
+    worst, counts, failures = compare(tensors, expected, label)
+    report(f"{label} ({path})", worst, counts)
+    return failures + missing_from_gguf(emitted, required, label)
 
 
 def parse_args():
@@ -429,7 +446,13 @@ def parse_args():
     parser.add_argument("--lm-gguf")
     parser.add_argument("--codec-encoder-gguf")
     parser.add_argument("--codec-decoder-gguf")
-    return parser.parse_args()
+    args = parser.parse_args()
+    # Without one there is nothing to check, and a run that checks nothing
+    # would otherwise end in the success line.
+    if not (args.lm_gguf or args.codec_encoder_gguf or args.codec_decoder_gguf):
+        parser.error("name at least one GGUF: --lm-gguf, --codec-encoder-gguf "
+                     "or --codec-decoder-gguf")
+    return args
 
 
 def codec_paths(args):
@@ -441,23 +464,20 @@ def codec_paths(args):
 
 
 def verify_codec_halves(model_dir, args):
-    """Only the two halves together are expected to cover the checkpoint, so the
-    completeness check runs on their union and only when both were given."""
+    """Each half is checked against what the split says it should carry, not
+    against the pair's union: a tensor in the wrong file satisfies the union
+    while the runtime loader still rejects the half it is missing from."""
     paths = codec_paths(args)
     if not paths:
         return []
-    expected = codec_expectations(model_dir)
+    checkpoint = codec_expectations(model_dir)
     print("\nnote: the codec expectation is built through the converter's own "
           "layout helpers,\n      so tensor values are checked but their axis "
           "order is not")
     failures = []
-    emitted = set()
     for path, part in paths:
         fields, tensors = read_gguf(path)
-        emitted.update(tensors)
-        failures += verify_codec(model_dir, path, part, expected, fields, tensors)
-    if len(paths) == len(CODEC_PARTS):
-        failures += missing_from_gguf(emitted, expected, "codec")
+        failures += verify_codec(model_dir, path, part, checkpoint, fields, tensors)
     return failures
 
 

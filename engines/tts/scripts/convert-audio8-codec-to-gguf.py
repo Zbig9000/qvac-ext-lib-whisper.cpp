@@ -38,6 +38,7 @@ from audio8_reference import (  # noqa: E402
     BLOCK,
     CODEC_ARCH as ARCH,
     CODEC_KV as KV,
+    CODEC_PARTS,
     DENSE,
     DEPTHWISE_MARKER,
     EXACT,
@@ -50,10 +51,12 @@ from audio8_reference import (  # noqa: E402
     expand_fused,
     flush,
     format_tally,
+    is_shared,
     load_config,
     raw_codec_state,
     rename_codec_key,
     rope_planes,
+    select_part,
     to_engine_layout,
     write_tensors,
 )
@@ -75,14 +78,6 @@ PARAMETRIZED_WEIGHT_NORM = (
     "parametrizations.weight.original0",
     "parametrizations.weight.original1",
 )
-
-ENCODER_PREFIXES = ("enc/", "q/down/", "q/pre/")
-DECODER_PREFIXES = ("dec/", "q/up/", "q/post/")
-SHARED_SUFFIXES = ("/codebook/weight",)
-ANALYSIS_PROJECTION = "/in_proj/"
-# The encoder subtracts each quantiser's reconstruction from the residual it
-# passes on, so it needs the projection back out of the codebook as well.
-RECONSTRUCTION_PROJECTION = "/out_proj/"
 
 
 @dataclass(frozen=True)
@@ -176,29 +171,6 @@ def renamed_tensors(state):
     for key, array in state.items():
         named.update(expand_attention(rename_codec_key(key), array))
     return {name: to_engine_layout(name, array) for name, array in named.items()}
-
-
-def belongs_to_encoder(name):
-    if name.startswith(ENCODER_PREFIXES):
-        return True
-    return ANALYSIS_PROJECTION in name or RECONSTRUCTION_PROJECTION in name
-
-
-def belongs_to_decoder(name):
-    if name.startswith(DECODER_PREFIXES):
-        return True
-    return RECONSTRUCTION_PROJECTION in name
-
-
-def is_shared(name):
-    return name.endswith(SHARED_SUFFIXES)
-
-
-def select_part(named, part):
-    keep = belongs_to_encoder if part == "encoder" else belongs_to_decoder
-    return {
-        name: array for name, array in named.items() if keep(name) or is_shared(name)
-    }
 
 
 def check_no_projection_weights(named):
@@ -303,7 +275,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--codec-file", default="codec.pth")
-    parser.add_argument("--part", choices=["encoder", "decoder"], required=True)
+    parser.add_argument("--part", choices=CODEC_PARTS, required=True)
     parser.add_argument("--outfile", required=True)
     parser.add_argument("--dtype", choices=STORAGE_TYPES, default="f32")
     parser.add_argument("--max-frames", type=int, default=4096)

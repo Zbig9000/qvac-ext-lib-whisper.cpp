@@ -260,6 +260,18 @@ struct codec_model {
 bool load_lm(const std::string & path, lm_model & model, std::string * error);
 void free_lm(lm_model & model);
 
+// What a codec GGUF says about itself: which half it holds and the shapes it
+// was converted with.
+struct codec_header {
+    codec_hparams hp;
+    std::string part;  // "encoder" or "decoder"
+};
+
+// Reads that header and nothing else, so a set of GGUFs can be checked for
+// belonging together before any of the weights are pulled off disk.
+bool peek_codec_header(const std::string & path, codec_header & header,
+                       std::string * error);
+
 bool load_codec(const std::string & path, codec_model & model, std::string * error);
 void free_codec(codec_model & model);
 
@@ -304,10 +316,18 @@ struct decode_taps {
     std::vector<float> latent;
 };
 
+// Asked between blocks of the sample-rate stack, the one place a codec pass
+// can stop: once ggml has a graph it runs to completion. Returning true ends
+// the pass with CANCELLED as the error. An empty hook never cancels.
+using cancel_hook = std::function<bool()>;
+
+constexpr const char * CANCELLED = "audio8: synthesis cancelled";
+
 // codes: [num_codebooks, n_frames] row-major. Writes n_frames * frame_size
 // samples at the codec sample rate.
 bool decode_codes(codec_model & model, const int32_t * codes, int n_frames,
-                  int n_threads, std::vector<float> & pcm_out, std::string * error,
+                  int n_threads, const cancel_hook & cancel,
+                  std::vector<float> & pcm_out, std::string * error,
                   decode_taps * taps = nullptr);
 
 // The convolutional encoder's output, [latent_dim, 4 * frames], and what the
@@ -319,7 +339,8 @@ struct encode_taps {
 
 // pcm: mono at the codec sample rate. Writes [num_codebooks, n_frames].
 bool encode_audio(codec_model & model, const float * pcm, int n_samples,
-                  int n_threads, std::vector<int32_t> & codes_out, int & n_frames,
+                  int n_threads, const cancel_hook & cancel,
+                  std::vector<int32_t> & codes_out, int & n_frames,
                   std::string * error, encode_taps * taps = nullptr);
 
 }  // namespace detail

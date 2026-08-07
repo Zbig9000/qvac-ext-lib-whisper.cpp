@@ -520,6 +520,11 @@ from what the tensor's storage can actually represent — exact for f32, one
 reconstruction step for the block formats.  It recomputes the RoPE tables
 independently rather than trusting the converter's copy.
 
+Each GGUF is also checked for completeness on its own, against the half of the
+checkpoint the converter's own split says it carries, so a tensor written to
+the wrong half fails here rather than at load time.  It takes any subset of the
+three files, but at least one.
+
 ```bash
 python3 scripts/verify-audio8-conversion.py \
     --model-dir models/Audio8-TTS-Preview-0.6b \
@@ -624,7 +629,14 @@ of a file on disk.
 
 The engine holds the models resident across calls and caches the codes for the
 most recent voice prompt, so re-using a reference skips the codec encoder.
-`cancel()` stops an in-flight `synthesize()` at the next decoder step.
+`cancel()` stops an in-flight `synthesize()` at the next language model step or
+codec block, whichever comes first; the call throws rather than returning a
+partial waveform.
+
+The three GGUFs have to come from one checkpoint, and the engine checks that
+they do — codebook counts and widths, the codec's two halves against each other
+and both against the language model — from their headers, before it reads a
+byte of weights.
 
 ### Engine notes
 
@@ -670,10 +682,10 @@ ctest -R audio8 --output-on-failure
 |---|---|
 | `test-audio8-tokenizer` | BPE ids and the ChatML prompt, both cloning and not |
 | `test-audio8-lm` | prompt embeddings, per-step hidden states, semantic and fast-AR logits, emitted codes |
-| `test-audio8-codec` | encode and decode at every stage boundary, plus block-size independence |
+| `test-audio8-codec` | encode and decode at every stage boundary, block-size independence, and that a cancel stops the block loop |
 | `test-audio8-sampler` | filtered score vectors, which is the part of the draw that is reproducible |
 | `test-audio8-ras` | the repetition-aware window: eligibility, eviction, and the retry's nucleus |
-| `test-audio8-engine` | both public paths end to end, against the decoded waveforms |
+| `test-audio8-engine` | both public paths end to end against the decoded waveforms, and the refusal of GGUFs that disagree |
 
 Every target above except `test-audio8-ras` needs the dumps, so `test-audio8-ras`
 is the only one that runs on a checkout with no models.

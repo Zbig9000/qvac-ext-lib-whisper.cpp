@@ -5,19 +5,24 @@
 // waveform out -- so it also covers what only shows up when the stages are
 // joined: the ChatML prompt the tokenizer builds, the frame budget, the
 // codebook-major transposition between the two halves, and, on the cloning
-// side, the engine encoding a WAV into the speaker history by itself.
+// side, the engine encoding a WAV into the speaker history by itself. The last
+// case covers the other side of that joining: a set of GGUFs that does not
+// agree on the shape of a frame has to be refused rather than indexed.
 //
 // Greedy decoding throughout, because that is the only trajectory the fixtures
 // can pin; the sampler has its own test.
 
 #include "tts-cpp/audio8/engine.h"
 
+#include "ggml.h"
+#include "gguf.h"
 #include "json.hpp"
 #include "npy.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -100,6 +105,81 @@ bool check_frames(const char * tag, int got, const nlohmann::json & meta) {
     return false;
 }
 
+// An encoder from another checkpoint emits fewer rows per frame than the
+// prompt reads, which used to be a read past the codes. The engine now
+// compares the three files before loading any of them, so the regression is
+// a copy of the encoder's metadata with the codebook count moved by one --
+// no weights, since it is rejected before they would be read.
+constexpr const char * MISMATCHED_ENCODER = "audio8-mismatched-encoder.gguf";
+// Both, so the copy stays a coherent nine-codebook encoder rather than one
+// that contradicts its own quantizer bank -- the point is the disagreement
+// with the other two files, not a malformed file.
+const char * const NARROWED_KEYS[] = {"audio8.codec.num_codebooks",
+                                      "audio8.codec.residual_codebooks"};
+
+bool narrow_by_one(gguf_context * gguf, const char * key) {
+    const int64_t id = gguf_find_key(gguf, key);
+    if (id < 0) {
+        std::fprintf(stderr, "mismatch: %s has no %s\n", MISMATCHED_ENCODER, key);
+        return false;
+    }
+    gguf_set_val_u32(gguf, key, gguf_get_val_u32(gguf, id) - 1);
+    return true;
+}
+
+bool narrow_all(gguf_context * gguf) {
+    for (const char * key : NARROWED_KEYS) {
+        if (!narrow_by_one(gguf, key)) return false;
+    }
+    return true;
+}
+
+bool write_mismatched_encoder(const std::string & source, const char * out) {
+    ggml_context * meta = nullptr;
+    gguf_init_params params = {/*no_alloc=*/true, &meta};
+    gguf_context * gguf = gguf_init_from_file(source.c_str(), params);
+    if (!gguf) {
+        std::fprintf(stderr, "mismatch: cannot read %s\n", source.c_str());
+        return false;
+    }
+    const bool written = narrow_all(gguf) && gguf_write_to_file(gguf, out,
+                                                                /*only_meta=*/true);
+    gguf_free(gguf);
+    ggml_free(meta);
+    if (!written) std::fprintf(stderr, "mismatch: cannot write %s\n", out);
+    return written;
+}
+
+bool rejected_for(const char * tag, const std::exception & failure, const char * reason) {
+    if (std::strstr(failure.what(), reason)) {
+        std::printf("%s: rejected with \"%s\"\n", tag, failure.what());
+        return true;
+    }
+    std::fprintf(stderr, "%s: FAIL rejected for the wrong reason: %s\n", tag,
+                 failure.what());
+    return false;
+}
+
+bool run_mismatch_case(const char * tag, const paths & where) {
+    if (!write_mismatched_encoder(where.encoder, MISMATCHED_ENCODER)) return false;
+    tts_cpp::audio8::EngineOptions opts;
+    opts.lm_gguf_path = where.lm;
+    opts.codec_decoder_gguf_path = where.decoder;
+    opts.codec_encoder_gguf_path = MISMATCHED_ENCODER;
+    opts.n_threads = where.threads;
+
+    bool ok = false;
+    try {
+        tts_cpp::audio8::Engine engine(opts);
+        std::fprintf(stderr, "%s: FAIL accepted an encoder the decoder disagrees with\n",
+                     tag);
+    } catch (const std::exception & failure) {
+        ok = rejected_for(tag, failure, "the codebook count disagrees");
+    }
+    std::remove(MISMATCHED_ENCODER);
+    return ok;
+}
+
 bool run_case(const char * tag, const paths & where, const fixture & data, bool cloning) {
     const nlohmann::json meta = data.meta();
     tts_cpp::audio8::Engine engine(options_for(where, meta));
@@ -136,6 +216,7 @@ int main(int argc, char ** argv) {
     try {
         bool ok = run_case("text", where, fixture{argv[4]}, /*cloning=*/false);
         ok &= run_case("clone", where, fixture{argv[5]}, /*cloning=*/true);
+        ok &= run_mismatch_case("mismatch", where);
         std::printf("\n%s\n", ok ? "PASS" : "FAIL");
         return ok ? 0 : 1;
     } catch (const std::exception & failure) {

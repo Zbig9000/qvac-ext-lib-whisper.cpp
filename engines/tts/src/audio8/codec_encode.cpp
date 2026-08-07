@@ -227,13 +227,15 @@ bool run_block(codec_model & model, const std::vector<float> & audio, const bloc
 }
 
 bool run_conv_blocks(codec_model & model, const std::vector<float> & audio, int positions,
-                     int n_threads, std::vector<float> & features, std::string * error) {
+                     int n_threads, const cancel_hook & cancel,
+                     std::vector<float> & features, std::string * error) {
     features.clear();
     features.reserve(static_cast<size_t>(positions) * feature_width(model));
     const int stride = total_encoder_stride(model.hp);
     const int context = analysis_context(model);
     const int block_columns = std::max(1, model.analysis_block_columns);
     for (int first = 0; first < positions; first += block_columns) {
+        if (cancelled(cancel, error)) return false;
         if (!run_block(model, audio, block_at(first, positions, context, block_columns),
                        stride, n_threads, features, error)) {
             return false;
@@ -326,8 +328,8 @@ bool check_encodable(const codec_model & model, int n_frames, std::string * erro
 }  // namespace
 
 bool encode_audio(codec_model & model, const float * pcm, int n_samples, int n_threads,
-                  std::vector<int32_t> & codes_out, int & n_frames, std::string * error,
-                  encode_taps * taps) {
+                  const cancel_hook & cancel, std::vector<int32_t> & codes_out,
+                  int & n_frames, std::string * error, encode_taps * taps) {
     codes_out.clear();
     n_frames = (n_samples + model.hp.frame_size - 1) / model.hp.frame_size;
     if (!check_encodable(model, n_frames, error)) return false;
@@ -338,7 +340,10 @@ bool encode_audio(codec_model & model, const float * pcm, int n_samples, int n_t
     const int positions = encoder_positions(model.hp, n_frames);
 
     std::vector<float> features;
-    if (!run_conv_blocks(model, audio, positions, n_threads, features, error)) return false;
+    if (!run_conv_blocks(model, audio, positions, n_threads, cancel, features, error)) {
+        return false;
+    }
+    if (cancelled(cancel, error)) return false;
     return run_analysis(model, features, positions, n_frames, n_threads, codes_out, taps,
                         error);
 }

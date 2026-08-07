@@ -400,6 +400,29 @@ void read_codec_hparams(metadata & meta, codec_hparams & hp) {
     meta.ints("residual_dilations", hp.residual_dilations);
 }
 
+bool read_codec_header(const gguf_file & file, codec_header & header,
+                       std::string * error) {
+    if (!architecture_is(file, "audio8-codec")) {
+        if (error) *error = "audio8: " + file.path() + " is not an audio8-codec GGUF";
+        return false;
+    }
+    metadata meta(file.ctx(), "audio8.codec.");
+    read_codec_hparams(meta, header.hp);
+    header.part = meta.text("part");
+    if (!meta.ok()) {
+        if (error) *error = meta.error();
+        return false;
+    }
+    if (header.part != "encoder" && header.part != "decoder") {
+        if (error) {
+            *error = "audio8: unexpected codec part '" + header.part + "' in " +
+                     file.path();
+        }
+        return false;
+    }
+    return true;
+}
+
 void read_quantizer_bank(tensor_map & map, codec_model & model, bool encoding) {
     read_quantizers(map, "q/sem", 1, encoding, model.semantic_quantizers);
     read_quantizers(map, "q/res", model.hp.residual_codebooks, encoding,
@@ -516,26 +539,29 @@ void free_lm(lm_model & model) {
     model.backend = nullptr;
 }
 
+bool peek_codec_header(const std::string & path, codec_header & header,
+                       std::string * error) {
+    gguf_file file(path);
+    if (!file.ok()) {
+        if (error) *error = "audio8: failed to open " + path;
+        return false;
+    }
+    return read_codec_header(file, header, error);
+}
+
 bool load_codec(const std::string & path, codec_model & model, std::string * error) {
     gguf_file file(path);
     if (!file.ok()) {
         if (error) *error = "audio8: failed to open " + path;
         return false;
     }
-    if (!architecture_is(file, "audio8-codec")) {
-        if (error) *error = "audio8: " + path + " is not an audio8-codec GGUF";
-        return false;
-    }
+    codec_header header;
+    if (!read_codec_header(file, header, error)) return false;
+    model.hp = header.hp;
+    model.has_decoder = header.part == "decoder";
+    model.has_encoder = header.part == "encoder";
 
     metadata meta(file.ctx(), "audio8.codec.");
-    read_codec_hparams(meta, model.hp);
-    const std::string part = meta.text("part");
-    model.has_decoder = part == "decoder";
-    model.has_encoder = part == "encoder";
-    if (!model.has_decoder && !model.has_encoder) {
-        if (error) *error = "audio8: unexpected codec part '" + part + "' in " + path;
-        return false;
-    }
     transformer_spec nested;
     if (model.has_decoder) {
         read_transformer_spec(meta, "post_tf", model.post.spec);

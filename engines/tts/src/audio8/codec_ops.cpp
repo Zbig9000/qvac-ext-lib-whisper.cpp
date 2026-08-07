@@ -264,6 +264,12 @@ std::vector<float> window_mask(const transformer_spec & spec, int length) {
     return mask;
 }
 
+bool cancelled(const cancel_hook & cancel, std::string * error) {
+    if (!cancel || !cancel()) return false;
+    if (error) *error = CANCELLED;
+    return true;
+}
+
 }  // namespace detail
 }  // namespace audio8
 }  // namespace tts_cpp

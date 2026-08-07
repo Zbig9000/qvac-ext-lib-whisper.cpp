@@ -768,7 +768,7 @@ if (TTS_CPP_BUILD_TESTS)
     # End-to-end through the public engine, both the text path and the cloning
     # path, so it links the whole library rather than the stage sources.
     add_executable(test-audio8-engine test/audio8/test_engine.cpp)
-    target_link_libraries(test-audio8-engine PRIVATE tts-cpp)
+    target_link_libraries(test-audio8-engine PRIVATE tts-cpp ggml)
     target_include_directories(test-audio8-engine PRIVATE include src)
     tts_cpp_apply_ccache(test-audio8-engine)
     tts_cpp_register_test(test-audio8-engine

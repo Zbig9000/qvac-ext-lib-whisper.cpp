@@ -90,7 +90,8 @@ struct SynthesisResult {
 // consecutive calls with the same reference skip the codec encoder.
 class TTS_CPP_API Engine {
 public:
-    // Throws std::runtime_error on any hard failure.
+    // Throws std::runtime_error on any hard failure, a set of GGUFs that does
+    // not come from one checkpoint among them.
     explicit Engine(const EngineOptions & opts);
     ~Engine();
 
@@ -107,7 +108,8 @@ public:
     SynthesisResult synthesize(const std::string & text, const VoicePrompt & voice);
 
     // Best-effort cancel of an in-flight synthesize() on another thread; takes
-    // effect at the next decoder step.
+    // effect at the next language model step or codec block, and leaves
+    // synthesize() throwing rather than returning a partial waveform.
     void cancel();
 
     const EngineOptions & options() const;

@@ -242,13 +242,15 @@ bool run_block(codec_model & model, const std::vector<float> & post, const block
 }
 
 bool run_synthesis_blocks(codec_model & model, const std::vector<float> & post,
-                          int n_frames, int n_threads, std::vector<float> & pcm_out,
-                          decode_taps * taps, std::string * error) {
+                          int n_frames, int n_threads, const cancel_hook & cancel,
+                          std::vector<float> & pcm_out, decode_taps * taps,
+                          std::string * error) {
     pcm_out.reserve(static_cast<size_t>(n_frames) * model.hp.frame_size);
     if (taps) taps->latent.clear();
     const int context = synthesis_context(model);
     const int block_frames = std::max(1, model.synthesis_block_frames);
     for (int first = 0; first < n_frames; first += block_frames) {
+        if (cancelled(cancel, error)) return false;
         if (!run_block(model, post, block_at(first, n_frames, context, block_frames),
                        n_threads, pcm_out, taps, error)) {
             return false;
@@ -276,7 +278,8 @@ bool check_decodable(const codec_model & model, int n_frames, std::string * erro
 }  // namespace
 
 bool decode_codes(codec_model & model, const int32_t * codes, int n_frames,
-                  int n_threads, std::vector<float> & pcm_out, std::string * error,
+                  int n_threads, const cancel_hook & cancel,
+                  std::vector<float> & pcm_out, std::string * error,
                   decode_taps * taps) {
     pcm_out.clear();
     if (!check_decodable(model, n_frames, error)) return false;
@@ -284,7 +287,8 @@ bool decode_codes(codec_model & model, const int32_t * codes, int n_frames,
 
     std::vector<float> post;
     if (!run_latents(model, codes, n_frames, n_threads, post, taps, error)) return false;
-    return run_synthesis_blocks(model, post, n_frames, n_threads, pcm_out, taps, error);
+    return run_synthesis_blocks(model, post, n_frames, n_threads, cancel, pcm_out, taps,
+                                error);
 }
 
 }  // namespace detail

@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -139,7 +140,7 @@ bool check_blocked_decode(codec_model & model, const std::vector<int32_t> & code
     std::vector<float> blocked;
     std::string error;
     const bool ran =
-        decode_codes(model, codes.data(), n_frames, n_threads, blocked, &error);
+        decode_codes(model, codes.data(), n_frames, n_threads, nullptr, blocked, &error);
     model.synthesis_block_frames = restore;
     if (!ran) {
         std::fprintf(stderr, "blocked decode: %s\n", error.c_str());
@@ -162,8 +163,8 @@ bool check_blocked_encode(codec_model & model, const npy_array & audio, int n_th
     int n_frames = 0;
     std::string error;
     const bool ran = encode_audio(model, as_f32(audio),
-                                  static_cast<int>(audio.n_elements()), n_threads, blocked,
-                                  n_frames, &error);
+                                  static_cast<int>(audio.n_elements()), n_threads, nullptr,
+                                  blocked, n_frames, &error);
     model.analysis_block_columns = restore;
     if (!ran) {
         std::fprintf(stderr, "blocked encode: %s\n", error.c_str());
@@ -174,6 +175,67 @@ bool check_blocked_encode(codec_model & model, const npy_array & audio, int n_th
     return mismatches == 0;
 }
 
+// Cancellation is only observable between blocks, so both directions run at
+// the narrow block size and stop after the first one. Checking how much came
+// back is what separates a real stop from a pass that ran to the end and
+// reported the cancel afterwards.
+constexpr int BLOCKS_BEFORE_CANCEL = 1;
+
+cancel_hook cancel_after(int blocks) {
+    auto seen = std::make_shared<int>(0);
+    return [seen, blocks] { return (*seen)++ >= blocks; };
+}
+
+bool report_cancel(const char * tag, bool ran, const std::string & error, size_t produced,
+                   size_t expected) {
+    if (ran) {
+        std::fprintf(stderr, "%s: FAIL ran to completion despite the cancel\n", tag);
+        return false;
+    }
+    if (error != CANCELLED) {
+        std::fprintf(stderr, "%s: FAIL stopped with '%s', not the cancellation\n", tag,
+                     error.c_str());
+        return false;
+    }
+    if (produced != expected) {
+        std::fprintf(stderr, "%s: FAIL kept %zu values, expected the %zu of one block\n",
+                     tag, produced, expected);
+        return false;
+    }
+    std::fprintf(stderr, "  [%s] stopped after %d block, %zu values\n", tag,
+                 BLOCKS_BEFORE_CANCEL, produced);
+    return true;
+}
+
+bool check_cancelled_decode(codec_model & model, const std::vector<int32_t> & codes,
+                            int n_frames, int n_threads) {
+    const int restore = model.synthesis_block_frames;
+    model.synthesis_block_frames = NARROW_SYNTHESIS_FRAMES;
+    std::vector<float> pcm;
+    std::string error;
+    const bool ran = decode_codes(model, codes.data(), n_frames, n_threads,
+                                  cancel_after(BLOCKS_BEFORE_CANCEL), pcm, &error);
+    model.synthesis_block_frames = restore;
+    const size_t one_block = static_cast<size_t>(BLOCKS_BEFORE_CANCEL) *
+                             NARROW_SYNTHESIS_FRAMES * model.hp.frame_size;
+    return report_cancel("cancelled decode", ran, error, pcm.size(), one_block);
+}
+
+// The encoder's blocks feed the analysis graph rather than the caller, so a
+// cancel leaves nothing behind at all.
+bool check_cancelled_encode(codec_model & model, const npy_array & audio, int n_threads) {
+    const int restore = model.analysis_block_columns;
+    model.analysis_block_columns = NARROW_ANALYSIS_COLUMNS;
+    std::vector<int32_t> codes;
+    int n_frames = 0;
+    std::string error;
+    const bool ran =
+        encode_audio(model, as_f32(audio), static_cast<int>(audio.n_elements()), n_threads,
+                     cancel_after(BLOCKS_BEFORE_CANCEL), codes, n_frames, &error);
+    model.analysis_block_columns = restore;
+    return report_cancel("cancelled encode", ran, error, codes.size(), 0);
+}
+
 bool run_decode(codec_model & model, const fixture & data, int n_threads) {
     const npy_array codes = data.load("codes");
     const std::vector<int32_t> values = to_i32(codes);
@@ -182,7 +244,8 @@ bool run_decode(codec_model & model, const fixture & data, int n_threads) {
     std::vector<float> pcm;
     decode_taps taps;
     std::string error;
-    if (!decode_codes(model, values.data(), n_frames, n_threads, pcm, &error, &taps)) {
+    if (!decode_codes(model, values.data(), n_frames, n_threads, nullptr, pcm, &error,
+                      &taps)) {
         std::fprintf(stderr, "decode: %s\n", error.c_str());
         return false;
     }
@@ -192,6 +255,7 @@ bool run_decode(codec_model & model, const fixture & data, int n_threads) {
     bool ok = check_stages(taps, data);
     ok &= check_flat("waveform", pcm, data.load("wav"), WAVEFORM_TOLERANCE);
     ok &= check_blocked_decode(model, values, n_frames, n_threads, pcm);
+    ok &= check_cancelled_decode(model, values, n_frames, n_threads);
     return ok;
 }
 
@@ -224,7 +288,7 @@ bool run_encode(codec_model & model, const fixture & data, int n_threads) {
     encode_taps taps;
     std::string error;
     if (!encode_audio(model, as_f32(audio), static_cast<int>(audio.n_elements()),
-                      n_threads, codes, n_frames, &error, &taps)) {
+                      n_threads, nullptr, codes, n_frames, &error, &taps)) {
         std::fprintf(stderr, "encode: %s\n", error.c_str());
         return false;
     }
@@ -242,6 +306,7 @@ bool run_encode(codec_model & model, const fixture & data, int n_threads) {
                            LATENT_TOLERANCE);
     ok &= check_codes(codes, want);
     ok &= check_blocked_encode(model, audio, n_threads, codes);
+    ok &= check_cancelled_encode(model, audio, n_threads);
     return ok;
 }
 
