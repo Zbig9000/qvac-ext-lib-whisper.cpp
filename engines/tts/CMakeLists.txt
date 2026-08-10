@@ -708,6 +708,7 @@ if (TTS_CPP_BUILD_TESTS)
         src/audio8/gguf.cpp
         src/audio8/graph.cpp
         src/backend_selection.cpp
+        src/sched_dispatch.cpp
         src/log.cpp)
 
     add_executable(test-audio8-tokenizer test/audio8/test_tokenizer.cpp
@@ -778,6 +779,32 @@ if (TTS_CPP_BUILD_TESTS)
         REQUIRES "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}"
                  "${_tcb_audio8_ref}/wav.npy" "${_tcb_audio8_ref_clone}/wav.npy"
                  "${_tcb_audio8_ref_wav}")
+
+    if (GGML_VULKAN)
+        tts_cpp_register_test(test-audio8-lm-vulkan
+            EXE      test-audio8-lm
+            LABEL    "gpu"
+            ARGS     "${_tcb_audio8_lm}" "${_tcb_audio8_ref}"
+            REQUIRES "${_tcb_audio8_lm}" "${_tcb_audio8_ref}/sem_logits.npy")
+        tts_cpp_register_test(test-audio8-codec-vulkan
+            EXE      test-audio8-codec
+            LABEL    "gpu"
+            ARGS     "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}" "${_tcb_audio8_ref}"
+            REQUIRES "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}"
+                     "${_tcb_audio8_ref}/codec_wav.npy"
+                     "${_tcb_audio8_ref}/codec_enc_codes.npy")
+        tts_cpp_register_test(test-audio8-engine-vulkan
+            EXE      test-audio8-engine
+            LABEL    "gpu"
+            ARGS     "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}"
+                     "${_tcb_audio8_ref}" "${_tcb_audio8_ref_clone}" "${_tcb_audio8_ref_wav}"
+            REQUIRES "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}"
+                     "${_tcb_audio8_ref}/wav.npy" "${_tcb_audio8_ref_clone}/wav.npy"
+                     "${_tcb_audio8_ref_wav}")
+        set_property(TEST test-audio8-lm-vulkan test-audio8-codec-vulkan
+                          test-audio8-engine-vulkan APPEND
+                     PROPERTY ENVIRONMENT "AUDIO8_TEST_GPU=1")
+    endif()
 
     # ---- Parler-TTS tests (fixtures from scripts/parler/dump-reference.py) ----
     set(_tcb_parler_core_srcs

@@ -1,6 +1,7 @@
 #include "audio8/internal.h"
 
 #include "backend_selection.h"
+#include "backend_util.h"
 #include "gguf.h"
 #include "gguf_stream.h"
 
@@ -147,6 +148,16 @@ bool load_weights(const gguf_file & file, ggml_backend_t backend, ggml_context *
         return false;
     }
     return true;
+}
+
+ggml_backend_t init_backend(int n_gpu_layers) {
+    ggml_backend_t backend =
+        ::tts_cpp::detail::init_gpu_backend(n_gpu_layers, true, "audio8");
+    if (backend && !::tts_cpp::detail::backend_is_vulkan(backend)) {
+        ggml_backend_free(backend);
+        backend = nullptr;
+    }
+    return backend ? backend : ::tts_cpp::detail::init_cpu_backend();
 }
 
 // Looks tensors up by name and remembers the first one that was missing, so a
@@ -457,7 +468,8 @@ void read_encoder(tensor_map & map, codec_model & model, const transformer_spec 
 
 }  // namespace
 
-bool load_lm(const std::string & path, lm_model & model, std::string * error) {
+bool load_lm(const std::string & path, int n_gpu_layers, lm_model & model,
+             std::string * error) {
     gguf_file file(path);
     if (!file.ok()) {
         if (error) *error = "audio8: failed to open " + path;
@@ -477,10 +489,9 @@ bool load_lm(const std::string & path, lm_model & model, std::string * error) {
         return false;
     }
 
-    ::tts_cpp::detail::ensure_backends_loaded();
-    model.backend = ::tts_cpp::detail::init_cpu_backend();
+    model.backend = init_backend(n_gpu_layers);
     if (!model.backend) {
-        if (error) *error = "audio8: failed to init the CPU backend";
+        if (error) *error = "audio8: failed to init a compute backend";
         return false;
     }
     if (!load_weights(file, model.backend, &model.ctx_w, &model.buffer_w, error)) {
@@ -525,6 +536,7 @@ bool load_lm(const std::string & path, lm_model & model, std::string * error) {
 }
 
 void free_lm(lm_model & model) {
+    ::tts_cpp::detail::sched_fallback_free(model.sched);
     if (model.slow_allocr) ggml_gallocr_free(model.slow_allocr);
     if (model.fast_allocr) ggml_gallocr_free(model.fast_allocr);
     free_kv(model.slow_kv);
@@ -549,7 +561,8 @@ bool peek_codec_header(const std::string & path, codec_header & header,
     return read_codec_header(file, header, error);
 }
 
-bool load_codec(const std::string & path, codec_model & model, std::string * error) {
+bool load_codec(const std::string & path, int n_gpu_layers, codec_model & model,
+                std::string * error) {
     gguf_file file(path);
     if (!file.ok()) {
         if (error) *error = "audio8: failed to open " + path;
@@ -574,10 +587,9 @@ bool load_codec(const std::string & path, codec_model & model, std::string * err
         return false;
     }
 
-    ::tts_cpp::detail::ensure_backends_loaded();
-    model.backend = ::tts_cpp::detail::init_cpu_backend();
+    model.backend = init_backend(n_gpu_layers);
     if (!model.backend) {
-        if (error) *error = "audio8: failed to init the CPU backend";
+        if (error) *error = "audio8: failed to init a compute backend";
         return false;
     }
     if (!load_weights(file, model.backend, &model.ctx_w, &model.buffer_w, error)) {
@@ -607,6 +619,7 @@ bool load_codec(const std::string & path, codec_model & model, std::string * err
 }
 
 void free_codec(codec_model & model) {
+    ::tts_cpp::detail::sched_fallback_free(model.sched);
     if (model.allocr) ggml_gallocr_free(model.allocr);
     if (model.block_allocr) ggml_gallocr_free(model.block_allocr);
     if (model.buffer_w) ggml_backend_buffer_free(model.buffer_w);
