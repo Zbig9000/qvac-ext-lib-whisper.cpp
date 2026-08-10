@@ -19,7 +19,6 @@
 #include "json.hpp"
 #include "npy.h"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -32,8 +31,7 @@ namespace {
 
 constexpr double WAVEFORM_TOLERANCE = 5e-5;
 constexpr double GPU_WAVEFORM_TOLERANCE = 1e-4;
-constexpr double MAX_PCM_AMPLITUDE = 1.0;
-constexpr double MIN_PCM_AMPLITUDE = 1e-4;
+constexpr double GPU_CLONE_MIN_CORRELATION = 0.85;
 constexpr int GPU_LAYERS = 99;
 constexpr const char * VULKAN_BACKEND = "Vulkan";
 
@@ -85,22 +83,36 @@ tts_cpp::audio8::VoicePrompt voice_from(const std::string & wav_path,
         wav_path, meta.at("reference_text").get<std::string>());
 }
 
-bool check_waveform_sanity(const char * tag, const std::vector<float> & got) {
-    const bool finite =
-        std::all_of(got.begin(), got.end(), [](float sample) { return std::isfinite(sample); });
-    if (!finite) {
-        std::fprintf(stderr, "%s: FAIL non-finite samples\n", tag);
-        return false;
+double mean(const float * values, size_t count) {
+    double sum = 0.0;
+    for (size_t index = 0; index < count; ++index) sum += values[index];
+    return count == 0 ? 0.0 : sum / count;
+}
+
+double correlation(const float * left, const float * right, size_t count) {
+    const double left_mean = mean(left, count);
+    const double right_mean = mean(right, count);
+    double covariance = 0.0;
+    double left_variance = 0.0;
+    double right_variance = 0.0;
+    for (size_t index = 0; index < count; ++index) {
+        const double left_delta = left[index] - left_mean;
+        const double right_delta = right[index] - right_mean;
+        covariance += left_delta * right_delta;
+        left_variance += left_delta * left_delta;
+        right_variance += right_delta * right_delta;
     }
-    const auto peak_sample = std::max_element(
-        got.begin(), got.end(),
-        [](float left, float right) { return std::abs(left) < std::abs(right); });
-    const double peak = peak_sample == got.end() ? 0.0 : std::abs(*peak_sample);
-    if (peak > MAX_PCM_AMPLITUDE || peak < MIN_PCM_AMPLITUDE) {
-        std::fprintf(stderr, "%s: FAIL invalid peak amplitude %.3e\n", tag, peak);
-        return false;
-    }
-    return true;
+    return covariance / std::sqrt(left_variance * right_variance);
+}
+
+bool check_correlated_waveform(const char * tag, const std::vector<float> & got,
+                               const npy_array & want) {
+    const double value = correlation(got.data(), as_f32(want), got.size());
+    std::fprintf(stderr, "%s: waveform correlation %.6f\n", tag, value);
+    if (std::isfinite(value) && value >= GPU_CLONE_MIN_CORRELATION) return true;
+    std::fprintf(stderr, "%s: FAIL waveform correlation below %.2f\n", tag,
+                 GPU_CLONE_MIN_CORRELATION);
+    return false;
 }
 
 bool check_waveform(const char * tag, const std::vector<float> & got,
@@ -110,7 +122,7 @@ bool check_waveform(const char * tag, const std::vector<float> & got,
                      want.n_elements());
         return false;
     }
-    if (cloning && is_gpu_test()) return check_waveform_sanity(tag, got);
+    if (cloning && is_gpu_test()) return check_correlated_waveform(tag, got, want);
     const compare_stats stats = compare_f32(got.data(), as_f32(want), got.size());
     print_compare(tag, stats);
     if (!std::isfinite(stats.max_abs_err)) {

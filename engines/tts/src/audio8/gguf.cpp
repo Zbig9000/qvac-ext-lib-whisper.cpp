@@ -1,7 +1,6 @@
 #include "audio8/internal.h"
 
 #include "backend_selection.h"
-#include "backend_util.h"
 #include "gguf.h"
 #include "gguf_stream.h"
 
@@ -151,12 +150,9 @@ bool load_weights(const gguf_file & file, ggml_backend_t backend, ggml_context *
 }
 
 ggml_backend_t init_backend(int n_gpu_layers) {
-    ggml_backend_t backend =
-        ::tts_cpp::detail::init_gpu_backend(n_gpu_layers, true, "audio8");
-    if (backend && !::tts_cpp::detail::backend_is_vulkan(backend)) {
-        ggml_backend_free(backend);
-        backend = nullptr;
-    }
+    ggml_backend_t backend = ::tts_cpp::detail::init_gpu_backend(
+        n_gpu_layers, true, "audio8", 0, false, nullptr,
+        ::tts_cpp::detail::GpuBackendRequirement::Vulkan);
     return backend ? backend : ::tts_cpp::detail::init_cpu_backend();
 }
 

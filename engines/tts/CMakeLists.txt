@@ -703,6 +703,12 @@ if (TTS_CPP_BUILD_TESTS)
                  "--ref" "${_tcb_cosy_ref}/tokenizer_ref.txt"
         REQUIRES "${_tcb_cosy_vocab}" "${_tcb_cosy_merges}" "${_tcb_cosy_ref}/tokenizer_ref.txt")
 
+    add_executable(test-backend-selection test/test_backend_selection.cpp)
+    target_link_libraries(test-backend-selection PRIVATE tts-cpp)
+    target_include_directories(test-backend-selection PRIVATE src)
+    tts_cpp_apply_ccache(test-backend-selection)
+    tts_cpp_register_test(test-backend-selection LABEL "unit")
+
     # ---- Audio8 tests (fixtures from scripts/dump-audio8-*-reference.py) ----
     set(_tcb_audio8_core_srcs
         src/audio8/gguf.cpp
