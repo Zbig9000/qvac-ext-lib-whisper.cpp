@@ -1,6 +1,7 @@
 #include "audiogen-cpp/acestep/vae.h"
 
 #include "vae_ggml.h"              // internal: VaeModel + vae_model_*
+#include "vae_encode_windows.h"
 
 #include "acestep/backend_registry.h"
 
@@ -80,13 +81,10 @@ std::vector<float> Vae::decode(const std::vector<float> & latent, int T_latent,
 }
 
 std::vector<float> Vae::encode(const std::vector<float> & pcm_interleaved, int frames, int * T_latent_out) const {
-    if (T_latent_out) *T_latent_out = 0;
-    if (frames <= 0 || (int) pcm_interleaved.size() < frames * 2) return {};
-    std::vector<float> latent;
-    int T_lat = vae_model_encode(impl_->model, pcm_interleaved.data(), frames, latent);
-    if (T_lat < 0) return {};
-    if (T_latent_out) *T_latent_out = T_lat;
-    return latent;
+    const VaeWindowEncoder encode = [this](const float * pcm, int window_frames, std::vector<float> & latent) {
+        return vae_model_encode(impl_->model, pcm, window_frames, latent);
+    };
+    return encode_vae_pcm_bounded(pcm_interleaved, frames, encode, T_latent_out);
 }
 
 bool        Vae::has_encoder() const   { return vae_model_has_encoder(impl_->model); }
