@@ -8,6 +8,7 @@
 // baked RoPE tables and both heads.
 
 #include "audio8/internal.h"
+#include "gpu_arm.h"
 #include "npy.h"
 
 #include <cmath>
@@ -30,11 +31,11 @@ constexpr double GPU_HIDDEN_TOLERANCE = 3e-3;
 constexpr int GPU_LAYERS = 99;
 
 double logit_tolerance() {
-    return std::getenv("AUDIO8_TEST_GPU") ? GPU_LOGIT_TOLERANCE : LOGIT_TOLERANCE;
+    return audio8_test::is_gpu_test() ? GPU_LOGIT_TOLERANCE : LOGIT_TOLERANCE;
 }
 
 double hidden_tolerance() {
-    return std::getenv("AUDIO8_TEST_GPU") ? GPU_HIDDEN_TOLERANCE : HIDDEN_TOLERANCE;
+    return audio8_test::is_gpu_test() ? GPU_HIDDEN_TOLERANCE : HIDDEN_TOLERANCE;
 }
 
 struct fixture {
@@ -108,6 +109,31 @@ struct step_report {
     bool ok = true;
 };
 
+// fast_frame claims to be fast_step's greedy equivalent in one graph. Both are
+// already pinned to the reference codes elsewhere, but only comparing them
+// directly states the claim, and it costs one extra frame to do it. Each frame
+// rewrites the fast cache from position 0, so re-running the frame is safe.
+bool check_chained_frame(lm_model & model, const std::vector<float> & carried, int semantic,
+                         int n_threads, const std::vector<int32_t> & want) {
+    if (!model.picks_codes) {
+        std::printf("  [chained frame] skipped: %s does not pick codes\n",
+                    ggml_backend_name(model.backend));
+        return true;
+    }
+    std::vector<int32_t> codes;
+    std::string error;
+    if (!fast_frame(model, carried, semantic, n_threads, codes, &error)) {
+        std::fprintf(stderr, "chained frame: FAIL %s\n", error.c_str());
+        return false;
+    }
+    if (codes == want) {
+        std::printf("  [chained frame] %zu codes match the per-position path\n", codes.size());
+        return true;
+    }
+    std::fprintf(stderr, "chained frame: FAIL codes differ from the per-position path\n");
+    return false;
+}
+
 bool run_steps(lm_model & model, const fixture & data, int n_threads, step_report & report) {
     const lm_hparams & hp = model.hp;
     const npy_array prompt = data.load("prompt");
@@ -171,6 +197,9 @@ bool run_steps(lm_model & model, const fixture & data, int n_threads, step_repor
             report.ok = false;
             return true;
         }
+        if (step == 0) {
+            report.ok &= check_chained_frame(model, carried, semantic, n_threads, codes);
+        }
         report.frames = step + 1;
         if (semantic == hp.eos || step + 1 == steps) break;
 
@@ -197,9 +226,14 @@ int main(int argc, char ** argv) {
 
     lm_model model;
     std::string error;
-    const int n_gpu_layers = std::getenv("AUDIO8_TEST_GPU") ? GPU_LAYERS : 0;
+    const int n_gpu_layers = audio8_test::is_gpu_test() ? GPU_LAYERS : 0;
     if (!load_lm(argv[1], n_gpu_layers, model, &error)) {
         std::fprintf(stderr, "load: %s\n", error.c_str());
+        return 1;
+    }
+    std::printf("backend: %s\n", ggml_backend_name(model.backend));
+    if (!audio8_test::check_requested_gpu("lm", model.backend)) {
+        free_lm(model);
         return 1;
     }
 

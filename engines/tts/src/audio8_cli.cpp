@@ -12,14 +12,17 @@
 
 #include "tts-cpp/audio8/engine.h"
 
+#include "audio8/cli.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace cli = tts_cpp::audio8::cli;
 
 namespace {
 
@@ -30,76 +33,7 @@ constexpr uint32_t PCM_FORMAT_CHUNK_BYTES = 16;
 constexpr uint16_t PCM_FORMAT_TAG = 1;
 constexpr uint32_t HEADER_BYTES_AFTER_SIZE = 36;
 
-struct options {
-    std::string lm;
-    std::string codec_decoder;
-    std::string codec_encoder;
-    std::string ref_audio;
-    std::string ref_text;
-    std::string text = "Hello from a fully on-device C plus plus pipeline.";
-    std::string out = "audio8_out.wav";
-    std::string backends_dir;
-    int seed = 42;
-    int threads = 0;
-    int n_gpu_layers = 0;
-    int max_frames = 0;
-    int top_k = 50;
-    int output_sample_rate = 0;
-    float temperature = 0.7f;
-    float top_p = 0.9f;
-    bool greedy = false;
-};
-
-void print_usage(const char * program) {
-    std::fprintf(stderr,
-                 "usage: %s --lm LM.gguf --codec-decoder DEC.gguf [--text ...] "
-                 "[--out out.wav]\n"
-                 "          [--codec-encoder ENC.gguf --ref-audio ref.wav --ref-text "
-                 "\"...\"]\n"
-                 "          [--seed N] [--greedy] [--temperature F] [--top-k N] "
-                 "[--top-p F]\n"
-                 "          [--max-frames N] [--threads N] [--output-sample-rate N]\n"
-                 "          [--n-gpu-layers N] [--backends-dir DIR]\n",
-                 program);
-}
-
-bool takes_value(const std::string & flag) {
-    return flag != "--greedy";
-}
-
-bool apply_flag(options & opts, const std::string & flag, const char * value) {
-    if (flag == "--lm") opts.lm = value;
-    else if (flag == "--codec-decoder") opts.codec_decoder = value;
-    else if (flag == "--codec-encoder") opts.codec_encoder = value;
-    else if (flag == "--ref-audio") opts.ref_audio = value;
-    else if (flag == "--ref-text") opts.ref_text = value;
-    else if (flag == "--text") opts.text = value;
-    else if (flag == "--out") opts.out = value;
-    else if (flag == "--backends-dir") opts.backends_dir = value;
-    else if (flag == "--seed") opts.seed = std::atoi(value);
-    else if (flag == "--threads" || flag == "-t") opts.threads = std::atoi(value);
-    else if (flag == "--n-gpu-layers") opts.n_gpu_layers = std::atoi(value);
-    else if (flag == "--max-frames") opts.max_frames = std::atoi(value);
-    else if (flag == "--top-k") opts.top_k = std::atoi(value);
-    else if (flag == "--output-sample-rate") opts.output_sample_rate = std::atoi(value);
-    else if (flag == "--temperature") opts.temperature = static_cast<float>(std::atof(value));
-    else if (flag == "--top-p") opts.top_p = static_cast<float>(std::atof(value));
-    else return false;
-    return true;
-}
-
-bool parse_args(int argc, char ** argv, options & opts) {
-    for (int index = 1; index < argc; ++index) {
-        const std::string flag = argv[index];
-        if (flag == "--greedy") {
-            opts.greedy = true;
-            continue;
-        }
-        if (!takes_value(flag) || index + 1 >= argc) return false;
-        if (!apply_flag(opts, flag, argv[++index])) return false;
-    }
-    return !opts.lm.empty() && !opts.codec_decoder.empty();
-}
+using cli::options;
 
 void write_u32(std::FILE * file, uint32_t value) {
     std::fwrite(&value, sizeof(value), 1, file);
@@ -172,6 +106,7 @@ tts_cpp::audio8::EngineOptions to_engine_options(const options & opts) {
     engine.top_p = opts.top_p;
     engine.max_frames = opts.max_frames;
     engine.output_sample_rate = opts.output_sample_rate;
+    engine.verbose = opts.verbose;
     engine.backends_dir = opts.backends_dir;
     return engine;
 }
@@ -187,8 +122,8 @@ tts_cpp::audio8::SynthesisResult speak(tts_cpp::audio8::Engine & engine,
 
 int main(int argc, char ** argv) {
     options opts;
-    if (!parse_args(argc, argv, opts)) {
-        print_usage(argv[0]);
+    if (!cli::parse_args(argc, argv, opts)) {
+        cli::print_usage(argv[0]);
         return 1;
     }
 
@@ -203,6 +138,11 @@ int main(int argc, char ** argv) {
         const tts_cpp::audio8::SynthesisResult result = speak(engine, opts, voice);
         if (!write_wav(opts.out, result.pcm, result.sample_rate)) {
             std::fprintf(stderr, "cannot write %s\n", opts.out.c_str());
+            return 1;
+        }
+        if (!opts.codes_out.empty() &&
+            !cli::write_codes(opts.codes_out, result.codes, result.frames)) {
+            std::fprintf(stderr, "cannot write %s\n", opts.codes_out.c_str());
             return 1;
         }
         std::printf("%s: %d frames, %.2f s at %d Hz on %s\n", opts.out.c_str(),

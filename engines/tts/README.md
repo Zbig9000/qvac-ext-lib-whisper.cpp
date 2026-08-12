@@ -51,7 +51,7 @@ engine, not every backend ggml can compile.
 | Supertonic 3 | 31 languages plus `na` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Parler-TTS mini/large/Indic | English or 21 Indic languages | natural-language description | 44.1 kHz | yes | yes | yes | yes | no |
 | Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice; instruct controls | 24 kHz | yes | yes | no | yes | no |
-| Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | no | yes | no | no |
+| Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | yes | yes | no | no |
 | LavaSR denoiser | language agnostic | input PCM | rate preserving | yes | yes | yes | yes | yes |
 | LavaSR enhancer | language agnostic | input PCM | 48 kHz | yes | yes | yes | yes | yes |
 
@@ -577,9 +577,15 @@ frame.  Cloning needs no speaker encoder: the codec *encoder* turns a reference
 wav into codes, and those codes plus the reference transcript are prepended to
 the prompt.
 
-**Status — CPU and desktop Vulkan, validated against the reference.**
-Text-to-speech and voice cloning both run in-process on Linux and Windows
-Vulkan.  Pass `--n-gpu-layers 99` to offload every stage; omit it for CPU.
+**Status — CPU, Metal, and desktop Vulkan, validated against the reference.**
+Text-to-speech and voice cloning both run in-process on macOS and iOS Metal and
+on Linux and Windows Vulkan.  Pass `--n-gpu-layers 99` to offload every stage;
+omit it for CPU.  On Metal that is **4.2x** CPU at q4_0 and **3.2x** at q8_0 on
+an iPhone 17, measured on device with both arms in one launch.  At F32 the GPU
+reproduces the CPU code trajectory exactly, frame for frame, which is the
+strongest available statement that the graphs compute the same function;
+quantised tiers fork their trajectories under either backend and are judged by
+WER instead.
 
 ### Convert
 
@@ -725,6 +731,12 @@ audio8-cli --lm models/audio8-lm-q8_0.gguf \
            --text "Hello from a fully on-device C++ pipeline." \
            --out out.wav --threads 8 --n-gpu-layers 99
 
+# on the GPU: same command, everything on the device
+audio8-cli --lm models/audio8-lm-q8_0.gguf \
+           --codec-decoder models/audio8-codec-decoder-q8_0.gguf \
+           --text "Hello from a fully on-device C++ pipeline." \
+           --out out.wav --n-gpu-layers 99
+
 # cloning: add the analysis half, a reference wav and what it says
 audio8-cli --lm models/audio8-lm-q8_0.gguf \
            --codec-decoder models/audio8-codec-decoder-q8_0.gguf \
@@ -739,6 +751,24 @@ audio8-cli --lm models/audio8-lm-q8_0.gguf \
 codec's native 44.1 kHz, and `--backends-dir` points a `GGML_BACKEND_DL` build
 at its backend libraries.  The reference wav is resampled and downmixed on the
 way in, so any format `dr_wav` reads will do.
+
+`--n-gpu-layers` is all-or-nothing by design: it selects the backend the whole
+model runs on rather than splitting layers across two, so any count above zero
+puts everything on the device and zero keeps it on CPU.  A GPU run copies the
+weights into device memory rather than mapping them, so plan for the GGUF size
+again on top of the file itself.  `--verbose` prints the per-stage times and the
+block width the codec settled on, and `--dump-codes` writes the discrete code
+trajectory as one comma-separated line per frame, which two runs can be diffed
+on to see whether a backend or a quantisation tier changed what was generated.
+
+Codec synthesis runs in blocks whose width is chosen from a memory budget rather
+than fixed: the widest block whose scratch fits a quarter of what the backend
+reports free, capped at 384 MiB.  A backend that reports no total at all is
+saying it cannot tell rather than that it has nothing, and gets the cap.  Blocks
+exist only to bound that scratch — each one re-runs the causal context of the one
+before it — so a wider block is strictly less work, and the width never changes
+the samples.  Set `codec_model::synthesis_block_frames` to pin a width or
+`synthesis_scratch_budget` to pin the budget.
 
 The same thing through the library, from `<tts-cpp/audio8/engine.h>`:
 
@@ -822,9 +852,18 @@ ctest -R audio8 --output-on-failure
 | `test-audio8-sampler` | filtered score vectors, which is the part of the draw that is reproducible |
 | `test-audio8-ras` | the repetition-aware window: which draws enter it, eligibility, eviction, and the retry's nucleus |
 | `test-audio8-engine` | both public paths end to end against the decoded waveforms, and the refusal of GGUFs that disagree |
+| `test-audio8-timing` | that the per-stage times are disjoint and bounded by the total they are reported against |
+| `test-audio8-cli` | the CLI's flags, `-ngl` and `--n-gpu-layers` among them, and the `--dump-codes` file format |
+| `test-audio8-cli-verbose` | the same flags through the binary: `--verbose` reaching stderr and codes surviving a synthesis |
 
-Every target above except `test-audio8-ras` needs the dumps, so `test-audio8-ras`
-is the only one that runs on a checkout with no models.
+`test-audio8-ras` and `test-audio8-cli` are the two that run on a checkout with
+no models; every other target needs the dumps.
+
+On a build with a GPU backend compiled in, the `lm`, `codec` and `engine`
+suites are registered a second time per backend as `test-audio8-<suite>-metal`
+and `-vulkan`. Each arm names its backend in `AUDIO8_TEST_GPU` and asserts it
+before reading a number, so an arm that fell back to CPU, or that was handed the
+other arm's GPU, fails rather than passing on someone else's result.
 
 The engine test hands the cloning path a wav rather than pre-computed codes, so
 it exercises the codec encoder the way a caller would.

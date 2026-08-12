@@ -125,15 +125,17 @@ int pick_vulkan_device_index(int requested,
 bool gpu_backend_satisfies_requirement(const char * backend_name,
                                        GpuBackendRequirement requirement) {
     if (requirement == GpuBackendRequirement::Any) return true;
-    if (!backend_name) return false;
-    if (requirement == GpuBackendRequirement::MetalOrOpenCL) {
-        // Registry names: Metal registers as "Metal" or "MTL" depending on
-        // the ggml build (see backend_util.h backend_is_metal).
-        return std::strcmp(backend_name, "Metal") == 0 ||
-               std::strcmp(backend_name, "MTL") == 0 ||
-               std::strcmp(backend_name, "OpenCL") == 0;
+    switch (requirement) {
+        case GpuBackendRequirement::Vulkan:
+            return reg_name_is_vulkan(backend_name);
+        case GpuBackendRequirement::VulkanOrMetal:
+            return reg_name_is_vulkan(backend_name) || reg_name_is_metal(backend_name);
+        case GpuBackendRequirement::MetalOrOpenCL:
+            return reg_name_is_metal(backend_name) || reg_name_is_opencl(backend_name);
+        case GpuBackendRequirement::Any:
+            break;
     }
-    return std::strcmp(backend_name, VULKAN_BACKEND_NAME) == 0;
+    return false;
 }
 
 void set_backends_directory(const std::string & dir) {

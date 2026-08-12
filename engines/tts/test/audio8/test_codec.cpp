@@ -10,6 +10,7 @@
 // channels-inner, so the comparison transposes as it reads.
 
 #include "audio8/internal.h"
+#include "gpu_arm.h"
 #include "npy.h"
 
 #include <cmath>
@@ -30,9 +31,7 @@ constexpr double GPU_WAVEFORM_TOLERANCE = 1e-4;
 constexpr double GPU_CODE_MISMATCH_RATIO = 1e-2;
 constexpr int GPU_LAYERS = 99;
 
-bool is_gpu_test() {
-    return std::getenv("AUDIO8_TEST_GPU") != nullptr;
-}
+using audio8_test::is_gpu_test;
 
 double latent_tolerance() {
     return is_gpu_test() ? GPU_LATENT_TOLERANCE : LATENT_TOLERANCE;
@@ -186,6 +185,81 @@ bool check_blocked_encode(codec_model & model, const npy_array & audio, int n_th
     return mismatches == 0;
 }
 
+// A budget the whole utterance cannot fit in has to come back as narrower
+// blocks that stay inside it, and the audio has to be the same either way --
+// which together are the whole contract of sizing the block from memory.
+constexpr size_t TIGHT_SCRATCH_BUDGET = 64u * 1024 * 1024;
+
+bool check_budgeted_decode(codec_model & model, const std::vector<int32_t> & codes,
+                           int n_frames, int n_threads, const std::vector<float> & whole) {
+    const int restore_block = model.synthesis_block_frames;
+    const size_t restore_budget = model.synthesis_scratch_budget;
+    model.synthesis_block_frames = 0;
+    model.synthesis_scratch_budget = TIGHT_SCRATCH_BUDGET;
+    std::vector<float> budgeted;
+    std::string error;
+    decode_timing timing;
+    const bool ran = decode_codes(model, codes.data(), n_frames, n_threads, nullptr,
+                                  budgeted, &error, nullptr, &timing);
+    model.synthesis_block_frames = restore_block;
+    model.synthesis_scratch_budget = restore_budget;
+    if (!ran) {
+        std::fprintf(stderr, "budgeted decode: %s\n", error.c_str());
+        return false;
+    }
+    if (timing.block_scratch > TIGHT_SCRATCH_BUDGET) {
+        std::fprintf(stderr, "budgeted: FAIL %d frames a block needs %zu bytes, past %zu\n",
+                     timing.block_frames, timing.block_scratch, TIGHT_SCRATCH_BUDGET);
+        return false;
+    }
+    if (timing.block_frames >= n_frames) {
+        std::fprintf(stderr, "budgeted: FAIL took all %d frames in one block\n", n_frames);
+        return false;
+    }
+    if (budgeted.size() != whole.size()) {
+        std::fprintf(stderr, "budgeted: FAIL %zu samples against %zu\n", budgeted.size(),
+                     whole.size());
+        return false;
+    }
+    std::fprintf(stderr, "  [budgeted] %d frames a block, %.1f MB within the %.1f MB asked\n",
+                 timing.block_frames, timing.block_scratch / (1024.0 * 1024.0),
+                 TIGHT_SCRATCH_BUDGET / (1024.0 * 1024.0));
+    return report("budgeted", compare_f32(budgeted.data(), whole.data(), whole.size()),
+                  WAVEFORM_TOLERANCE);
+}
+
+// The share and the cap the budget is built from. Restated here rather than
+// exported, so that changing either one has to be a deliberate edit on both
+// sides instead of a test that agrees with whatever the code now does.
+constexpr size_t BUDGET_CAP = 384u * 1024 * 1024;
+constexpr size_t PLENTIFUL_FREE = 8ull * 1024 * 1024 * 1024;
+constexpr size_t SCARCE_FREE = 200u * 1024 * 1024;
+
+bool check_budget_rule(const char * what, size_t got, size_t want) {
+    if (got == want) return true;
+    std::fprintf(stderr, "budget: FAIL %s gave %zu bytes, wanted %zu\n", what, got, want);
+    return false;
+}
+
+// A backend that cannot report its memory says zero for both figures, and that
+// has to read as "unknown" rather than "none left" -- taking it literally would
+// price every block at one frame and make synthesis slower than the fixed width
+// it replaced.
+bool check_scratch_budget() {
+    bool ok = check_budget_rule("an explicit budget", synthesis_scratch_budget(1234, 0, 0),
+                                1234);
+    ok &= check_budget_rule("a silent backend",
+                            synthesis_scratch_budget(0, 0, 0), BUDGET_CAP);
+    ok &= check_budget_rule("a roomy device",
+                            synthesis_scratch_budget(0, PLENTIFUL_FREE, PLENTIFUL_FREE),
+                            BUDGET_CAP);
+    ok &= check_budget_rule("a device under pressure",
+                            synthesis_scratch_budget(0, SCARCE_FREE, PLENTIFUL_FREE),
+                            SCARCE_FREE / 4);
+    if (ok) std::fprintf(stderr, "  [budget] share and cap and the unknown report\n");
+    return ok;
+}
+
 // Cancellation is only observable between blocks, so both directions run at
 // the narrow block size and stop after the first one. Checking how much came
 // back is what separates a real stop from a pass that ran to the end and
@@ -266,6 +340,8 @@ bool run_decode(codec_model & model, const fixture & data, int n_threads) {
     bool ok = check_stages(taps, data);
     ok &= check_flat("waveform", pcm, data.load("wav"), waveform_tolerance());
     ok &= check_blocked_decode(model, values, n_frames, n_threads, pcm);
+    ok &= check_scratch_budget();
+    ok &= check_budgeted_decode(model, values, n_frames, n_threads, pcm);
     ok &= check_cancelled_decode(model, values, n_frames, n_threads);
     return ok;
 }
@@ -340,9 +416,14 @@ int main(int argc, char ** argv) {
 
     codec_model decoder;
     std::string error;
-    const int n_gpu_layers = std::getenv("AUDIO8_TEST_GPU") ? GPU_LAYERS : 0;
+    const int n_gpu_layers = is_gpu_test() ? GPU_LAYERS : 0;
     if (!load_codec(argv[1], n_gpu_layers, decoder, &error)) {
         std::fprintf(stderr, "load decoder: %s\n", error.c_str());
+        return 1;
+    }
+    std::printf("backend: %s\n", ggml_backend_name(decoder.backend));
+    if (!audio8_test::check_requested_gpu("codec", decoder.backend)) {
+        free_codec(decoder);
         return 1;
     }
     const bool decoded = run_decode(decoder, data, n_threads);
@@ -351,6 +432,10 @@ int main(int argc, char ** argv) {
     codec_model encoder;
     if (!load_codec(argv[2], n_gpu_layers, encoder, &error)) {
         std::fprintf(stderr, "load encoder: %s\n", error.c_str());
+        return 1;
+    }
+    if (!audio8_test::check_requested_gpu("encoder", encoder.backend)) {
+        free_codec(encoder);
         return 1;
     }
     const bool encoded = run_encode(encoder, data, n_threads);
