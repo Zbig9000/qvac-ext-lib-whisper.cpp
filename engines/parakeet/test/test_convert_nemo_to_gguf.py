@@ -28,6 +28,17 @@ def install_torch_stub():
     sys.modules["torch"] = torch
 
 
+def install_numpy_stub():
+    numpy = types.ModuleType("numpy")
+    numpy.ndarray = object
+    numpy.float32 = object
+    sys.modules["numpy"] = numpy
+
+
+def install_yaml_stub():
+    sys.modules["yaml"] = types.ModuleType("yaml")
+
+
 try:
     import gguf
 except ModuleNotFoundError:
@@ -37,6 +48,16 @@ try:
     import torch
 except ModuleNotFoundError:
     install_torch_stub()
+
+try:
+    import numpy
+except ModuleNotFoundError:
+    install_numpy_stub()
+
+try:
+    import yaml
+except ModuleNotFoundError:
+    install_yaml_stub()
 
 
 SCRIPTS_DIR = Path(__file__).parents[1] / "scripts"
