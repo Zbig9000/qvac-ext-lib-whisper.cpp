@@ -355,7 +355,9 @@ weight-free CPU logic and need no GGUFs. MiniMax coverage includes metadata
 compatibility, model-pair selection, Unicode token classes, frame validation,
 prompt assembly, unconditional masking, deterministic noise, flow scheduling,
 condition length, window stitching, sampler edge cases, and converter output
-transactions.
+transactions. Set `AUDIOGEN_TEST_MINIMAX_MODELS_DIR` to a directory containing
+the MiniMax GGUF pair to run `test-minimax-integration`, which covers model
+loading, generation output, progress, and cancellation.
 `test-acestep-integration` exercises the ACE-Step public API when model paths
 are supplied and otherwise reports a skipped test.
 

@@ -207,18 +207,44 @@ void test_unicode_categories() {
     CHECK(is_letter(0x10400));
     CHECK(is_whitespace(0x2003));
     CHECK(!is_whitespace(0x200B));
-    CHECK(gpt2_pre_tokenize(u8"é中𐐀") == std::vector<std::string>({u8"é中𐐀"}));
-    CHECK(gpt2_pre_tokenize(u8"١٢٣٤") ==
-          std::vector<std::string>({u8"١", u8"٢", u8"٣", u8"٤"}));
-    CHECK(gpt2_pre_tokenize(u8"😀é") == std::vector<std::string>({u8"😀é"}));
-    CHECK(gpt2_pre_tokenize(u8"\u2003中") == std::vector<std::string>({u8"\u2003中"}));
+    CHECK(gpt2_pre_tokenize(u8"\u00E9\u4E2D\U00010400") ==
+          std::vector<std::string>({u8"\u00E9\u4E2D\U00010400"}));
+    CHECK(gpt2_pre_tokenize(u8"\u0661\u0662\u0663\u0664") ==
+          std::vector<std::string>({u8"\u0661", u8"\u0662", u8"\u0663", u8"\u0664"}));
+    CHECK(gpt2_pre_tokenize(u8"\U0001F600\u00E9") ==
+          std::vector<std::string>({u8"\U0001F600\u00E9"}));
+    CHECK(gpt2_pre_tokenize(u8"\u2003\u4E2D") ==
+          std::vector<std::string>({u8"\u2003\u4E2D"}));
+}
+
+void test_pre_tokenization_branches() {
+    CHECK(gpt2_pre_tokenize(u8"I'LL we\u2019RE they've dog's can't I'm he'd") ==
+          std::vector<std::string>({"I", "'LL", " we", u8"\u2019RE", " they", "'ve",
+                                    " dog", "'s", " can", "'t", " I", "'m", " he", "'d"}));
+    CHECK(gpt2_pre_tokenize("'llama") == std::vector<std::string>({"'llama"}));
+    CHECK(gpt2_pre_tokenize(u8"Hello\u00E9\u4E2D\U00010400") ==
+          std::vector<std::string>({u8"Hello\u00E9\u4E2D\U00010400"}));
+    CHECK(gpt2_pre_tokenize(u8".world") == std::vector<std::string>({u8".world"}));
+    CHECK(gpt2_pre_tokenize(u8"\u0667") == std::vector<std::string>({u8"\u0667"}));
+    CHECK(gpt2_pre_tokenize("!?\r\n") == std::vector<std::string>({"!?\r\n"}));
+    CHECK(gpt2_pre_tokenize("  hello") == std::vector<std::string>({" ", " hello"}));
+    CHECK(gpt2_pre_tokenize(" \t!") == std::vector<std::string>({" ", "\t!"}));
+    CHECK(gpt2_pre_tokenize("  7") == std::vector<std::string>({" ", " ", "7"}));
+    CHECK(gpt2_pre_tokenize(" \t\n") == std::vector<std::string>({" \t\n"}));
+    CHECK(gpt2_pre_tokenize(u8"\u2003\u2003\u4E2D") ==
+          std::vector<std::string>({u8"\u2003", u8"\u2003\u4E2D"}));
 }
 
 void test_malformed_utf8() {
     const std::string truncated_four_byte("\xF0", 1);
     const std::string truncated_sequence("\xF0\x9F", 2);
+    const std::string invalid_prefix("\x80" "A", 2);
     CHECK(gpt2_pre_tokenize(truncated_four_byte) ==
           std::vector<std::string>({truncated_four_byte}));
+    CHECK(gpt2_pre_tokenize(truncated_sequence) ==
+          std::vector<std::string>({std::string("\xF0", 1), std::string("\x9F", 1)}));
+    CHECK(gpt2_pre_tokenize(invalid_prefix) ==
+          std::vector<std::string>({invalid_prefix}));
     int advance = 0;
     CHECK(utf8_codepoint(truncated_sequence.data(),
                          static_cast<int>(truncated_sequence.size()), &advance) == 0xF0);
@@ -295,6 +321,7 @@ int main() {
     test_sampling_edges();
     test_model_compatibility();
     test_unicode_categories();
+    test_pre_tokenization_branches();
     test_malformed_utf8();
     test_model_pair_resolution();
     test_backend_configuration();

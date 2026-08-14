@@ -125,235 +125,262 @@ static bool is_newline(int cp) {
     return cp == '\n' || cp == '\r';
 }
 
+typedef bool (*CodepointPredicate)(int);
+
+static bool is_punctuation(int cp) {
+    return !is_newline(cp) && !is_letter(cp) && !is_digit(cp) && !is_whitespace(cp);
+}
+
+static int scan_codepoints(const char * s, int len, int start, CodepointPredicate predicate) {
+    int position = start;
+    while (position < len) {
+        int advance;
+        int cp = utf8_codepoint(s + position, len - position, &advance);
+        if (!predicate(cp)) {
+            break;
+        }
+        position += advance;
+    }
+    return position;
+}
+
+static int scan_letters(const char * s, int len, int start) {
+    return scan_codepoints(s, len, start, is_letter);
+}
+
+static int scan_newlines(const char * s, int len, int start) {
+    return scan_codepoints(s, len, start, is_newline);
+}
+
+static int scan_whitespace(const char * s, int len, int start) {
+    return scan_codepoints(s, len, start, is_whitespace);
+}
+
+static int scan_punctuation(const char * s, int len, int start) {
+    return scan_codepoints(s, len, start, is_punctuation);
+}
+
+static void append_pre_token(const char * s, int start, int end,
+                             std::vector<std::string> & chunks) {
+    chunks.push_back(std::string(s + start, end - start));
+}
+
+static char ascii_lower(char value) {
+    const int case_offset = 'a' - 'A';
+    if (value >= 'A' && value <= 'Z') {
+        return (char) (value + case_offset);
+    }
+    return value;
+}
+
+static bool ascii_case_insensitive_match(const char * text, const char * expected, int length) {
+    for (int i = 0; i < length; i++) {
+        if (ascii_lower(text[i]) != expected[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool contraction_suffix_matches(const char * s, int len, int suffix_start,
+                                       const char * suffix, int suffix_length) {
+    const int remaining = len - suffix_start;
+    if (remaining < suffix_length ||
+        !ascii_case_insensitive_match(s + suffix_start, suffix, suffix_length)) {
+        return false;
+    }
+    if (remaining == suffix_length) {
+        return true;
+    }
+    int advance;
+    int cp = utf8_codepoint(s + suffix_start + suffix_length,
+                            remaining - suffix_length, &advance);
+    return !is_letter(cp);
+}
+
+static bool try_append_contraction_suffix(const char * s, int len, int start,
+                                          int apostrophe_length, const char * suffix,
+                                          std::vector<std::string> & chunks, int & position) {
+    const int suffix_length = (int) std::strlen(suffix);
+    const int suffix_start = start + apostrophe_length;
+    if (!contraction_suffix_matches(s, len, suffix_start, suffix, suffix_length)) {
+        return false;
+    }
+    position = suffix_start + suffix_length;
+    append_pre_token(s, start, position, chunks);
+    return true;
+}
+
+static bool try_append_contraction(const char * s, int len, int cp, int advance,
+                                   std::vector<std::string> & chunks, int & position) {
+    const int right_single_quotation_mark = 0x2019;
+    if ((cp != '\'' && cp != right_single_quotation_mark) || position + advance >= len) {
+        return false;
+    }
+    const int start = position;
+    return try_append_contraction_suffix(s, len, start, advance, "ll", chunks, position) ||
+           try_append_contraction_suffix(s, len, start, advance, "re", chunks, position) ||
+           try_append_contraction_suffix(s, len, start, advance, "ve", chunks, position) ||
+           try_append_contraction_suffix(s, len, start, advance, "s", chunks, position) ||
+           try_append_contraction_suffix(s, len, start, advance, "t", chunks, position) ||
+           try_append_contraction_suffix(s, len, start, advance, "m", chunks, position) ||
+           try_append_contraction_suffix(s, len, start, advance, "d", chunks, position);
+}
+
+static bool try_append_letters(const char * s, int len, int cp,
+                               std::vector<std::string> & chunks, int & position) {
+    if (!is_letter(cp)) {
+        return false;
+    }
+    const int start = position;
+    position = scan_letters(s, len, position);
+    append_pre_token(s, start, position, chunks);
+    return true;
+}
+
+static bool try_append_prefixed_letters(const char * s, int len, int cp, int advance,
+                                        std::vector<std::string> & chunks, int & position) {
+    const int letter_start = position + advance;
+    if (!is_punctuation(cp) || letter_start >= len) {
+        return false;
+    }
+    int letter_advance;
+    int next_cp = utf8_codepoint(s + letter_start, len - letter_start, &letter_advance);
+    if (!is_letter(next_cp)) {
+        return false;
+    }
+    const int start = position;
+    position = scan_letters(s, len, letter_start);
+    append_pre_token(s, start, position, chunks);
+    return true;
+}
+
+static bool try_append_number(const char * s, int cp, int advance,
+                              std::vector<std::string> & chunks, int & position) {
+    if (!is_digit(cp)) {
+        return false;
+    }
+    const int start = position;
+    position += advance;
+    append_pre_token(s, start, position, chunks);
+    return true;
+}
+
+static bool try_append_newlines(const char * s, int len, int cp,
+                                std::vector<std::string> & chunks, int & position) {
+    if (!is_newline(cp)) {
+        return false;
+    }
+    const int start = position;
+    position = scan_newlines(s, len, position);
+    append_pre_token(s, start, position, chunks);
+    return true;
+}
+
+struct WhitespaceRun {
+    int end;
+    int last_start;
+    int count;
+};
+
+static WhitespaceRun scan_non_newline_whitespace(const char * s, int len, int start) {
+    WhitespaceRun run = {start, start, 0};
+    while (run.end < len) {
+        int advance;
+        int cp = utf8_codepoint(s + run.end, len - run.end, &advance);
+        if (!is_whitespace(cp) || is_newline(cp)) {
+            break;
+        }
+        run.last_start = run.end;
+        run.end += advance;
+        run.count++;
+    }
+    return run;
+}
+
+static bool is_followed_by_non_whitespace(const char * s, int len, int position) {
+    if (position >= len) {
+        return false;
+    }
+    int advance;
+    int cp = utf8_codepoint(s + position, len - position, &advance);
+    return !is_whitespace(cp) && !is_newline(cp);
+}
+
+static void append_punctuation_with_newlines(const char * s, int len, int start,
+                                             int punctuation_start,
+                                             std::vector<std::string> & chunks,
+                                             int & position) {
+    position = scan_punctuation(s, len, punctuation_start);
+    position = scan_newlines(s, len, position);
+    append_pre_token(s, start, position, chunks);
+}
+
+static bool try_append_whitespace(const char * s, int len, int cp, int advance,
+                                  std::vector<std::string> & chunks, int & position) {
+    if (!is_whitespace(cp)) {
+        return false;
+    }
+    const int start = position;
+    const WhitespaceRun run = scan_non_newline_whitespace(s, len, start);
+    if (run.count > 1 && is_followed_by_non_whitespace(s, len, run.end)) {
+        position = run.last_start;
+        append_pre_token(s, start, position, chunks);
+        return true;
+    }
+
+    position = start + advance;
+    if (position < len) {
+        int next_advance;
+        int next_cp = utf8_codepoint(s + position, len - position, &next_advance);
+        if (is_letter(next_cp)) {
+            position = scan_letters(s, len, position);
+            append_pre_token(s, start, position, chunks);
+            return true;
+        }
+        if (is_digit(next_cp)) {
+            append_pre_token(s, start, position, chunks);
+            return true;
+        }
+        if (!is_whitespace(next_cp) && !is_newline(next_cp)) {
+            append_punctuation_with_newlines(s, len, start, position, chunks, position);
+            return true;
+        }
+    }
+
+    position = scan_whitespace(s, len, run.end);
+    append_pre_token(s, start, position, chunks);
+    return true;
+}
+
+static void append_punctuation(const char * s, int len,
+                               std::vector<std::string> & chunks, int & position) {
+    const int start = position;
+    append_punctuation_with_newlines(s, len, start, start, chunks, position);
+}
+
+static void append_next_pre_token(const char * s, int len,
+                                  std::vector<std::string> & chunks, int & position) {
+    int advance;
+    int cp = utf8_codepoint(s + position, len - position, &advance);
+    if (try_append_contraction(s, len, cp, advance, chunks, position) ||
+        try_append_letters(s, len, cp, chunks, position) ||
+        try_append_prefixed_letters(s, len, cp, advance, chunks, position) ||
+        try_append_number(s, cp, advance, chunks, position) ||
+        try_append_newlines(s, len, cp, chunks, position) ||
+        try_append_whitespace(s, len, cp, advance, chunks, position)) {
+        return;
+    }
+    append_punctuation(s, len, chunks, position);
+}
+
 static std::vector<std::string> gpt2_pre_tokenize(const std::string & text) {
     std::vector<std::string> chunks;
-    const char *             s   = text.c_str();
-    int                      len = (int) text.size();
-    int                      i   = 0;
-
-    while (i < len) {
-        int adv;
-        int cp = utf8_codepoint(s + i, len - i, &adv);
-
-        if ((cp == '\'' || cp == 0x2019) && i + adv < len) {
-            const char * rest      = s + i + adv;
-            int          rlen      = len - i - adv;
-            auto         try_match = [&](const char * suffix, int slen) -> bool {
-                if (rlen >= slen) {
-
-                    for (int k = 0; k < slen; k++) {
-                        char c1 = rest[k], c2 = suffix[k];
-                        if (c1 >= 'A' && c1 <= 'Z') {
-                            c1 = (char) (c1 + 32);
-                        }
-                        if (c1 != c2) {
-                            return false;
-                        }
-                    }
-
-                    if (rlen > slen) {
-                        int a2;
-                        int cp2 = utf8_codepoint(rest + slen, rlen - slen, &a2);
-                        if (is_letter(cp2)) {
-                            return false;
-                        }
-                    }
-                    chunks.push_back(std::string(s + i, adv + slen));
-                    i += adv + slen;
-                    return true;
-                }
-                return false;
-            };
-            if (try_match("ll", 2)) {
-                continue;
-            }
-            if (try_match("re", 2)) {
-                continue;
-            }
-            if (try_match("ve", 2)) {
-                continue;
-            }
-            if (try_match("s", 1)) {
-                continue;
-            }
-            if (try_match("t", 1)) {
-                continue;
-            }
-            if (try_match("m", 1)) {
-                continue;
-            }
-            if (try_match("d", 1)) {
-                continue;
-            }
-        }
-
-        if (is_letter(cp)) {
-            int start = i;
-            i += adv;
-            while (i < len) {
-                int a2;
-                int cp2 = utf8_codepoint(s + i, len - i, &a2);
-                if (!is_letter(cp2)) {
-                    break;
-                }
-                i += a2;
-            }
-            chunks.push_back(std::string(s + start, i - start));
-            continue;
-        }
-        if (!is_newline(cp) && !is_letter(cp) && !is_digit(cp) && !is_whitespace(cp)) {
-
-            int start = i;
-            int after = i + adv;
-            if (after < len) {
-                int a2;
-                int cp2 = utf8_codepoint(s + after, len - after, &a2);
-                if (is_letter(cp2)) {
-                    i = after + a2;
-                    while (i < len) {
-                        int a3;
-                        int cp3 = utf8_codepoint(s + i, len - i, &a3);
-                        if (!is_letter(cp3)) {
-                            break;
-                        }
-                        i += a3;
-                    }
-                    chunks.push_back(std::string(s + start, i - start));
-                    continue;
-                }
-            }
-        }
-
-        if (is_digit(cp)) {
-            const int start = i;
-            i += adv;
-            chunks.push_back(std::string(s + start, i - start));
-            continue;
-        }
-
-        if (is_newline(cp)) {
-            int start = i;
-            while (i < len) {
-                int a2;
-                int cp2 = utf8_codepoint(s + i, len - i, &a2);
-                if (!is_newline(cp2)) {
-                    break;
-                }
-                i += a2;
-            }
-            chunks.push_back(std::string(s + start, i - start));
-            continue;
-        }
-
-        if (is_whitespace(cp)) {
-            int start  = i;
-
-            int ws_end = i;
-            int last_start = i;
-            int ws_count = 0;
-            while (ws_end < len) {
-                int a2;
-                int cp2 = utf8_codepoint(s + ws_end, len - ws_end, &a2);
-                if (!is_whitespace(cp2) || is_newline(cp2)) {
-                    break;
-                }
-                last_start = ws_end;
-                ws_end += a2;
-                ws_count++;
-            }
-
-            bool followed_by_non_ws = false;
-            if (ws_end < len) {
-                int a2;
-                int cp2 = utf8_codepoint(s + ws_end, len - ws_end, &a2);
-                followed_by_non_ws = !is_whitespace(cp2) && !is_newline(cp2);
-            }
-            if (followed_by_non_ws && ws_count > 1) {
-
-                chunks.push_back(std::string(s + start, last_start - start));
-                i = last_start;
-                continue;
-            }
-
-            i = start + adv;
-            if (i < len) {
-                int a2;
-                int cp2 = utf8_codepoint(s + i, len - i, &a2);
-                if (is_letter(cp2)) {
-                    i += a2;
-                    while (i < len) {
-                        int a3;
-                        int cp3 = utf8_codepoint(s + i, len - i, &a3);
-                        if (!is_letter(cp3)) {
-                            break;
-                        }
-                        i += a3;
-                    }
-                    chunks.push_back(std::string(s + start, i - start));
-                    continue;
-                }
-                if (is_digit(cp2)) {
-                    chunks.push_back(std::string(s + start, i - start));
-                    continue;
-                }
-                if (!is_whitespace(cp2) && !is_newline(cp2)) {
-                    int pstart = start;
-                    while (i < len) {
-                        int a3;
-                        int cp3 = utf8_codepoint(s + i, len - i, &a3);
-                        if (is_whitespace(cp3) || is_letter(cp3) || is_digit(cp3)) {
-                            break;
-                        }
-                        i += a3;
-                    }
-                    while (i < len) {
-                        int a4;
-                        int cp4 = utf8_codepoint(s + i, len - i, &a4);
-                        if (!is_newline(cp4)) {
-                            break;
-                        }
-                        i += a4;
-                    }
-                    chunks.push_back(std::string(s + pstart, i - pstart));
-                    continue;
-                }
-            }
-
-            i = ws_end;
-            while (i < len) {
-                int a2;
-                int cp2 = utf8_codepoint(s + i, len - i, &a2);
-                if (!is_whitespace(cp2)) {
-                    break;
-                }
-                i += a2;
-            }
-            chunks.push_back(std::string(s + start, i - start));
-            continue;
-        }
-
-        {
-            int start = i;
-            i += adv;
-            while (i < len) {
-                int a2;
-                int cp2 = utf8_codepoint(s + i, len - i, &a2);
-                if (is_whitespace(cp2) || is_letter(cp2) || is_digit(cp2) || is_newline(cp2)) {
-                    break;
-                }
-                i += a2;
-            }
-
-            while (i < len) {
-                int a2;
-                int cp2 = utf8_codepoint(s + i, len - i, &a2);
-                if (!is_newline(cp2)) {
-                    break;
-                }
-                i += a2;
-            }
-            chunks.push_back(std::string(s + start, i - start));
-        }
+    const char * s = text.c_str();
+    const int len = (int) text.size();
+    int position = 0;
+    while (position < len) {
+        append_next_pre_token(s, len, chunks, position);
     }
     return chunks;
 }

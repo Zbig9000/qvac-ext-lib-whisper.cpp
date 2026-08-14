@@ -226,6 +226,14 @@ if (AUDIOGEN_BUILD_TESTS)
         target_include_directories(test-minimax-units PRIVATE include src src/minimax)
         audiogen_apply_ccache(test-minimax-units)
         audiogen_register_test(test-minimax-units LABEL "unit")
+
+        add_executable(test-minimax-integration test/test_minimax_integration.cpp)
+        target_link_libraries(test-minimax-integration PRIVATE audiogen-cpp)
+        target_include_directories(test-minimax-integration PRIVATE include)
+        audiogen_apply_ccache(test-minimax-integration)
+        audiogen_register_test(test-minimax-integration LABEL "integration")
+        set_property(TEST test-minimax-integration PROPERTY SKIP_RETURN_CODE 77)
+
         find_package(Python3 COMPONENTS Interpreter)
         if (Python3_Interpreter_FOUND)
             add_test(NAME test-minimax-converter
