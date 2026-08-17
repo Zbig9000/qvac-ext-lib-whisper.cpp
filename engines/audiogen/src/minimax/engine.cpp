@@ -159,6 +159,23 @@ private:
     ggml_backend_t backend_;
 };
 
+class GenerationScope {
+public:
+    explicit GenerationScope(bool & generating) : generating_(generating) {
+        if (generating_) {
+            throw std::logic_error("minimax engine: recursive generate() is not allowed");
+        }
+        generating_ = true;
+    }
+
+    ~GenerationScope() {
+        generating_ = false;
+    }
+
+private:
+    bool & generating_;
+};
+
 }
 
 struct Engine::Impl {
@@ -166,6 +183,7 @@ struct Engine::Impl {
     MM3Model model;
     mutable MM3Tokenizer tokenizer;
     mutable std::atomic<bool> cancelled{false};
+    mutable bool generating = false;
     bool registered = false;
 
     ~Impl() {
@@ -202,6 +220,7 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & input) {
 
 GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn & progress) const {
     std::lock_guard<std::recursive_mutex> lock(engine_mutex());
+    GenerationScope generation_scope(impl_->generating);
     impl_->cancelled.store(false);
     AbortScope abort_scope(impl_->model.cpu_backend, impl_->cancelled);
 

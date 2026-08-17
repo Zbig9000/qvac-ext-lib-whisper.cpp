@@ -1,7 +1,10 @@
 #include "minimax/logic.h"
 #include "minimax/bpe.h"
+#include "minimax/mm3-flow-runtime.h"
+#include "minimax/mm3-window-orchestrator.h"
 #include "minimax/progress.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -138,6 +141,118 @@ void test_flow_schedule() {
     CHECK(throws_invalid_argument([&] { flow_schedule(0, sigmas, timesteps); }));
 }
 
+void test_production_dit_readback_polarity() {
+    const std::vector<float> raw = {1.0f, -2.0f, 0.5f};
+    size_t requested_bytes = 0;
+    const MM3DitReadback readback =
+        [&raw, &requested_bytes](float * output, size_t bytes, std::string *) {
+            requested_bytes = bytes;
+            std::copy(raw.begin(), raw.end(), output);
+            return true;
+        };
+    std::vector<float> negated(raw.size());
+    std::string error;
+    CHECK(mm3_read_dit_output(negated.data(), negated.size(), true, readback, &error));
+    CHECK(error.empty());
+    CHECK(requested_bytes == raw.size() * sizeof(float));
+    CHECK(negated == std::vector<float>({-1.0f, 2.0f, -0.5f}));
+
+    std::vector<float> unchanged(raw.size());
+    CHECK(mm3_read_dit_output(unchanged.data(), unchanged.size(), false, readback,
+                              &error));
+    CHECK(unchanged == raw);
+}
+
+void test_production_cfg_euler_step() {
+    std::vector<float> latents = {1.0f, -1.0f};
+    const std::vector<float> conditional = {2.0f, 4.0f};
+    const std::vector<float> unconditional = {0.5f, -2.0f};
+    const std::vector<float> sigmas = {0.0f, 0.25f};
+    std::string error;
+    CHECK(mm3_integrate_flow_step(latents, conditional, unconditional, sigmas, 0,
+                                  1.5f, &error));
+    CHECK(error.empty());
+    CHECK(latents == std::vector<float>({1.6875f, 0.75f}));
+}
+
+tts_cpp::minimax::detail::SynthesisContract valid_synthesis_contract() {
+    tts_cpp::minimax::detail::SynthesisContract contract;
+    contract.scheduler = "FlowMatchEulerDiscrete";
+    contract.invert_sigmas = true;
+    contract.shift = 1.0f;
+    contract.train_timesteps = 1;
+    contract.rope_type = "neox";
+    contract.glu_order = "value_gate";
+    contract.timestep_token_prepended = true;
+    contract.pre_post_conv_residual = true;
+    contract.attn_bias = false;
+    return contract;
+}
+
+void test_malformed_synthesis_metadata() {
+    using namespace tts_cpp::minimax::detail;
+    CHECK(vocoder_upsample_error({8, 8, 2, 4}, 512).empty());
+    CHECK(!vocoder_upsample_error({}, 512).empty());
+    CHECK(!vocoder_upsample_error({8, 0, 2, 4}, 512).empty());
+    CHECK(!vocoder_upsample_error({8, -1, 2, 4}, 512).empty());
+    CHECK(!vocoder_upsample_error({8, 8, 2, 4}, 256).empty());
+    CHECK(!vocoder_upsample_error({std::numeric_limits<int32_t>::max(), 3}, 1).empty());
+
+    SynthesisContract contract = valid_synthesis_contract();
+    CHECK(validate_synthesis_contract(contract).empty());
+    contract.scheduler = "Other";
+    CHECK(!validate_synthesis_contract(contract).empty());
+    contract = valid_synthesis_contract();
+    contract.invert_sigmas = false;
+    CHECK(!validate_synthesis_contract(contract).empty());
+    contract = valid_synthesis_contract();
+    contract.shift = std::numeric_limits<float>::quiet_NaN();
+    CHECK(!validate_synthesis_contract(contract).empty());
+    contract = valid_synthesis_contract();
+    contract.shift = 1.0001f;
+    CHECK(!validate_synthesis_contract(contract).empty());
+    contract = valid_synthesis_contract();
+    contract.train_timesteps = 1000;
+    CHECK(!validate_synthesis_contract(contract).empty());
+    contract = valid_synthesis_contract();
+    contract.rope_type = "interleaved";
+    CHECK(!validate_synthesis_contract(contract).empty());
+    contract = valid_synthesis_contract();
+    contract.glu_order = "gate_value";
+    CHECK(!validate_synthesis_contract(contract).empty());
+    contract = valid_synthesis_contract();
+    contract.timestep_token_prepended = false;
+    CHECK(!validate_synthesis_contract(contract).empty());
+    contract = valid_synthesis_contract();
+    contract.pre_post_conv_residual = false;
+    CHECK(!validate_synthesis_contract(contract).empty());
+    contract = valid_synthesis_contract();
+    contract.attn_bias = true;
+    CHECK(!validate_synthesis_contract(contract).empty());
+}
+
+void test_vocoder_output_shape() {
+    using tts_cpp::minimax::detail::vocoder_output_shape_error;
+    CHECK(vocoder_output_shape_error(8, 1, 1, 1, 8, 8 * sizeof(float), 8).empty());
+    CHECK(!vocoder_output_shape_error(7, 1, 1, 1, 8, 8 * sizeof(float), 8).empty());
+    CHECK(!vocoder_output_shape_error(8, 2, 1, 1, 8, 8 * sizeof(float), 8).empty());
+    CHECK(!vocoder_output_shape_error(8, 1, 1, 1, 7, 8 * sizeof(float), 8).empty());
+    CHECK(!vocoder_output_shape_error(8, 1, 1, 1, 8, 7 * sizeof(float), 8).empty());
+    CHECK(!vocoder_output_shape_error(0, 1, 1, 1, 0, 0, 0).empty());
+}
+
+void test_copy_ranges() {
+    using namespace tts_cpp::minimax::detail;
+    CHECK(copy_range_fits(10, 8, 2, 1, 4));
+    CHECK(!copy_range_fits(10, 8, -1, 1, 4));
+    CHECK(!copy_range_fits(10, 8, 8, 1, 3));
+    CHECK(!copy_range_fits(10, 8, 2, 7, 2));
+    CHECK(stereo_copy_ranges_fit(20, 16, 10, 2, 8, 1, 4));
+    CHECK(!stereo_copy_ranges_fit(19, 16, 10, 2, 8, 1, 4));
+    CHECK(!stereo_copy_ranges_fit(20, 16, 10, 7, 8, 1, 4));
+    CHECK(!stereo_copy_ranges_fit(20, 16, 10, 2, 8, 6, 4));
+}
+
 void test_condition_length() {
     using namespace tts_cpp::minimax::detail;
     ConditionRate rate;
@@ -161,6 +276,379 @@ void test_window_arithmetic() {
     CHECK(stitched_sample_count({689, 689}, 512) == 529408);
     CHECK(kCarryLatents == kCropLeftLatents + kCropRightLatents);
     CHECK(kCarryLatents == 2 * kBlendLatents);
+}
+
+void test_overlap_blend_and_pin() {
+    using namespace tts_cpp::minimax::detail;
+    std::vector<float> noise = {2.0f, 4.0f, 6.0f, 8.0f, 10.0f, 12.0f};
+    std::vector<float> previous = {20.0f, 40.0f, 60.0f, 80.0f};
+    std::vector<float> latents = noise;
+    blend_latent_overlap(latents.data(), noise.data(), previous.data(), 2, 3, 2, 2,
+                         0.5f);
+    CHECK(close(latents[0], 11.000001f));
+    CHECK(close(latents[1], 22.000002f));
+    CHECK(close(latents[3], 34.000004f));
+    CHECK(close(latents[4], 45.000005f));
+    pin_latent_overlap(latents.data(), previous.data(), 2, 3, 2, 2);
+    CHECK(latents == std::vector<float>({20.0f, 40.0f, 6.0f, 60.0f, 80.0f, 12.0f}));
+}
+
+void test_carry_layout() {
+    using namespace tts_cpp::minimax::detail;
+    std::vector<float> latents(2 * 689);
+    std::vector<float> condition(3 * 689);
+    for (size_t index = 0; index < latents.size(); ++index) {
+        latents[index] = static_cast<float>(index);
+    }
+    for (size_t index = 0; index < condition.size(); ++index) {
+        condition[index] = static_cast<float>(index);
+    }
+    const CarryRange range = carry_range(689, 344, 172);
+    CHECK(range.start == 345);
+    CHECK(range.end == 517);
+    std::vector<float> carry_latents;
+    std::vector<float> carry_condition;
+    CHECK(copy_carry_layout(latents, condition, 2, 3, 689, range, carry_latents,
+                            carry_condition));
+    CHECK(carry_latents.size() == 344);
+    CHECK(carry_latents[0] == 345.0f);
+    CHECK(carry_latents[171] == 516.0f);
+    CHECK(carry_latents[172] == 1034.0f);
+    CHECK(carry_condition.size() == 516);
+    CHECK(carry_condition.front() == 1035.0f);
+    CHECK(carry_condition.back() == 1550.0f);
+}
+
+void test_planar_stitch() {
+    using tts_cpp::minimax::detail::copy_planar_window;
+    const std::vector<float> source = {0.0f, 1.0f, 2.0f, 3.0f,
+                                       10.0f, 11.0f, 12.0f, 13.0f};
+    std::vector<float> destination(12, -1.0f);
+    CHECK(copy_planar_window(source, 2, 4, 1, 6, 2, 2, destination));
+    CHECK(destination == std::vector<float>({-1.0f, -1.0f, 1.0f, 2.0f, -1.0f, -1.0f,
+                                             -1.0f, -1.0f, 11.0f, 12.0f, -1.0f, -1.0f}));
+}
+
+void emit_flow_steps(int64_t steps,
+                     const std::function<void(int64_t, int64_t)> & on_step) {
+    for (int64_t step = 1; step <= steps; ++step) {
+        on_step(step, steps);
+    }
+}
+
+int count_stage(const std::vector<std::string> & stages, const std::string & stage) {
+    return static_cast<int>(std::count(stages.begin(), stages.end(), stage));
+}
+
+void fill_fake_latents(int64_t window, int64_t channels, int64_t latent_length,
+                       int64_t overlap, std::vector<float> & latents) {
+    for (int64_t channel = 0; channel < channels; ++channel) {
+        for (int64_t index = overlap; index < latent_length; ++index) {
+            latents[static_cast<size_t>(channel * latent_length + index)] =
+                static_cast<float>(window * 10000 + channel * 1000 + index);
+        }
+    }
+}
+
+constexpr int64_t kTwoWindowChannels = 2;
+constexpr int64_t kTwoWindowConditionDimension = 2;
+constexpr int64_t kTwoWindowUpsample = 2;
+constexpr int64_t kTwoWindowFlowSteps = 2;
+constexpr int64_t kTwoWindowFrames = 201;
+
+struct TwoWindowCapture {
+    std::vector<std::string> stages;
+    std::vector<float> first_condition;
+    std::vector<float> blended;
+    std::vector<float> pinned;
+};
+
+MM3WindowDimensions make_two_window_dimensions() {
+    MM3WindowDimensions dimensions;
+    dimensions.latent_channels = kTwoWindowChannels;
+    dimensions.audio_channels = kTwoWindowChannels;
+    dimensions.condition_dimension = kTwoWindowConditionDimension;
+    dimensions.upsample = kTwoWindowUpsample;
+    dimensions.window_frames = 200;
+    dimensions.hop_frames = 100;
+    dimensions.carry_span = 344;
+    dimensions.overlap = 172;
+    dimensions.crop_left = 86;
+    dimensions.crop_right = 258;
+    dimensions.flow_steps = kTwoWindowFlowSteps;
+    return dimensions;
+}
+
+bool capture_two_window_progress(TwoWindowCapture & capture,
+                                 const std::string & stage) {
+    capture.stages.push_back(stage);
+    return true;
+}
+
+void fill_two_window_condition(int64_t window, std::vector<float> & condition) {
+    for (size_t index = 0; index < condition.size(); ++index) {
+        condition[index] =
+            static_cast<float>(window * 10000 + static_cast<int64_t>(index));
+    }
+}
+
+bool inject_two_window_condition(TwoWindowCapture & capture, int64_t window,
+                                 int64_t frames, std::vector<float> & condition,
+                                 int64_t & latent_length) {
+    latent_length =
+        tts_cpp::minimax::detail::condition_latent_length({}, frames);
+    condition.resize(static_cast<size_t>(
+        latent_length * kTwoWindowConditionDimension));
+    fill_two_window_condition(window, condition);
+    if (window == 0) {
+        capture.first_condition = condition;
+    }
+    return true;
+}
+
+bool inject_two_window_noise(int64_t window, int64_t count,
+                             std::vector<float> & noise) {
+    noise.assign(static_cast<size_t>(count), window == 0 ? 0.25f : 0.5f);
+    return window == 1;
+}
+
+void capture_two_window_overlap(TwoWindowCapture & capture, int64_t latent_length,
+                                const std::vector<float> & noise,
+                                const std::vector<float> & carry_latents,
+                                int64_t carry_length,
+                                const std::vector<float> & condition,
+                                std::vector<float> & latents) {
+    CHECK(carry_length == 172);
+    CHECK(condition[0] ==
+          capture.first_condition[345 * kTwoWindowConditionDimension]);
+    CHECK(condition[343] ==
+          capture.first_condition[345 * kTwoWindowConditionDimension + 343]);
+    tts_cpp::minimax::detail::blend_latent_overlap(
+        latents.data(), noise.data(), carry_latents.data(), kTwoWindowChannels,
+        latent_length, carry_length, carry_length, 0.5f);
+    capture.blended = latents;
+    tts_cpp::minimax::detail::pin_latent_overlap(
+        latents.data(), carry_latents.data(), kTwoWindowChannels, latent_length,
+        carry_length, carry_length);
+    capture.pinned = latents;
+}
+
+bool inject_two_window_flow(
+    TwoWindowCapture & capture, int64_t window, int64_t latent_length,
+    const std::vector<float> & noise, const std::vector<float> & carry_latents,
+    int64_t carry_length, const std::vector<float> & condition,
+    std::vector<float> & latents,
+    const std::function<void(int64_t, int64_t)> & on_step) {
+    latents = noise;
+    if (window == 1) {
+        capture_two_window_overlap(capture, latent_length, noise, carry_latents,
+                                   carry_length, condition, latents);
+    }
+    fill_fake_latents(window, kTwoWindowChannels, latent_length, carry_length,
+                      latents);
+    emit_flow_steps(kTwoWindowFlowSteps, on_step);
+    return true;
+}
+
+bool inject_two_window_vocoder(int64_t window, int64_t latent_length,
+                               std::vector<float> & waveform) {
+    const int64_t samples = latent_length * kTwoWindowUpsample;
+    waveform.resize(static_cast<size_t>(samples * kTwoWindowChannels));
+    std::fill(waveform.begin(), waveform.begin() + samples,
+              window == 0 ? 0.1f : 0.3f);
+    std::fill(waveform.begin() + samples, waveform.end(),
+              window == 0 ? 0.2f : 0.4f);
+    return true;
+}
+
+MM3WindowOperations make_two_window_operations(TwoWindowCapture & capture) {
+    MM3WindowOperations operations;
+    operations.progress =
+        [&capture](const std::string & stage, int64_t, int64_t, int64_t, int64_t,
+                   std::string *) {
+            return capture_two_window_progress(capture, stage);
+        };
+    operations.condition =
+        [&capture](int64_t window, int64_t, int64_t, int64_t frames,
+                   std::vector<float> & condition, int64_t & latent_length,
+                   std::string *) {
+            return inject_two_window_condition(capture, window, frames, condition,
+                                               latent_length);
+        };
+    operations.noise =
+        [](int64_t window, int64_t count, std::vector<float> & noise) {
+            return inject_two_window_noise(window, count, noise);
+        };
+    operations.flow =
+        [&capture](
+            int64_t window, int64_t, int64_t latent_length,
+            const std::vector<float> & noise,
+            const std::vector<float> & carry_latents, int64_t carry_length,
+            const std::vector<float> & condition, std::vector<float> & latents,
+            const std::function<void(int64_t, int64_t)> & on_step,
+            std::string *) {
+            return inject_two_window_flow(
+                capture, window, latent_length, noise, carry_latents, carry_length,
+                condition, latents, on_step);
+        };
+    operations.vocoder =
+        [](int64_t window, int64_t, const std::vector<float> &, int64_t latent_length,
+           std::vector<float> & waveform, std::string *) {
+            return inject_two_window_vocoder(window, latent_length, waveform);
+        };
+    return operations;
+}
+
+void assert_two_window_expected_state(const MM3WindowOrchestration & result,
+                                      const std::string & error) {
+    CHECK(error.empty());
+    CHECK(result.starts == std::vector<int64_t>({0, 100}));
+    CHECK(result.frame_lengths == std::vector<int64_t>({200, 101}));
+    CHECK(result.latent_lengths == std::vector<int64_t>({689, 347}));
+    CHECK(result.overlaps == std::vector<int64_t>({0, 172}));
+    CHECK(result.carry_starts[0] == 345);
+    CHECK(result.carry_ends[0] == 517);
+    CHECK(result.vocoder_calls == 2);
+    CHECK(result.samples_per_channel == 1384);
+    CHECK(result.audio.size() == 2768);
+    CHECK(result.forced_noise == std::vector<int64_t>({0, 1}));
+}
+
+void assert_two_window_crops(const MM3WindowDimensions & dimensions) {
+    const auto first_crop = mm3_window_crop_span(dimensions, 689, 0, 2);
+    const auto second_crop = mm3_window_crop_span(dimensions, 347, 1, 2);
+    CHECK(first_crop.left == 0);
+    CHECK(first_crop.length == 862);
+    CHECK(second_crop.left == 172);
+    CHECK(second_crop.length == 522);
+}
+
+void assert_two_window_seams(const MM3WindowOrchestration & result,
+                             const TwoWindowCapture & capture) {
+    CHECK(close(result.audio[861], 0.1f));
+    CHECK(close(result.audio[862], 0.3f));
+    CHECK(close(result.audio[1384 + 861], 0.2f));
+    CHECK(close(result.audio[1384 + 862], 0.4f));
+    CHECK(!capture.blended.empty());
+    CHECK(!capture.pinned.empty());
+    CHECK(!close(capture.blended[0], capture.pinned[0]));
+    CHECK(capture.pinned[0] == result.latents[0][345]);
+}
+
+void assert_two_window_progress(const TwoWindowCapture & capture) {
+    CHECK(count_stage(capture.stages, "cond") == 2);
+    CHECK(count_stage(capture.stages, "flow") == 6);
+    CHECK(count_stage(capture.stages, "vocode") == 2);
+    CHECK(count_stage(capture.stages, "stitch") == 1);
+    CHECK(count_stage(capture.stages, "done") == 1);
+}
+
+void test_two_window_orchestration() {
+    const MM3WindowDimensions dimensions = make_two_window_dimensions();
+    TwoWindowCapture capture;
+    const MM3WindowOperations operations = make_two_window_operations(capture);
+    MM3WindowOrchestration result;
+    std::string error;
+    CHECK(mm3_orchestrate_windows(kTwoWindowFrames, dimensions, operations, &result,
+                                  &error));
+    assert_two_window_expected_state(result, error);
+    assert_two_window_crops(dimensions);
+    assert_two_window_seams(result, capture);
+    assert_two_window_progress(capture);
+}
+
+void test_nonfinite_vocoder_orchestration(float value) {
+    const MM3WindowDimensions dimensions = make_two_window_dimensions();
+    TwoWindowCapture capture;
+    MM3WindowOperations operations = make_two_window_operations(capture);
+    operations.vocoder =
+        [value](int64_t, int64_t, const std::vector<float> &, int64_t latent_length,
+                std::vector<float> & waveform, std::string *) {
+            const int64_t samples = latent_length * kTwoWindowUpsample;
+            waveform.assign(static_cast<size_t>(samples * kTwoWindowChannels), 0.25f);
+            waveform[4] = value;
+            return true;
+        };
+    MM3WindowOrchestration result;
+    std::string error;
+    CHECK(!mm3_orchestrate_windows(1, dimensions, operations, &result, &error));
+    CHECK(error == "non-finite audio sample at index 4");
+    CHECK(result.audio.size() == 12);
+    CHECK(!std::isfinite(result.audio[4]));
+}
+
+void test_nonfinite_vocoder_orchestration() {
+    test_nonfinite_vocoder_orchestration(std::numeric_limits<float>::quiet_NaN());
+    test_nonfinite_vocoder_orchestration(std::numeric_limits<float>::infinity());
+    test_nonfinite_vocoder_orchestration(-std::numeric_limits<float>::infinity());
+}
+
+void test_finite_vocoder_orchestration_clipping() {
+    const MM3WindowDimensions dimensions = make_two_window_dimensions();
+    TwoWindowCapture capture;
+    MM3WindowOperations operations = make_two_window_operations(capture);
+    operations.vocoder =
+        [](int64_t, int64_t, const std::vector<float> &, int64_t latent_length,
+           std::vector<float> & waveform, std::string *) {
+            const int64_t samples = latent_length * kTwoWindowUpsample;
+            waveform.assign(static_cast<size_t>(samples * kTwoWindowChannels), 0.0f);
+            waveform[0] = 2.0f;
+            waveform[1] = -2.0f;
+            waveform[2] = 0.5f;
+            return true;
+        };
+    MM3WindowOrchestration result;
+    std::string error;
+    CHECK(mm3_orchestrate_windows(1, dimensions, operations, &result, &error));
+    CHECK(error.empty());
+    CHECK(result.audio[0] == 1.0f);
+    CHECK(result.audio[1] == -1.0f);
+    CHECK(result.audio[2] == 0.5f);
+    CHECK(close(result.metrics.peak, 1.0f));
+    CHECK(std::fabs(result.metrics.rms - std::sqrt(0.1875)) <= 1e-12);
+}
+
+void test_ar_candidate_helpers() {
+    using namespace tts_cpp::minimax::detail;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    const std::vector<float> logits = {
+        0.0f, 9.0f, 0.0f, nan, inf, -inf,
+        0.0f, 4.0f, 0.0f, 1.0f, 2.0f, 3.0f,
+    };
+    ArCandidates candidates;
+    int64_t nonfinite = 0;
+    CHECK(collect_ar_candidates(logits.data(), 6, 1, 3, 3, candidates, nonfinite));
+    CHECK(candidates.conditional.size() == 4);
+    CHECK(candidates.conditional[0] == 9.0f);
+    CHECK(std::isinf(candidates.conditional[1]) && candidates.conditional[1] < 0.0f);
+    CHECK(std::isinf(candidates.conditional[2]) && candidates.conditional[2] < 0.0f);
+    CHECK(std::isinf(candidates.conditional[3]) && candidates.conditional[3] < 0.0f);
+    CHECK(candidates.unconditional == std::vector<float>({4.0f, 1.0f, 2.0f, 3.0f}));
+    CHECK(nonfinite == 2);
+
+    candidates.conditional = {4.0f, 3.0f, 3.0f, 1.0f};
+    candidates.unconditional = {0.0f, 0.0f, 0.0f, 0.0f};
+    guide_ar_candidates(candidates, 2.0f);
+    apply_conditional_top_k(candidates, 2);
+    CHECK(candidates.guided[0] == 8.0f);
+    CHECK(candidates.guided[1] == 6.0f);
+    CHECK(candidates.guided[2] == 6.0f);
+    CHECK(std::isinf(candidates.guided[3]) && candidates.guided[3] < 0.0f);
+}
+
+void test_ar_acoustic_rows_and_frame_cap() {
+    using namespace tts_cpp::minimax::detail;
+    const int32_t codes[] = {2, 3, 4};
+    std::vector<int32_t> rows;
+    build_acoustic_rows(codes, 3, 10, rows);
+    CHECK(rows == std::vector<int32_t>({2, 13, 24}));
+    std::string error;
+    CHECK(resolve_ar_frame_cap(20, 12, true, 6, error) == 5);
+    CHECK(error.empty());
+    CHECK(resolve_ar_frame_cap(20, 12, false, 0, error) == 12);
+    CHECK(resolve_ar_frame_cap(20, 12, true, 1, error) == 0);
+    CHECK(!error.empty());
 }
 
 void test_sampling_edges() {
@@ -316,8 +804,21 @@ int main() {
     test_unconditional_mask();
     test_noise();
     test_flow_schedule();
+    test_production_dit_readback_polarity();
+    test_production_cfg_euler_step();
+    test_malformed_synthesis_metadata();
+    test_vocoder_output_shape();
+    test_copy_ranges();
     test_condition_length();
     test_window_arithmetic();
+    test_overlap_blend_and_pin();
+    test_carry_layout();
+    test_planar_stitch();
+    test_two_window_orchestration();
+    test_nonfinite_vocoder_orchestration();
+    test_finite_vocoder_orchestration_clipping();
+    test_ar_candidate_helpers();
+    test_ar_acoustic_rows_and_frame_cap();
     test_sampling_edges();
     test_model_compatibility();
     test_unicode_categories();

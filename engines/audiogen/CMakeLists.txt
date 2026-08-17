@@ -227,6 +227,12 @@ if (AUDIOGEN_BUILD_TESTS)
         audiogen_apply_ccache(test-minimax-units)
         audiogen_register_test(test-minimax-units LABEL "unit")
 
+        add_executable(test-minimax-loading-safety test/test_minimax_loading_safety.cpp)
+        target_link_libraries(test-minimax-loading-safety PRIVATE audiogen-cpp)
+        target_include_directories(test-minimax-loading-safety PRIVATE include src src/minimax)
+        audiogen_apply_ccache(test-minimax-loading-safety)
+        audiogen_register_test(test-minimax-loading-safety LABEL "unit")
+
         add_executable(test-minimax-integration test/test_minimax_integration.cpp)
         target_link_libraries(test-minimax-integration PRIVATE audiogen-cpp)
         target_include_directories(test-minimax-integration PRIVATE include)

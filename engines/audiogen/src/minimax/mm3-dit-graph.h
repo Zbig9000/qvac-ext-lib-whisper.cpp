@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include "build-flags.h"
 #include "logic.h"
+#include "mm3-flow-runtime.h"
 
 #include <chrono>
 #include <cmath>
@@ -409,8 +410,15 @@ static bool mm3_dit_run(const MM3Model & m, MM3DitGraph * g, const float * laten
         }
         return false;
     }
-    ggml_backend_tensor_get(g->output, out, 0, ggml_nbytes(g->output));
-    return true;
+    const size_t output_count =
+        static_cast<size_t>(m.synth_cfg.dit.in_channels) * static_cast<size_t>(L);
+    const MM3DitReadback readback =
+        [g](float * destination, size_t bytes, std::string *) {
+            ggml_backend_tensor_get(g->output, destination, 0, bytes);
+            return true;
+        };
+    return mm3_read_dit_output(out, output_count, m.synth_cfg.dit.output_negated,
+                               readback, err);
 }
 
 static bool mm3_dit_forward(const MM3Model & m, const float * latents, const float * cond, int64_t L, float t,
@@ -483,11 +491,9 @@ static bool mm3_flow_sample(const MM3Model & m, const float * noise, const float
         }
         last_ms = ms;
 
-        const float dsigma = sigmas[(size_t) i + 1] - sigmas[(size_t) i];
-        for (int64_t j = 0; j < N; j++) {
-            const float u = pred_u[(size_t) j];
-            const float v = u + cfg_scale * (pred_c[(size_t) j] - u);
-            out_latents[(size_t) j] += dsigma * v;
+        if (!mm3_integrate_flow_step(out_latents, pred_c, pred_u, sigmas,
+                                     static_cast<size_t>(i), cfg_scale, err)) {
+            return false;
         }
     }
 

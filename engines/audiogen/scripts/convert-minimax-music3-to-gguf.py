@@ -117,11 +117,20 @@ def remove_paths(paths):
         except FileNotFoundError:
             pass
 
+def backup_restore_error(failures):
+    details = "; ".join(
+        f"backup={backup!r}, destination={destination!r}, "
+        f"error={type(error).__name__}: {error}; original remains at backup"
+        for backup, destination, error in failures
+    )
+    return f"output rollback failed: {details}"
+
 class OutputTransaction:
     def __init__(self, transaction_id=None):
         self.transaction_id = transaction_id or f"{os.getpid()}-{id(self):x}"
         self.entries = []
         self.backups = []
+        self.restored_backups = set()
         self.committed = []
         self.finished = False
 
@@ -149,15 +158,30 @@ class OutputTransaction:
 
     def rollback(self):
         remove_paths(self.committed)
+        failures = self.restore_backups()
+        if failures:
+            raise RuntimeError(backup_restore_error(failures))
+
+    def restore_backups(self):
+        failures = []
         for backup, final_path in reversed(self.backups):
-            os.replace(backup, final_path)
+            try:
+                os.replace(backup, final_path)
+                self.restored_backups.add(backup)
+            except BaseException as error:
+                failures.append((backup, final_path, error))
+        return failures
 
     def commit(self):
         try:
             self.create_backups()
             self.publish()
-        except BaseException:
-            self.rollback()
+        except BaseException as publish_error:
+            try:
+                self.rollback()
+            except BaseException as rollback_error:
+                self.cleanup()
+                raise rollback_error from publish_error
             self.cleanup()
             raise
         remove_paths([backup for backup, _ in self.backups])
@@ -166,7 +190,6 @@ class OutputTransaction:
     def cleanup(self):
         if not self.finished:
             remove_paths([temporary for temporary, _, _ in self.entries])
-            remove_paths([backup for backup, _ in self.backups])
 
 _ST_DTYPES = {"F64", "F32", "F16", "BF16", "I64", "I32", "I16", "I8", "U8", "BOOL"}
 

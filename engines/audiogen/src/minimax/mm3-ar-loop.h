@@ -1,17 +1,16 @@
 #pragma once
 
+#include "logic.h"
 #include "mm3-depth-graph.h"
 #include "mm3-lm-graph.h"
 #include "mm3-model.h"
 #include "mm3-sample.h"
 #include "mm3-tokenizer.h"
-#include "logic.h"
 #include "progress.h"
 
-#include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <random>
 #include <string>
@@ -27,44 +26,84 @@ struct MM3ArDump {
 
 struct MM3ArResult {
     int64_t n_iterations = 0;
-    int64_t n_frames     = 0;
-    int64_t hidden_dim   = 0;
-    int64_t n_codebooks  = 0;
-    int64_t sem_vocab    = 0;
-    bool    eos_hit      = false;
+    int64_t n_frames = 0;
+    int64_t hidden_dim = 0;
+    int64_t n_codebooks = 0;
+    int64_t sem_vocab = 0;
+    bool eos_hit = false;
 
     std::vector<int32_t> semantic_all;
     std::vector<int32_t> acoustic_all;
-    std::vector<float>   frame_hiddens;
-    std::vector<float>   prefill_hidden;
+    std::vector<float> frame_hiddens;
+    std::vector<float> prefill_hidden;
     std::vector<MM3ArDump> dumps;
 
     int64_t nonfinite_logits = 0;
-    double  prefill_ms       = 0.0;
-    double  lm_ms            = 0.0;
-    double  depth_ms         = 0.0;
-    double  host_ms          = 0.0;
-    double  total_ms         = 0.0;
-    int64_t lm_steps         = 0;
+    double prefill_ms = 0.0;
+    double lm_ms = 0.0;
+    double depth_ms = 0.0;
+    double host_ms = 0.0;
+    double total_ms = 0.0;
+    int64_t lm_steps = 0;
 };
 
 struct MM3ArOptions {
-    int64_t  max_frames = 300;
-    uint64_t seed       = 42;
+    int64_t max_frames = 300;
+    uint64_t seed = 42;
 
     const int32_t * forced_semantic = nullptr;
     const int32_t * forced_acoustic = nullptr;
-    int64_t         forced_len      = 0;
+    int64_t forced_len = 0;
 
-    int64_t dump_iters      = 0;
-    bool    collect_hiddens = true;
+    int64_t dump_iters = 0;
+    bool collect_hiddens = true;
 
-    std::function<void(int64_t , int64_t )> on_frame;
-
+    std::function<void(int64_t, int64_t)> on_frame;
     std::function<bool()> should_cancel;
 };
 
+struct MM3ArConfig {
+    int64_t hidden = 0;
+    int64_t vocab = 0;
+    int64_t semantic_vocab = 0;
+    int64_t acoustic_codebooks = 0;
+    int64_t acoustic_vocab = 0;
+    int64_t semantic_offset = 0;
+    int64_t eos = 0;
+    int64_t max_frames = 0;
+    float cfg_scale = 0.0f;
+    int top_k = 0;
+    bool forced = false;
+};
+
+struct MM3ArWorkspace {
+    explicit MM3ArWorkspace(uint64_t seed) : random(seed) {
+    }
+
+    std::vector<float> hidden;
+    std::vector<float> logits;
+    std::vector<float> feedback;
+    tts_cpp::minimax::detail::ArCandidates candidates;
+    std::vector<float> sampling_scratch;
+    std::vector<int32_t> acoustic_rows;
+    MM3DepthFrame frame;
+    std::mt19937_64 random;
+};
+
+enum class MM3ArStep {
+    proceed,
+    stop,
+    failure,
+};
+
 static MM3LmGraph g_mm3_lm;
+
+static bool mm3_ar_fail(std::string * error, const std::string & message) {
+    if (error) {
+        *error = message;
+    }
+    return false;
+}
 
 static bool mm3_ar_cancelled(const MM3ArOptions & options, std::string * error) {
     if (!tts_cpp::minimax::detail::cancellation_requested(options.should_cancel)) {
@@ -76,278 +115,451 @@ static bool mm3_ar_cancelled(const MM3ArOptions & options, std::string * error) 
     return true;
 }
 
-static bool mm3_ar_plan(const MM3Model & m, const int32_t * cond_ids, const int32_t * uncond_ids, int64_t n_prompt,
-                        const MM3ArOptions & opt, MM3ArResult * out, std::string * err) {
-    const MM3LmConfig & c  = m.lm_cfg;
-    const int64_t       H  = (int64_t) c.embedding_length;
-    const int64_t       V  = (int64_t) c.vocab_size;
-    const int64_t       SV = (int64_t) c.semantic_vocab_size;
-    const int64_t       NC = (int64_t) c.num_codebooks - 1;
-    const int64_t       AV = (int64_t) c.acoustic_vocab_size;
-    const int64_t       OFF  = (int64_t) c.semantic_vocab_offset;
-    const int64_t       EOS  = (int64_t) c.eos_audio;
-    const float         CFG  = c.ar_cfg_scale > 0.0f ? c.ar_cfg_scale : 1.5f;
-    const int           TOPK = c.ar_top_k > 0 ? (int) c.ar_top_k : 50;
+static bool mm3_ar_validate_prompt(const MM3LmConfig & config, int64_t prompt_length,
+                                   std::string * error) {
+    if (prompt_length <= 0) {
+        return mm3_ar_fail(error, "the prompt tokenised to zero tokens");
+    }
+    if (config.max_prompt_tokens > 0 &&
+        prompt_length > static_cast<int64_t>(config.max_prompt_tokens)) {
+        return mm3_ar_fail(
+            error, "the prompt is " + std::to_string(prompt_length) +
+                       " tokens; the checkpoint's limit is " +
+                       std::to_string(config.max_prompt_tokens));
+    }
+    return true;
+}
 
-    if (n_prompt <= 0) {
-        if (err) {
-            *err = "the prompt tokenised to zero tokens";
-        }
+static bool mm3_ar_validate_vocabulary(const MM3ArConfig & resolved,
+                                       std::string * error) {
+    if (resolved.eos < 0 || resolved.eos >= resolved.vocab ||
+        resolved.semantic_offset < 0 ||
+        resolved.semantic_offset >
+            resolved.vocab - resolved.semantic_vocab) {
+        return mm3_ar_fail(
+            error,
+            "the LM vocabulary metadata does not cover the semantic range and EOS");
+    }
+    return true;
+}
+
+static bool mm3_ar_resolve_frame_cap(const MM3LmConfig & config,
+                                     const MM3ArOptions & options,
+                                     MM3ArConfig & resolved, std::string * error) {
+    if (resolved.forced && !options.forced_acoustic) {
+        return mm3_ar_fail(
+            error,
+            "forced replay needs both forced_semantic and forced_acoustic, and a positive length");
+    }
+    std::string resolution_error;
+    resolved.max_frames = tts_cpp::minimax::detail::resolve_ar_frame_cap(
+        options.max_frames, static_cast<int64_t>(config.max_audio_frames),
+        resolved.forced, options.forced_len, resolution_error);
+    if (!resolution_error.empty()) {
+        return mm3_ar_fail(error, resolution_error);
+    }
+    return true;
+}
+
+static bool mm3_ar_resolve_config(const MM3Model & model,
+                                  const MM3ArOptions & options,
+                                  int64_t prompt_length, MM3ArConfig & resolved,
+                                  std::string * error) {
+    const MM3LmConfig & config = model.lm_cfg;
+    resolved.hidden = static_cast<int64_t>(config.embedding_length);
+    resolved.vocab = static_cast<int64_t>(config.vocab_size);
+    resolved.semantic_vocab =
+        static_cast<int64_t>(config.semantic_vocab_size);
+    resolved.acoustic_codebooks =
+        static_cast<int64_t>(config.num_codebooks) - 1;
+    resolved.acoustic_vocab =
+        static_cast<int64_t>(config.acoustic_vocab_size);
+    resolved.semantic_offset =
+        static_cast<int64_t>(config.semantic_vocab_offset);
+    resolved.eos = static_cast<int64_t>(config.eos_audio);
+    resolved.cfg_scale =
+        config.ar_cfg_scale > 0.0f ? config.ar_cfg_scale : 1.5f;
+    resolved.top_k = config.ar_top_k > 0 ? static_cast<int>(config.ar_top_k) : 50;
+    resolved.forced = options.forced_semantic != nullptr;
+    if (!mm3_ar_validate_prompt(config, prompt_length, error) ||
+        !mm3_ar_validate_vocabulary(resolved, error) ||
+        !mm3_ar_resolve_frame_cap(config, options, resolved, error)) {
         return false;
     }
-    if (c.max_prompt_tokens > 0 && n_prompt > (int64_t) c.max_prompt_tokens) {
-        if (err) {
-            *err = "the prompt is " + std::to_string((long long) n_prompt) + " tokens; the checkpoint's limit is " +
-                   std::to_string(c.max_prompt_tokens);
-        }
+    if (!mm3_lm_positions_fit(config.context_length, prompt_length,
+                              resolved.max_frames)) {
+        return mm3_ar_fail(
+            error, "the prompt and generated frames exceed qwen3.context_length");
+    }
+    return true;
+}
+
+static void mm3_ar_initialize_result(const MM3ArConfig & config,
+                                     const MM3ArOptions & options,
+                                     MM3ArResult * result) {
+    *result = MM3ArResult{};
+    result->hidden_dim = config.hidden;
+    result->n_codebooks = config.acoustic_codebooks + 1;
+    result->sem_vocab = config.semantic_vocab;
+    result->semantic_all.reserve(
+        static_cast<size_t>(config.max_frames + 1));
+    result->acoustic_all.reserve(static_cast<size_t>(
+        (config.max_frames + 1) * config.acoustic_codebooks));
+    if (options.collect_hiddens) {
+        result->frame_hiddens.reserve(static_cast<size_t>(
+            config.max_frames * (config.acoustic_codebooks + 1) *
+            config.hidden));
+    }
+}
+
+static void mm3_ar_initialize_workspace(const MM3ArConfig & config,
+                                        MM3ArWorkspace & workspace) {
+    workspace.hidden.resize(
+        static_cast<size_t>(config.hidden * MM3_LM_CFG_ROWS));
+    workspace.logits.resize(
+        static_cast<size_t>(config.vocab * MM3_LM_CFG_ROWS));
+    workspace.feedback.resize(static_cast<size_t>(config.hidden));
+    workspace.acoustic_rows.resize(
+        static_cast<size_t>(config.acoustic_codebooks));
+}
+
+static bool mm3_ar_prefill(const MM3Model & model, const int32_t * conditional,
+                           const int32_t * unconditional, int64_t prompt_length,
+                           const MM3ArOptions & options, MM3ArWorkspace & workspace,
+                           MM3ArResult * result, std::string * error) {
+    if (mm3_ar_cancelled(options, error)) {
         return false;
     }
-    if (EOS < 0 || EOS >= V || OFF + SV > V) {
-        if (err) {
-            *err = "the LM vocabulary metadata does not cover the semantic range and EOS";
-        }
+    const auto started = std::chrono::steady_clock::now();
+    if (!mm3_lm_prefill(model, &g_mm3_lm, conditional, unconditional,
+                        prompt_length, workspace.hidden.data(),
+                        workspace.logits.data(), error)) {
         return false;
     }
+    result->prefill_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    result->prefill_hidden = workspace.hidden;
+    return true;
+}
 
-    int64_t max_frames = opt.max_frames;
-    if (max_frames <= 0) {
-        if (err) {
-            *err = "max_frames must be positive";
+static bool mm3_ar_collect_candidates(const MM3ArConfig & config,
+                                      MM3ArWorkspace & workspace,
+                                      MM3ArResult * result,
+                                      std::string * error) {
+    if (!tts_cpp::minimax::detail::collect_ar_candidates(
+            workspace.logits.data(), config.vocab, config.eos,
+            config.semantic_offset, config.semantic_vocab, workspace.candidates,
+            result->nonfinite_logits)) {
+        return mm3_ar_fail(error, "the LM candidate layout is invalid");
+    }
+    return true;
+}
+
+static void mm3_ar_apply_cfg_and_top_k(const MM3ArConfig & config,
+                                       MM3ArWorkspace & workspace) {
+    tts_cpp::minimax::detail::guide_ar_candidates(workspace.candidates,
+                                                   config.cfg_scale);
+    tts_cpp::minimax::detail::apply_conditional_top_k(workspace.candidates,
+                                                       config.top_k);
+}
+
+static MM3ArStep mm3_ar_choose_semantic(const MM3ArConfig & config,
+                                        const MM3ArOptions & options,
+                                        int64_t iteration,
+                                        MM3ArWorkspace & workspace,
+                                        MM3ArResult * result, int32_t & semantic,
+                                        std::string * error) {
+    if (config.forced) {
+        semantic = options.forced_semantic[iteration];
+        if (semantic < 0 ||
+            static_cast<int64_t>(semantic) >= config.semantic_vocab) {
+            mm3_ar_fail(error,
+                        "forced semantic code " + std::to_string(semantic) +
+                            " at iteration " + std::to_string(iteration) +
+                            " is outside [0, " +
+                            std::to_string(config.semantic_vocab) + ")");
+            return MM3ArStep::failure;
         }
+        return MM3ArStep::proceed;
+    }
+    const int64_t selected = mm3_sample_top_k(
+        workspace.candidates.guided.data(),
+        static_cast<int64_t>(workspace.candidates.guided.size()), config.top_k,
+        workspace.random, &workspace.sampling_scratch);
+    if (selected == 0) {
+        result->eos_hit = true;
+        return MM3ArStep::stop;
+    }
+    semantic = static_cast<int32_t>(selected - 1);
+    return MM3ArStep::proceed;
+}
+
+static bool mm3_ar_decode_depth(const MM3Model & model,
+                                const MM3ArConfig & config,
+                                const MM3ArOptions & options, int64_t iteration,
+                                int32_t semantic, MM3ArWorkspace & workspace,
+                                MM3ArResult * result, std::string * error) {
+    const int32_t * forced_acoustic =
+        config.forced
+            ? options.forced_acoustic +
+                  iteration * config.acoustic_codebooks
+            : nullptr;
+    if (!mm3_depth_decode_frame(
+            model, workspace.hidden.data(),
+            workspace.hidden.data() + config.hidden, semantic, forced_acoustic,
+            &workspace.frame, error,
+            config.forced ? nullptr : &workspace.random, config.top_k)) {
         return false;
     }
-    if (c.max_audio_frames > 0 && max_frames > (int64_t) c.max_audio_frames) {
-        max_frames = (int64_t) c.max_audio_frames;
-    }
-    const bool forced = opt.forced_semantic != nullptr;
-    if (forced) {
-        if (!opt.forced_acoustic || opt.forced_len <= 0) {
-            if (err) {
-                *err = "forced replay needs both forced_semantic and forced_acoustic, and a positive length";
-            }
-            return false;
-        }
-        if (opt.forced_len - 1 < max_frames) {
-            max_frames = opt.forced_len - 1;
-        }
-        if (max_frames <= 0) {
-            if (err) {
-                *err = "forced replay needs at least 2 iterations (one un-emitted, one emitted)";
-            }
-            return false;
-        }
-    }
-
-    if (!mm3_lm_prepare(m, &g_mm3_lm, n_prompt + max_frames + 2, err)) {
+    if (mm3_ar_cancelled(options, error)) {
         return false;
     }
-
-    *out             = MM3ArResult{};
-    out->hidden_dim  = H;
-    out->n_codebooks = NC + 1;
-    out->sem_vocab   = SV;
-
-    std::vector<float> hidden((size_t) (H * MM3_LM_CFG_ROWS));
-    std::vector<float> logits((size_t) (V * MM3_LM_CFG_ROWS));
-    std::vector<float> feedback((size_t) H);
-
-    const auto t_start = std::chrono::steady_clock::now();
-    {
-        if (mm3_ar_cancelled(opt, err)) {
-            return false;
-        }
-        const auto t0 = std::chrono::steady_clock::now();
-        if (!mm3_lm_prefill(m, &g_mm3_lm, cond_ids, uncond_ids, n_prompt, hidden.data(), logits.data(), err)) {
-            return false;
-        }
-        out->prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    result->depth_ms += workspace.frame.ms;
+    if (workspace.frame.n_codes != config.acoustic_codebooks) {
+        return mm3_ar_fail(
+            error, "the depth decoder returned " +
+                       std::to_string(workspace.frame.n_codes) +
+                       " codes, expected " +
+                       std::to_string(config.acoustic_codebooks));
     }
-    out->prefill_hidden.assign(hidden.begin(), hidden.end());
+    return true;
+}
 
-    const int64_t      NCAND = SV + 1;
-    std::vector<float> cand_cond((size_t) NCAND);
-    std::vector<float> cand_unc((size_t) NCAND);
-    std::vector<float> cand_guided((size_t) NCAND);
-    std::vector<float> sel_scratch;
-    std::vector<float> samp_scratch;
-
-    std::mt19937_64      rng(opt.seed);
-    std::vector<int32_t> ac_rows((size_t) NC);
-    MM3DepthFrame        frame;
-
-    out->semantic_all.reserve((size_t) (max_frames + 1));
-    out->acoustic_all.reserve((size_t) ((max_frames + 1) * NC));
-    if (opt.collect_hiddens) {
-        out->frame_hiddens.reserve((size_t) (max_frames * (NC + 1) * H));
+static void mm3_ar_append_acoustic_codes(const MM3ArConfig & config,
+                                         const MM3DepthFrame & frame,
+                                         MM3ArResult * result) {
+    for (int64_t index = 0; index < config.acoustic_codebooks; ++index) {
+        result->acoustic_all.push_back(frame.codes[index]);
     }
+}
 
-    for (int64_t it = 0; it <= max_frames; it++) {
-        if (mm3_ar_cancelled(opt, err)) {
+static void mm3_ar_record_iteration(const MM3ArConfig & config, int32_t semantic,
+                                    MM3ArWorkspace & workspace,
+                                    MM3ArResult * result) {
+    result->semantic_all.push_back(semantic);
+    mm3_ar_append_acoustic_codes(config, workspace.frame, result);
+    ++result->n_iterations;
+}
+
+static bool mm3_ar_dumping(const MM3ArOptions & options,
+                           const MM3ArResult & result) {
+    return static_cast<int64_t>(result.dumps.size()) < options.dump_iters;
+}
+
+static void mm3_ar_create_dump(const MM3ArConfig & config,
+                               MM3ArWorkspace & workspace,
+                               MM3ArResult * result) {
+    MM3ArDump dump;
+    dump.last_hidden = workspace.hidden;
+    dump.sem_logits.resize(static_cast<size_t>(2 * config.semantic_vocab));
+    memcpy(dump.sem_logits.data(),
+           workspace.logits.data() + config.semantic_offset,
+           static_cast<size_t>(config.semantic_vocab) * sizeof(float));
+    memcpy(dump.sem_logits.data() + config.semantic_vocab,
+           workspace.logits.data() + config.vocab + config.semantic_offset,
+           static_cast<size_t>(config.semantic_vocab) * sizeof(float));
+    dump.guided.assign(workspace.candidates.guided.begin() + 1,
+                       workspace.candidates.guided.end());
+    dump.feedback.assign(static_cast<size_t>(2 * config.hidden), 0.0f);
+    dump.depth_hidden = workspace.frame.hiddens;
+    result->dumps.push_back(std::move(dump));
+}
+
+static void mm3_ar_collect_frame_hiddens(const MM3ArConfig & config,
+                                         const MM3ArWorkspace & workspace,
+                                         MM3ArResult * result) {
+    result->frame_hiddens.insert(result->frame_hiddens.end(),
+                                 workspace.hidden.begin(),
+                                 workspace.hidden.begin() + config.hidden);
+    result->frame_hiddens.insert(result->frame_hiddens.end(),
+                                 workspace.frame.hiddens.begin(),
+                                 workspace.frame.hiddens.end());
+}
+
+static MM3ArStep mm3_ar_emit_frame(const MM3ArConfig & config,
+                                   const MM3ArOptions & options,
+                                   int64_t iteration,
+                                   const MM3ArWorkspace & workspace,
+                                   MM3ArResult * result,
+                                   std::string * error) {
+    if (iteration == 0) {
+        return MM3ArStep::proceed;
+    }
+    if (options.collect_hiddens) {
+        mm3_ar_collect_frame_hiddens(config, workspace, result);
+    }
+    ++result->n_frames;
+    if (options.on_frame) {
+        options.on_frame(result->n_frames, config.max_frames);
+    }
+    if (mm3_ar_cancelled(options, error)) {
+        return MM3ArStep::failure;
+    }
+    return result->n_frames >= config.max_frames ? MM3ArStep::stop
+                                                  : MM3ArStep::proceed;
+}
+
+static bool mm3_ar_decode_feedback(const MM3Model & model,
+                                   const MM3ArConfig & config,
+                                   const MM3ArOptions & options,
+                                   int32_t semantic, bool dumping,
+                                   MM3ArWorkspace & workspace,
+                                   MM3ArResult * result,
+                                   std::string * error) {
+    tts_cpp::minimax::detail::build_acoustic_rows(
+        workspace.frame.codes, config.acoustic_codebooks,
+        config.acoustic_vocab, workspace.acoustic_rows);
+    if (mm3_ar_cancelled(options, error)) {
+        return false;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    if (!mm3_lm_decode(model, &g_mm3_lm,
+                       semantic + static_cast<int32_t>(config.semantic_offset),
+                       workspace.acoustic_rows.data(), workspace.hidden.data(),
+                       workspace.logits.data(), workspace.feedback.data(), error)) {
+        return false;
+    }
+    result->lm_ms += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - started)
+                         .count();
+    ++result->lm_steps;
+    if (dumping) {
+        MM3ArDump & dump = result->dumps.back();
+        memcpy(dump.feedback.data(), workspace.feedback.data(),
+               static_cast<size_t>(config.hidden) * sizeof(float));
+        memcpy(dump.feedback.data() + config.hidden, workspace.feedback.data(),
+               static_cast<size_t>(config.hidden) * sizeof(float));
+    }
+    return true;
+}
+
+static MM3ArStep mm3_ar_run_iteration(const MM3Model & model,
+                                      const MM3ArConfig & config,
+                                      const MM3ArOptions & options,
+                                      int64_t iteration,
+                                      MM3ArWorkspace & workspace,
+                                      MM3ArResult * result,
+                                      std::string * error) {
+    const auto host_started = std::chrono::steady_clock::now();
+    if (!mm3_ar_collect_candidates(config, workspace, result, error)) {
+        return MM3ArStep::failure;
+    }
+    mm3_ar_apply_cfg_and_top_k(config, workspace);
+    int32_t semantic = 0;
+    const MM3ArStep choice = mm3_ar_choose_semantic(
+        config, options, iteration, workspace, result, semantic, error);
+    if (choice == MM3ArStep::failure) {
+        return choice;
+    }
+    result->host_ms += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - host_started)
+                           .count();
+    if (choice == MM3ArStep::stop) {
+        return choice;
+    }
+    if (!mm3_ar_decode_depth(model, config, options, iteration, semantic,
+                             workspace, result, error)) {
+        return MM3ArStep::failure;
+    }
+    mm3_ar_record_iteration(config, semantic, workspace, result);
+    const bool dumping = mm3_ar_dumping(options, *result);
+    if (dumping) {
+        mm3_ar_create_dump(config, workspace, result);
+    }
+    const MM3ArStep emission =
+        mm3_ar_emit_frame(config, options, iteration, workspace, result, error);
+    if (emission != MM3ArStep::proceed) {
+        return emission;
+    }
+    return mm3_ar_decode_feedback(model, config, options, semantic, dumping,
+                                  workspace, result, error)
+               ? MM3ArStep::proceed
+               : MM3ArStep::failure;
+}
+
+static bool mm3_ar_run_iterations(const MM3Model & model,
+                                  const MM3ArConfig & config,
+                                  const MM3ArOptions & options,
+                                  MM3ArWorkspace & workspace,
+                                  MM3ArResult * result,
+                                  std::string * error) {
+    for (int64_t iteration = 0; iteration <= config.max_frames; ++iteration) {
+        if (mm3_ar_cancelled(options, error)) {
             return false;
         }
-        if (forced && it >= opt.forced_len) {
+        if (config.forced && iteration >= options.forced_len) {
             break;
         }
-        const auto t_host0 = std::chrono::steady_clock::now();
-
-        const float * lrow_c = logits.data();
-        const float * lrow_u = logits.data() + V;
-        auto          fix    = [&](float x) -> float {
-            if (std::isnan(x) || (std::isinf(x) && x > 0.0f)) {
-                out->nonfinite_logits++;
-                return -INFINITY;
-            }
-            return x;
-        };
-        cand_cond[0] = fix(lrow_c[EOS]);
-        cand_unc[0]  = fix(lrow_u[EOS]);
-        for (int64_t j = 0; j < SV; j++) {
-            cand_cond[(size_t) (j + 1)] = fix(lrow_c[OFF + j]);
-            cand_unc[(size_t) (j + 1)]  = fix(lrow_u[OFF + j]);
-        }
-
-        for (int64_t i = 0; i < NCAND; i++) {
-            const float u          = cand_unc[(size_t) i];
-            cand_guided[(size_t) i] = u + (cand_cond[(size_t) i] - u) * CFG;
-        }
-        {
-            int64_t k = TOPK < NCAND ? (int64_t) TOPK : NCAND;
-            if (k < 1) {
-                k = 1;
-            }
-            float threshold = -INFINITY;
-            if (k < NCAND) {
-                sel_scratch = cand_cond;
-                std::nth_element(sel_scratch.begin(), sel_scratch.begin() + (size_t) (k - 1), sel_scratch.end(),
-                                 std::greater<float>());
-                threshold = sel_scratch[(size_t) (k - 1)];
-            }
-            for (int64_t i = 0; i < NCAND; i++) {
-
-                if (cand_cond[(size_t) i] < threshold) {
-                    cand_guided[(size_t) i] = -INFINITY;
-                }
-            }
-        }
-
-        int32_t semantic;
-        if (forced) {
-            semantic = opt.forced_semantic[it];
-            if (semantic < 0 || (int64_t) semantic >= SV) {
-                if (err) {
-                    *err = "forced semantic code " + std::to_string(semantic) + " at iteration " +
-                           std::to_string((long long) it) + " is outside [0, " + std::to_string((long long) SV) + ")";
-                }
-                return false;
-            }
-        } else {
-            const int64_t idx = mm3_sample_top_k(cand_guided.data(), NCAND, TOPK, rng, &samp_scratch);
-            if (idx == 0) {
-                out->eos_hit = true;
-                out->host_ms +=
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_host0).count();
-                break;
-            }
-            semantic = (int32_t) (idx - 1);
-        }
-        out->host_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_host0).count();
-
-        const int32_t * forced_ac = forced ? opt.forced_acoustic + it * NC : nullptr;
-        if (!mm3_depth_decode_frame(m, hidden.data(), hidden.data() + H, semantic, forced_ac, &frame, err,
-                                    forced ? nullptr : &rng, TOPK)) {
+        const MM3ArStep step = mm3_ar_run_iteration(
+            model, config, options, iteration, workspace, result, error);
+        if (step == MM3ArStep::failure) {
             return false;
         }
-        if (mm3_ar_cancelled(opt, err)) {
-            return false;
-        }
-        out->depth_ms += frame.ms;
-        if (frame.n_codes != (int) NC) {
-            if (err) {
-                *err = "the depth decoder returned " + std::to_string(frame.n_codes) + " codes, expected " +
-                       std::to_string((long long) NC);
-            }
-            return false;
-        }
-
-        out->semantic_all.push_back(semantic);
-        for (int64_t i = 0; i < NC; i++) {
-            out->acoustic_all.push_back(frame.codes[i]);
-        }
-        out->n_iterations++;
-
-        const bool dumping = (int64_t) out->dumps.size() < opt.dump_iters;
-        if (dumping) {
-            MM3ArDump d;
-            d.last_hidden.assign(hidden.begin(), hidden.end());
-            d.sem_logits.resize((size_t) (2 * SV));
-            memcpy(d.sem_logits.data(), lrow_c + OFF, (size_t) SV * sizeof(float));
-            memcpy(d.sem_logits.data() + SV, lrow_u + OFF, (size_t) SV * sizeof(float));
-            d.guided.assign(cand_guided.begin() + 1, cand_guided.end());
-            d.feedback.assign((size_t) (2 * H), 0.0f);
-            d.depth_hidden = frame.hiddens;
-            out->dumps.push_back(std::move(d));
-        }
-
-        if (it > 0) {
-            if (opt.collect_hiddens) {
-                out->frame_hiddens.insert(out->frame_hiddens.end(), hidden.begin(), hidden.begin() + H);
-                out->frame_hiddens.insert(out->frame_hiddens.end(), frame.hiddens.begin(), frame.hiddens.end());
-            }
-            out->n_frames++;
-            if (opt.on_frame) {
-                opt.on_frame(out->n_frames, max_frames);
-            }
-            if (mm3_ar_cancelled(opt, err)) {
-                return false;
-            }
-            if (out->n_frames >= max_frames) {
-                break;
-            }
-        }
-
-        for (int64_t i = 0; i < NC; i++) {
-            ac_rows[(size_t) i] = frame.codes[i] + (int32_t) (i * AV);
-        }
-        if (mm3_ar_cancelled(opt, err)) {
-            return false;
-        }
-        {
-            const auto t0 = std::chrono::steady_clock::now();
-            if (!mm3_lm_decode(m, &g_mm3_lm, semantic + (int32_t) OFF, ac_rows.data(), hidden.data(), logits.data(),
-                               feedback.data(), err)) {
-                return false;
-            }
-            out->lm_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            out->lm_steps++;
-        }
-        if (dumping) {
-            MM3ArDump & d = out->dumps.back();
-
-            memcpy(d.feedback.data(), feedback.data(), (size_t) H * sizeof(float));
-            memcpy(d.feedback.data() + H, feedback.data(), (size_t) H * sizeof(float));
+        if (step == MM3ArStep::stop) {
+            break;
         }
     }
+    return true;
+}
 
-    out->total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
-
-    if (out->n_frames == 0) {
-        if (err) {
-            *err = out->eos_hit ? "the LM emitted EOS on the first iteration; zero audio frames were generated"
-                                : "zero audio frames were generated";
-        }
-        return false;
-    }
-
+static void mm3_ar_log_result(const MM3ArResult & result) {
     fprintf(stderr,
             "[MM3-AR] %lld frames (%lld iterations%s) in %.0f ms — prefill %.0f, LM %.0f (%lld steps, %.1f ms/step), "
             "depth %.0f (%.1f ms/frame), host %.0f\n",
-            (long long) out->n_frames, (long long) out->n_iterations, out->eos_hit ? ", EOS" : "", out->total_ms,
-            out->prefill_ms, out->lm_ms, (long long) out->lm_steps,
-            out->lm_steps ? out->lm_ms / (double) out->lm_steps : 0.0, out->depth_ms,
-            out->n_iterations ? out->depth_ms / (double) out->n_iterations : 0.0, out->host_ms);
-    if (out->nonfinite_logits) {
-        fprintf(stderr, "[MM3-AR] WARNING: %lld non-finite candidate logits were clamped to -inf\n",
-                (long long) out->nonfinite_logits);
+            static_cast<long long>(result.n_frames),
+            static_cast<long long>(result.n_iterations),
+            result.eos_hit ? ", EOS" : "", result.total_ms, result.prefill_ms,
+            result.lm_ms, static_cast<long long>(result.lm_steps),
+            result.lm_steps ? result.lm_ms / static_cast<double>(result.lm_steps)
+                            : 0.0,
+            result.depth_ms,
+            result.n_iterations
+                ? result.depth_ms / static_cast<double>(result.n_iterations)
+                : 0.0,
+            result.host_ms);
+    if (result.nonfinite_logits) {
+        fprintf(stderr,
+                "[MM3-AR] WARNING: %lld non-finite candidate logits were clamped to -inf\n",
+                static_cast<long long>(result.nonfinite_logits));
     }
+}
+
+static bool mm3_ar_finalize(const std::chrono::steady_clock::time_point & started,
+                            MM3ArResult * result, std::string * error) {
+    result->total_ms = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
+    if (result->n_frames == 0) {
+        return mm3_ar_fail(
+            error, result->eos_hit
+                       ? "the LM emitted EOS on the first iteration; zero audio frames were generated"
+                       : "zero audio frames were generated");
+    }
+    mm3_ar_log_result(*result);
     return true;
+}
+
+static bool mm3_ar_plan(const MM3Model & model, const int32_t * conditional,
+                        const int32_t * unconditional, int64_t prompt_length,
+                        const MM3ArOptions & options, MM3ArResult * result,
+                        std::string * error) {
+    MM3ArConfig config;
+    if (!mm3_ar_resolve_config(model, options, prompt_length, config, error)) {
+        return false;
+    }
+    if (!mm3_lm_prepare(model, &g_mm3_lm, prompt_length + config.max_frames,
+                        error)) {
+        return false;
+    }
+    mm3_ar_initialize_result(config, options, result);
+    MM3ArWorkspace workspace(options.seed);
+    mm3_ar_initialize_workspace(config, workspace);
+    const auto started = std::chrono::steady_clock::now();
+    if (!mm3_ar_prefill(model, conditional, unconditional, prompt_length, options,
+                        workspace, result, error) ||
+        !mm3_ar_run_iterations(model, config, options, workspace, result, error)) {
+        return false;
+    }
+    return mm3_ar_finalize(started, result, error);
 }

@@ -6,6 +6,7 @@
 #include "mm3-model.h"
 #include "mm3-tokenizer.h"
 #include "mm3-vocoder-graph.h"
+#include "mm3-window-orchestrator.h"
 #include "logic.h"
 #include "progress.h"
 
@@ -15,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -81,15 +83,8 @@ static bool mm3_flow_sample_chunk(const MM3Model & m, const float * noise, const
         const float t = timesteps[(size_t) i];
 
         if (overlap > 0) {
-            const float a = 1.0f - (1.0f - 1e-6f) * t;
-            for (int64_t c = 0; c < C; c++) {
-                const float * np = noise + c * L;
-                const float * pl = prev_latent + c * prev_stride;
-                float *       x  = out_latents.data() + c * L;
-                for (int64_t j = 0; j < overlap; j++) {
-                    x[j] = a * np[j] + t * pl[j];
-                }
-            }
+            tts_cpp::minimax::detail::blend_latent_overlap(
+                out_latents.data(), noise, prev_latent, C, L, overlap, prev_stride, t);
         }
 
         const auto t0 = std::chrono::steady_clock::now();
@@ -116,11 +111,9 @@ static bool mm3_flow_sample_chunk(const MM3Model & m, const float * noise, const
         }
         last_ms = ms;
 
-        const float dsigma = sigmas[(size_t) i + 1] - sigmas[(size_t) i];
-        for (int64_t j = 0; j < N; j++) {
-            const float u = pred_u[(size_t) j];
-            const float v = u + cfg_scale * (pred_c[(size_t) j] - u);
-            out_latents[(size_t) j] += dsigma * v;
+        if (!mm3_integrate_flow_step(out_latents, pred_c, pred_u, sigmas,
+                                     static_cast<size_t>(i), cfg_scale, err)) {
+            return false;
         }
 
         if (on_step) {
@@ -136,9 +129,8 @@ static bool mm3_flow_sample_chunk(const MM3Model & m, const float * noise, const
     }
 
     if (overlap > 0) {
-        for (int64_t c = 0; c < C; c++) {
-            memcpy(out_latents.data() + c * L, prev_latent + c * prev_stride, (size_t) overlap * sizeof(float));
-        }
+        tts_cpp::minimax::detail::pin_latent_overlap(
+            out_latents.data(), prev_latent, C, L, overlap, prev_stride);
     }
 
     const double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_all).count();
@@ -219,15 +211,6 @@ struct MM3PipelineDimensions {
     int64_t window_frames = 0;
     int64_t hop_frames = 0;
 };
-
-struct MM3WindowCarry {
-    std::vector<float> latent;
-    std::vector<float> condition;
-    int64_t length = 0;
-};
-
-constexpr int kMm3StereoChannels = 2;
-constexpr size_t kMm3CancellationPollSamples = 4096;
 
 static bool mm3_fail(std::string * error, const std::string & message) {
     if (error) {
@@ -332,42 +315,6 @@ static bool mm3_run_ar_stage(const MM3Model & model, const MM3GenRequest & reque
     return true;
 }
 
-static bool mm3_encode_window_condition(const MM3Model & model, const MM3GenRequest & request,
-                                        const MM3PipelineDimensions & dimensions,
-                                        const MM3ProgressCb & progress, MM3GenResult * result,
-                                        int64_t window, int64_t window_count, int64_t start,
-                                        int64_t frames, std::vector<float> & condition,
-                                        int64_t & latent_length, std::string * error) {
-    if (!mm3_emit_progress(progress, {"cond", window, window_count, 0, 1},
-                           request.should_cancel, error)) {
-        return false;
-    }
-    const auto started = std::chrono::steady_clock::now();
-    const size_t hidden_offset =
-        static_cast<size_t>(start * dimensions.layers * dimensions.hidden);
-    if (!mm3_cond_encode(model, result->ar.frame_hiddens.data() + hidden_offset, frames,
-                         condition, &latent_length, error)) {
-        return false;
-    }
-    result->cond_ms +=
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-    result->window_L.push_back(latent_length);
-    return true;
-}
-
-static int64_t mm3_apply_window_carry(const MM3Model & model, const MM3WindowCarry & carry,
-                                      int64_t latent_length, std::vector<float> & condition) {
-    const int64_t overlap =
-        carry.length > 0 ? std::min<int64_t>(carry.length, latent_length) : 0;
-    if (overlap > 0) {
-        const size_t bytes =
-            static_cast<size_t>(overlap * static_cast<int64_t>(model.synth_cfg.cond.out_dim)) *
-            sizeof(float);
-        memcpy(condition.data(), carry.condition.data(), bytes);
-    }
-    return overlap;
-}
-
 static bool mm3_prepare_window_noise(const MM3GenRequest & request, int64_t window,
                                      int64_t count, std::vector<float> & noise) {
     if (static_cast<int64_t>(request.forced_noise.size()) > window &&
@@ -379,265 +326,10 @@ static bool mm3_prepare_window_noise(const MM3GenRequest & request, int64_t wind
     return false;
 }
 
-static bool mm3_sample_window(const MM3Model & model, const MM3GenRequest & request,
-                              const MM3ProgressCb & progress, const std::vector<float> & noise,
-                              const std::vector<float> & condition, const MM3WindowCarry & carry,
-                              int64_t window, int64_t window_count, int64_t latent_length,
-                              int64_t overlap, std::vector<float> & latents,
-                              MM3GenResult * result, std::string * error) {
-    if (!mm3_emit_progress(progress, {"flow", window, window_count, 0, request.steps},
-                           request.should_cancel, error)) {
-        return false;
-    }
-    const auto on_step = [progress, window, window_count](int step, int total) {
-        if (progress) {
-            progress(MM3GenProgress{"flow", window, window_count, step, total});
-        }
-    };
-    MM3FlowStats stats;
-    if (!mm3_flow_sample_chunk(model, noise.data(), condition.data(), latent_length,
-                               request.steps, request.cfg_flow, overlap,
-                               overlap > 0 ? carry.latent.data() : nullptr, carry.length,
-                               latents, &stats, on_step, request.should_cancel, error)) {
-        return false;
-    }
-    result->flow_ms += stats.total_ms;
-    result->flow_forwards += stats.forwards;
-    result->dit_compute_bytes = stats.compute_bytes;
-    return true;
-}
-
-static void mm3_copy_carry_latents(const std::vector<float> & latents, int64_t channels,
-                                   int64_t latent_length, int64_t carry_start,
-                                   MM3WindowCarry & carry) {
-    for (int64_t channel = 0; channel < channels; ++channel) {
-        memcpy(carry.latent.data() + channel * carry.length,
-               latents.data() + channel * latent_length + carry_start,
-               static_cast<size_t>(carry.length) * sizeof(float));
-    }
-}
-
-static void mm3_update_window_carry(const MM3Model & model,
-                                    const MM3PipelineDimensions & dimensions,
-                                    const std::vector<float> & latents,
-                                    const std::vector<float> & condition,
-                                    int64_t latent_length, MM3WindowCarry & carry) {
-    const int64_t start =
-        std::max<int64_t>(latent_length - MM3_CARRY_SPAN_LATENTS, 0);
-    const int64_t end =
-        std::max<int64_t>(latent_length - MM3_OVERLAP_LATENTS, start);
-    carry.length = end - start;
-    if (carry.length <= 0) {
-        carry.latent.clear();
-        carry.condition.clear();
-        return;
-    }
-    carry.latent.assign(static_cast<size_t>(dimensions.channels * carry.length), 0.0f);
-    mm3_copy_carry_latents(latents, dimensions.channels, latent_length, start, carry);
-    const int64_t condition_dimension = static_cast<int64_t>(model.synth_cfg.cond.out_dim);
-    carry.condition.assign(static_cast<size_t>(carry.length * condition_dimension), 0.0f);
-    memcpy(carry.condition.data(), condition.data() + start * condition_dimension,
-           static_cast<size_t>(carry.length * condition_dimension) * sizeof(float));
-}
-
-static bool mm3_generate_window(const MM3Model & model, const MM3GenRequest & request,
-                                const MM3PipelineDimensions & dimensions,
-                                const MM3ProgressCb & progress, MM3GenResult * result,
-                                const std::vector<int64_t> & starts, int64_t window,
-                                MM3WindowCarry & carry, std::vector<float> & latents,
-                                std::string * error) {
-    const int64_t window_count = static_cast<int64_t>(starts.size());
-    const int64_t start = starts[static_cast<size_t>(window)];
-    const int64_t end = std::min<int64_t>(start + dimensions.window_frames, result->frames);
-    const int64_t frames = end - start;
-    result->chunk_frames.push_back(frames);
-    std::vector<float> condition;
-    int64_t latent_length = 0;
-    if (!mm3_encode_window_condition(model, request, dimensions, progress, result, window,
-                                     window_count, start, frames, condition, latent_length, error)) {
-        return false;
-    }
-    const int64_t overlap =
-        mm3_apply_window_carry(model, carry, latent_length, condition);
-    result->window_overlap.push_back(overlap);
-    std::vector<float> noise;
-    const bool forced = mm3_prepare_window_noise(
-        request, window, dimensions.channels * latent_length, noise);
-    result->forced_noise_used.push_back(forced ? 1 : 0);
-    if (!mm3_sample_window(model, request, progress, noise, condition, carry, window,
-                           window_count, latent_length, overlap, latents, result, error)) {
-        return false;
-    }
-    mm3_update_window_carry(model, dimensions, latents, condition, latent_length, carry);
-    return true;
-}
-
-static bool mm3_generate_windows(const MM3Model & model, const MM3GenRequest & request,
-                                 const MM3PipelineDimensions & dimensions,
-                                 const MM3ProgressCb & progress, MM3GenResult * result,
-                                 const std::vector<int64_t> & starts,
-                                 std::vector<std::vector<float>> & chunk_latents,
-                                 std::string * error) {
-    MM3WindowCarry carry;
-    const int64_t window_count = static_cast<int64_t>(starts.size());
-    chunk_latents.resize(static_cast<size_t>(window_count));
-    for (int64_t window = 0; window < window_count; ++window) {
-        if (!mm3_generate_window(model, request, dimensions, progress, result, starts,
-                                 window, carry, chunk_latents[static_cast<size_t>(window)],
-                                 error)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool mm3_vocode_windows(const MM3Model & model, const MM3GenRequest & request,
-                               const MM3ProgressCb & progress, MM3GenResult * result,
-                               const std::vector<std::vector<float>> & chunk_latents,
-                               std::vector<std::vector<float>> & waveforms,
-                               std::string * error) {
-    const int64_t window_count = static_cast<int64_t>(chunk_latents.size());
-    waveforms.resize(static_cast<size_t>(window_count));
-    const auto started = std::chrono::steady_clock::now();
-    for (int64_t window = 0; window < window_count; ++window) {
-        if (!mm3_emit_progress(progress, {"vocode", window, window_count, 0, 1},
-                               request.should_cancel, error)) {
-            return false;
-        }
-        if (!mm3_vocoder_decode(model, chunk_latents[static_cast<size_t>(window)].data(),
-                                result->window_L[static_cast<size_t>(window)],
-                                waveforms[static_cast<size_t>(window)], error)) {
-            return false;
-        }
-    }
-    result->voc_ms =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-    return true;
-}
-
-static bool mm3_calculate_crop_spans(const MM3GenRequest & request,
-                                     const std::vector<int64_t> & latent_lengths,
-                                     int64_t upsample, std::vector<int64_t> & left,
-                                     std::vector<int64_t> & length, int64_t & total,
-                                     std::string * error) {
-    const int64_t window_count = static_cast<int64_t>(latent_lengths.size());
-    left.resize(static_cast<size_t>(window_count));
-    length.resize(static_cast<size_t>(window_count));
-    total = 0;
-    for (int64_t window = 0; window < window_count; ++window) {
-        if (!mm3_continue_generation(request.should_cancel, error)) {
-            return false;
-        }
-        const auto span = tts_cpp::minimax::detail::crop_span(
-            latent_lengths[static_cast<size_t>(window)], window, window_count, upsample);
-        left[static_cast<size_t>(window)] = span.left;
-        length[static_cast<size_t>(window)] = span.length;
-        total += span.length;
-    }
-    return true;
-}
-
-static void mm3_copy_stereo_window(const std::vector<float> & waveform, int64_t source_length,
-                                   int64_t source_left, int64_t output_length,
-                                   int64_t output_offset, int64_t copy_length,
-                                   std::vector<float> & output) {
-    for (int channel = 0; channel < kMm3StereoChannels; ++channel) {
-        memcpy(output.data() + static_cast<int64_t>(channel) * output_length + output_offset,
-               waveform.data() + static_cast<int64_t>(channel) * source_length + source_left,
-               static_cast<size_t>(copy_length) * sizeof(float));
-    }
-}
-
-static bool mm3_copy_audio_windows(const MM3GenRequest & request,
-                                   const std::vector<int64_t> & latent_lengths,
-                                   const std::vector<std::vector<float>> & waveforms,
-                                   const std::vector<int64_t> & left,
-                                   const std::vector<int64_t> & length, int64_t upsample,
-                                   int64_t total, std::vector<float> & output,
-                                   std::string * error) {
-    int64_t output_offset = 0;
-    const int64_t window_count = static_cast<int64_t>(waveforms.size());
-    for (int64_t window = 0; window < window_count; ++window) {
-        if (!mm3_continue_generation(request.should_cancel, error)) {
-            return false;
-        }
-        const int64_t source_length =
-            latent_lengths[static_cast<size_t>(window)] * upsample;
-        mm3_copy_stereo_window(
-            waveforms[static_cast<size_t>(window)], source_length,
-            left[static_cast<size_t>(window)], total, output_offset,
-            length[static_cast<size_t>(window)], output);
-        output_offset += length[static_cast<size_t>(window)];
-    }
-    return true;
-}
-
-static bool mm3_sanitize_audio(const MM3GenRequest & request, MM3GenResult * result,
-                               std::string * error) {
-    double sum_squared = 0.0;
-    for (size_t index = 0; index < result->audio.size(); ++index) {
-        if (index % kMm3CancellationPollSamples == 0 &&
-            !mm3_continue_generation(request.should_cancel, error)) {
-            return false;
-        }
-        float & value = result->audio[index];
-        if (!std::isfinite(value)) {
-            result->has_nan = true;
-            value = 0.0f;
-            continue;
-        }
-        value = std::max(-1.0f, std::min(1.0f, value));
-        result->peak = std::max(result->peak, std::fabs(value));
-        sum_squared += static_cast<double>(value) * static_cast<double>(value);
-    }
-    result->rms = result->audio.empty()
-                      ? 0.0
-                      : std::sqrt(sum_squared / static_cast<double>(result->audio.size()));
-    return true;
-}
-
-static bool mm3_stitch_audio(const MM3GenRequest & request,
-                             const MM3PipelineDimensions & dimensions,
-                             const MM3ProgressCb & progress,
-                             const std::vector<std::vector<float>> & waveforms,
-                             MM3GenResult * result, std::string * error) {
-    const int64_t window_count = static_cast<int64_t>(waveforms.size());
-    if (!mm3_emit_progress(progress, {"stitch", -1, window_count, 0, 1},
-                           request.should_cancel, error)) {
-        return false;
-    }
-    std::vector<int64_t> left;
-    std::vector<int64_t> length;
-    int64_t total = 0;
-    if (!mm3_calculate_crop_spans(request, result->window_L, dimensions.upsample,
-                                  left, length, total, error)) {
-        return false;
-    }
-    result->audio.assign(
-        static_cast<size_t>(kMm3StereoChannels * total), 0.0f);
-    result->n_samples = total;
-    if (!mm3_copy_audio_windows(request, result->window_L, waveforms, left, length,
-                                dimensions.upsample, total, result->audio, error)) {
-        return false;
-    }
-    return mm3_sanitize_audio(request, result, error);
-}
-
-static bool mm3_finish_generation(const MM3GenRequest & request,
-                                  const MM3ProgressCb & progress,
-                                  const std::chrono::steady_clock::time_point & started,
-                                  std::vector<std::vector<float>> & chunk_latents,
-                                  MM3GenResult * result, std::string * error) {
-    if (request.keep_window_latents) {
-        result->window_latents = std::move(chunk_latents);
-    }
+static bool mm3_finish_generation(
+    const std::chrono::steady_clock::time_point & started, MM3GenResult * result) {
     result->total_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-    if (!mm3_emit_progress(progress,
-                           {"done", -1, result->n_windows, result->n_windows, result->n_windows},
-                           request.should_cancel, error)) {
-        return false;
-    }
     fprintf(stderr,
             "[MM3-Pipe] %lld frames -> %lld window(s) -> %lld samples/ch (%.2fs @ %d Hz) | "
             "AR %.0f ms, cond %.0f ms, flow %.0f ms, voc %.0f ms, total %.0f ms\n",
@@ -649,6 +341,122 @@ static bool mm3_finish_generation(const MM3GenRequest & request,
             result->sample_rate, result->ar_ms, result->cond_ms, result->flow_ms,
             result->voc_ms, result->total_ms);
     return true;
+}
+
+static MM3WindowDimensions mm3_window_dimensions(
+    const MM3Model & model, const MM3GenRequest & request,
+    const MM3PipelineDimensions & dimensions) {
+    MM3WindowDimensions window;
+    window.latent_channels = dimensions.channels;
+    window.audio_channels = static_cast<int64_t>(model.synth_cfg.voc.channels);
+    window.condition_dimension =
+        static_cast<int64_t>(model.synth_cfg.cond.out_dim);
+    window.upsample = dimensions.upsample;
+    window.window_frames = dimensions.window_frames;
+    window.hop_frames = dimensions.hop_frames;
+    window.carry_span = MM3_CARRY_SPAN_LATENTS;
+    window.overlap = MM3_OVERLAP_LATENTS;
+    window.crop_left = MM3_CROP_LEFT_LATENTS;
+    window.crop_right = MM3_CROP_RIGHT_LATENTS;
+    window.flow_steps = request.steps;
+    return window;
+}
+
+static MM3WindowOperations mm3_window_operations(
+    const MM3Model & model, const MM3GenRequest & request,
+    const MM3ProgressCb & progress, MM3GenResult * result) {
+    MM3WindowOperations operations;
+    operations.progress =
+        [&request, &progress](const std::string & stage, int64_t window,
+                             int64_t window_count, int64_t current, int64_t total,
+                             std::string * error) {
+            const MM3GenProgress state{
+                stage.c_str(), window, window_count, current, total};
+            return mm3_emit_progress(progress, state, request.should_cancel, error);
+        };
+    operations.continue_generation =
+        [&request](std::string * error) {
+            return mm3_continue_generation(request.should_cancel, error);
+        };
+    operations.condition =
+        [&model, result](int64_t, int64_t, int64_t start, int64_t frames,
+                         std::vector<float> & condition, int64_t & latent_length,
+                         std::string * error) {
+            const auto started = std::chrono::steady_clock::now();
+            const int64_t layers = static_cast<int64_t>(model.lm_cfg.num_codebooks);
+            const int64_t hidden =
+                static_cast<int64_t>(model.lm_cfg.embedding_length);
+            const size_t offset = static_cast<size_t>(start * layers * hidden);
+            if (!mm3_cond_encode(model, result->ar.frame_hiddens.data() + offset,
+                                 frames, condition, &latent_length, error)) {
+                return false;
+            }
+            result->cond_ms += std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - started)
+                                   .count();
+            return true;
+        };
+    operations.noise =
+        [&request](int64_t window, int64_t count, std::vector<float> & noise) {
+            return mm3_prepare_window_noise(request, window, count, noise);
+        };
+    operations.flow =
+        [&model, &request, result](
+            int64_t, int64_t, int64_t latent_length,
+            const std::vector<float> & noise,
+            const std::vector<float> & carry_latents, int64_t carry_length,
+            const std::vector<float> & condition, std::vector<float> & latents,
+            const std::function<void(int64_t, int64_t)> & on_step,
+            std::string * error) {
+            MM3FlowStats stats;
+            const auto step = [&on_step](int current, int total) {
+                on_step(current, total);
+            };
+            const float * previous =
+                carry_length > 0 ? carry_latents.data() : nullptr;
+            if (!mm3_flow_sample_chunk(
+                    model, noise.data(), condition.data(), latent_length, request.steps,
+                    request.cfg_flow, std::min(carry_length, latent_length), previous,
+                    carry_length, latents, &stats, step, request.should_cancel, error)) {
+                return false;
+            }
+            result->flow_ms += stats.total_ms;
+            result->flow_forwards += stats.forwards;
+            result->dit_compute_bytes = stats.compute_bytes;
+            return true;
+        };
+    operations.vocoder =
+        [&model, result](int64_t, int64_t, const std::vector<float> & latents,
+                         int64_t latent_length, std::vector<float> & waveform,
+                         std::string * error) {
+            const auto started = std::chrono::steady_clock::now();
+            if (!mm3_vocoder_decode(model, latents, latent_length, waveform, error)) {
+                return false;
+            }
+            result->voc_ms += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - started)
+                                  .count();
+            return true;
+        };
+    return operations;
+}
+
+static void mm3_apply_window_orchestration(
+    const MM3GenRequest & request, MM3WindowOrchestration & orchestration,
+    MM3GenResult * result) {
+    result->chunk_starts = orchestration.starts;
+    result->chunk_frames = orchestration.frame_lengths;
+    result->window_L = orchestration.latent_lengths;
+    result->window_overlap = orchestration.overlaps;
+    result->forced_noise_used = orchestration.forced_noise;
+    result->n_windows = static_cast<int64_t>(orchestration.starts.size());
+    result->n_samples = orchestration.samples_per_channel;
+    result->audio = std::move(orchestration.audio);
+    result->peak = orchestration.metrics.peak;
+    result->rms = orchestration.metrics.rms;
+    if (request.keep_window_latents) {
+        result->window_latents = std::move(orchestration.latents);
+    }
 }
 
 static bool mm3_generate(const MM3Model & model, const MM3GenRequest & request,
@@ -667,21 +475,14 @@ static bool mm3_generate(const MM3Model & model, const MM3GenRequest & request,
                           progress, result, error)) {
         return false;
     }
-    result->chunk_starts = tts_cpp::minimax::detail::window_starts(
-        result->frames, dimensions.window_frames, dimensions.hop_frames);
-    result->n_windows = static_cast<int64_t>(result->chunk_starts.size());
-    std::vector<std::vector<float>> chunk_latents;
-    if (!mm3_generate_windows(model, request, dimensions, progress, result,
-                              result->chunk_starts, chunk_latents, error)) {
+    MM3WindowOrchestration orchestration;
+    const auto window_dimensions = mm3_window_dimensions(model, request, dimensions);
+    const auto operations =
+        mm3_window_operations(model, request, progress, result);
+    if (!mm3_orchestrate_windows(result->frames, window_dimensions, operations,
+                                 &orchestration, error)) {
         return false;
     }
-    std::vector<std::vector<float>> waveforms;
-    if (!mm3_vocode_windows(model, request, progress, result, chunk_latents,
-                            waveforms, error)) {
-        return false;
-    }
-    if (!mm3_stitch_audio(request, dimensions, progress, waveforms, result, error)) {
-        return false;
-    }
-    return mm3_finish_generation(request, progress, started, chunk_latents, result, error);
+    mm3_apply_window_orchestration(request, orchestration, result);
+    return mm3_finish_generation(started, result);
 }

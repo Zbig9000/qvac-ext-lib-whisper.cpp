@@ -2,6 +2,7 @@
 
 #include "backend.h"
 #include "gguf-weights.h"
+#include "logic.h"
 #include "weight-ctx.h"
 
 #include <chrono>
@@ -47,6 +48,16 @@ struct MM3LmConfig {
     uint32_t tok_lyrics_start  = 0;
     uint32_t tok_lyrics_end    = 0;
 };
+
+static bool mm3_lm_positions_fit(int64_t context_length, int64_t prompt_positions, int64_t generated_positions) {
+    if (context_length <= 0 || prompt_positions < 0 || generated_positions < 0) {
+        return false;
+    }
+    if (prompt_positions > context_length) {
+        return false;
+    }
+    return generated_positions <= context_length - prompt_positions;
+}
 
 struct MM3DepthConfig {
     uint32_t block_count         = 0;
@@ -516,6 +527,7 @@ static void mm3_validate_lm_config(const MM3LmConfig & c, std::vector<std::strin
         }
     };
     need(c.block_count > 0, "qwen3.block_count is 0 or missing");
+    need(c.context_length > 0, "qwen3.context_length is 0 or missing");
     need(c.embedding_length > 0, "qwen3.embedding_length is 0 or missing");
     need(c.vocab_size > 0, "qwen3.vocab_size is 0 or missing");
     need(c.head_count > 0 && c.head_count_kv > 0, "head counts are 0 or missing");
@@ -528,8 +540,22 @@ static void mm3_validate_lm_config(const MM3LmConfig & c, std::vector<std::strin
     need(c.frame_rate > 0, "mm3.frame_rate is 0 or missing");
     need(c.max_audio_frames > 0, "mm3.max_audio_frames is 0 or missing");
     need(c.max_prompt_tokens > 0, "mm3.max_prompt_tokens is 0 or missing");
+    need(c.max_prompt_tokens <= c.context_length,
+         "mm3.max_prompt_tokens exceeds qwen3.context_length");
+    need(c.max_audio_frames <= c.context_length,
+         "mm3.max_audio_frames exceeds qwen3.context_length");
     need(c.head_count * c.key_length == c.embedding_length,
          "head_count * key_length != embedding_length");
+}
+
+static void mm3_append_synth_contract_errors(const std::vector<std::string> & source,
+                                             std::vector<std::string> * errors) {
+    for (const std::string & error : source) {
+        if (errors->size() >= 24) {
+            return;
+        }
+        errors->push_back("synth config: " + error);
+    }
 }
 
 static void mm3_validate_synth_config(const MM3SynthConfig & c, std::vector<std::string> * errs) {
@@ -560,12 +586,28 @@ static void mm3_validate_synth_config(const MM3SynthConfig & c, std::vector<std:
          "dit latent window metadata is 0 or missing");
     need(c.flow.steps > 0 && c.flow.cfg_scale > 0.0f, "flow defaults are 0 or missing");
     need(c.voc.upsample_rates.size() == 4, "mm3.voc.upsample_rates is not 4 entries");
+    const std::string upsample_error =
+        tts_cpp::minimax::detail::vocoder_upsample_error(c.voc.upsample_rates, c.voc.total_upsample);
+    need(upsample_error.empty(), upsample_error.c_str());
     need(c.voc.res_dilations.size() == 3, "mm3.voc.res_dilations is not 3 entries");
     need(c.voc.hidden_dim > 0 && c.voc.dec_in_dim > 0, "voc dims are 0 or missing");
     need(c.voc.sampling_rate > 0, "vocoder sampling rate is 0 or missing");
     need(c.voc.channels == 2, "vocoder channels must be 2");
     need(c.voc.latent_channels == c.voc.fold_channels * 2,
          "voc latent_channels != 2 * fold_channels (stereo fold)");
+    const tts_cpp::minimax::detail::SynthesisContract contract{
+        c.flow.scheduler,
+        c.flow.invert_sigmas,
+        c.flow.shift,
+        c.flow.num_train_timesteps,
+        c.dit.rope_type,
+        c.dit.glu_order,
+        c.dit.timestep_token_prepended,
+        c.dit.pre_post_conv_residual,
+        c.dit.attn_bias,
+    };
+    mm3_append_synth_contract_errors(
+        tts_cpp::minimax::detail::validate_synthesis_contract(contract), errs);
 }
 
 static void mm3_probe_file(const std::string & path, MM3FileInfo * fi, MM3LmConfig * lm_cfg,
@@ -866,7 +908,7 @@ static bool mm3_load_synth_tensors(MM3Model * m, const GGUFModel & gf, std::vect
 }
 
 static void mm3_unload(MM3Model * m) {
-    if (!m->loaded && !m->wctx_lm.ctx && !m->wctx_synth.ctx) {
+    if (!m->loaded && !m->wctx_lm.ctx && !m->wctx_synth.ctx && !m->backend_ref) {
         return;
     }
     wctx_free(&m->wctx_lm);

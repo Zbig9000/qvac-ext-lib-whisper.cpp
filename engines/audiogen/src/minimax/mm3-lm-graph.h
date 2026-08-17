@@ -310,9 +310,14 @@ static bool mm3_lm_build_slot(const MM3Model & m, MM3LmGraph * g, MM3LmSlot * s,
     return true;
 }
 
-static int64_t mm3_lm_bucket(int64_t n) {
-    const int64_t b = MM3_LM_KV_BUCKET;
-    return ((n + b - 1) / b) * b;
+static bool mm3_lm_bucket_for_context(int64_t positions, int64_t context_length, int64_t * bucket) {
+    if (!bucket || positions <= 0 || context_length <= 0 || positions > context_length) {
+        return false;
+    }
+    const int64_t remainder = positions % MM3_LM_KV_BUCKET;
+    const int64_t padding   = remainder == 0 ? 0 : MM3_LM_KV_BUCKET - remainder;
+    *bucket = padding <= context_length - positions ? positions + padding : context_length;
+    return true;
 }
 
 static bool mm3_lm_prepare(const MM3Model & m, MM3LmGraph * g, int64_t n_ctx_needed, std::string * err) {
@@ -341,6 +346,13 @@ static bool mm3_lm_prepare(const MM3Model & m, MM3LmGraph * g, int64_t n_ctx_nee
         }
         return false;
     }
+    int64_t want = 0;
+    if (!mm3_lm_bucket_for_context(n_ctx_needed, c.context_length, &want)) {
+        if (err) {
+            *err = "requested LM KV positions exceed qwen3.context_length";
+        }
+        return false;
+    }
 
     const void * lt = (const void *) m.wctx_lm.buffer;
     const void * st = (const void *) m.wctx_synth.buffer;
@@ -361,7 +373,6 @@ static bool mm3_lm_prepare(const MM3Model & m, MM3LmGraph * g, int64_t n_ctx_nee
         g->synth_token     = st;
     }
 
-    const int64_t want = mm3_lm_bucket(n_ctx_needed);
     if (g->n_ctx >= want) {
         return true;
     }
@@ -471,7 +482,13 @@ static bool mm3_lm_prefill(const MM3Model & m, MM3LmGraph * g, const int32_t * i
         return false;
     }
 
-    const int64_t n_kv_pad = std::min<int64_t>(mm3_lm_bucket(n_prompt), g->n_ctx);
+    int64_t n_kv_pad = 0;
+    if (!mm3_lm_bucket_for_context(n_prompt, g->n_ctx, &n_kv_pad)) {
+        if (err) {
+            *err = "prompt positions cannot be represented by the KV cache";
+        }
+        return false;
+    }
     if (!g->prefill.graph || g->prefill.T != n_prompt || g->prefill.n_kv_pad != n_kv_pad) {
         mm3_lm_free_slot(&g->prefill);
         if (!g->prefill.sched) {
@@ -509,14 +526,21 @@ static bool mm3_lm_decode(const MM3Model & m, MM3LmGraph * g, int32_t sem_token_
     const MM3LmConfig & c  = m.lm_cfg;
     const int64_t       NC = (int64_t) c.num_codebooks - 1;
 
-    if (g->kv_pos + 1 > g->n_ctx) {
+    if (!mm3_lm_positions_fit(g->n_ctx, g->kv_pos, 1)) {
         if (err) {
             *err = "the KV cache is full at " + std::to_string((long long) g->n_ctx) + " positions";
         }
         return false;
     }
 
-    const int64_t n_kv_pad = std::min<int64_t>(mm3_lm_bucket(g->kv_pos + 1), g->n_ctx);
+    const int64_t next_position = g->kv_pos + 1;
+    int64_t       n_kv_pad      = 0;
+    if (!mm3_lm_bucket_for_context(next_position, g->n_ctx, &n_kv_pad)) {
+        if (err) {
+            *err = "decode positions cannot be represented by the KV cache";
+        }
+        return false;
+    }
     if (!g->decode.graph || g->decode.n_kv_pad != n_kv_pad) {
         mm3_lm_free_slot(&g->decode);
         if (!g->decode.sched) {

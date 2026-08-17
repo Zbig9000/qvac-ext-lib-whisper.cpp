@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -67,6 +68,45 @@ static bool mm3_voc_readback(const ggml_tensor * t, std::vector<float> * out, st
     }
     out->resize((size_t) ggml_nelements(t));
     ggml_backend_tensor_get((ggml_tensor *) t, out->data(), 0, ggml_nbytes(t));
+    return true;
+}
+
+static bool mm3_voc_expected_length(int64_t frames, int64_t upsample, int64_t * length,
+                                    std::string * error) {
+    if (!length || frames <= 0 || upsample <= 0 ||
+        frames > std::numeric_limits<int64_t>::max() / upsample) {
+        if (error) {
+            *error = "vocoder output length is invalid or overflows int64";
+        }
+        return false;
+    }
+    *length = frames * upsample;
+    return true;
+}
+
+static bool mm3_voc_validate_output(const ggml_tensor * output, int64_t expected_length,
+                                    std::string * error) {
+    if (!output) {
+        if (error) {
+            *error = "vocoder output tensor is missing";
+        }
+        return false;
+    }
+    if (output->type != GGML_TYPE_F32) {
+        if (error) {
+            *error = "vocoder output tensor must be F32";
+        }
+        return false;
+    }
+    const std::string shape_error = tts_cpp::minimax::detail::vocoder_output_shape_error(
+        output->ne[0], output->ne[1], output->ne[2], output->ne[3],
+        ggml_nelements(output), ggml_nbytes(output), expected_length);
+    if (!shape_error.empty()) {
+        if (error) {
+            *error = shape_error;
+        }
+        return false;
+    }
     return true;
 }
 
@@ -392,10 +432,21 @@ static bool mm3_voc_ensure_graph(const MM3Model & m, MM3VocGraph * g, int64_t L,
 
 static bool mm3_voc_run(const MM3Model & m, MM3VocGraph * g, const float * src, int64_t L, float * dst,
                         std::string * err) {
+    if (!src || !dst) {
+        if (err) {
+            *err = "vocoder source and destination buffers must not be null";
+        }
+        return false;
+    }
     if (!mm3_voc_ensure_graph(m, g, L, err)) {
         return false;
     }
-    (void) L;
+    int64_t expected_length = 0;
+    if (!mm3_voc_expected_length(L, static_cast<int64_t>(m.synth_cfg.voc.total_upsample),
+                                 &expected_length, err) ||
+        !mm3_voc_validate_output(g->output, expected_length, err)) {
+        return false;
+    }
     ggml_backend_tensor_set(g->input, src, 0, ggml_nbytes(g->input));
     if (ggml_backend_sched_graph_compute(g->sched, g->graph) != GGML_STATUS_SUCCESS) {
         if (err) {
@@ -403,13 +454,13 @@ static bool mm3_voc_run(const MM3Model & m, MM3VocGraph * g, const float * src, 
         }
         return false;
     }
-    ggml_backend_tensor_get(g->output, dst, 0, (size_t) g->output->ne[0] * sizeof(float));
+    ggml_backend_tensor_get(g->output, dst, 0, ggml_nbytes(g->output));
     return true;
 }
 
 static MM3VocGraph g_mm3_voc;
 
-static bool mm3_vocoder_decode(const MM3Model & m, const float * latents, int64_t L,
+static bool mm3_vocoder_decode(const MM3Model & m, const std::vector<float> & latents, int64_t L,
                                std::vector<float> & out_stereo, std::string * err = nullptr) {
     if (L <= 0) {
         if (err) {
@@ -424,14 +475,31 @@ static bool mm3_vocoder_decode(const MM3Model & m, const float * latents, int64_
     const MM3VocConfig & vc  = m.synth_cfg.voc;
     const int64_t        up  = (int64_t) vc.total_upsample;
     const int64_t        FC  = (int64_t) vc.fold_channels;
-    const int64_t        T   = L * up;
+    int64_t T = 0;
+    const uint64_t fold_channels = FC > 0 ? static_cast<uint64_t>(FC) : 0;
+    const uint64_t latent_elements =
+        fold_channels > 0 && static_cast<uint64_t>(L) <=
+                                 static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
+                                     (2 * fold_channels)
+            ? static_cast<uint64_t>(L) * 2 * fold_channels
+            : 0;
+    if (!mm3_voc_expected_length(L, up, &T, err) ||
+        latent_elements == 0 || latents.size() != static_cast<size_t>(latent_elements) ||
+        static_cast<uint64_t>(T) >
+            static_cast<uint64_t>(std::numeric_limits<size_t>::max() / 2)) {
+        if (err && err->empty()) {
+            *err = "vocoder latent or waveform buffer size is invalid";
+        }
+        return false;
+    }
     out_stereo.assign((size_t) (2 * T), 0.0f);
 
     MM3VocGraph * g = &g_mm3_voc;
 
     if (L <= MM3_VOC_CHUNK) {
         for (int ch = 0; ch < 2; ch++) {
-            if (!mm3_voc_run(m, g, latents + (size_t) (ch * FC * L), L, out_stereo.data() + (size_t) (ch * T),
+            if (!mm3_voc_run(m, g, latents.data() + (size_t) (ch * FC * L), L,
+                             out_stereo.data() + (size_t) (ch * T),
                              err)) {
                 return false;
             }
@@ -453,15 +521,36 @@ static bool mm3_vocoder_decode(const MM3Model & m, const float * latents, int64_
         tile.resize((size_t) (wl * up));
         for (int ch = 0; ch < 2; ch++) {
             for (int64_t c = 0; c < FC; c++) {
-                memcpy(win.data() + (size_t) (c * wl), latents + (size_t) ((ch * FC + c) * L + ws),
+                const int64_t source_offset = (ch * FC + c) * L + ws;
+                const int64_t destination_offset = c * wl;
+                if (!tts_cpp::minimax::detail::copy_range_fits(
+                        latents.size(), win.size(), source_offset, destination_offset, wl)) {
+                    if (err) {
+                        *err = "vocoder latent window copy range is invalid";
+                    }
+                    return false;
+                }
+                memcpy(win.data() + (size_t) destination_offset,
+                       latents.data() + (size_t) source_offset,
                        (size_t) wl * sizeof(float));
             }
             if (!mm3_voc_run(m, g, win.data(), wl, tile.data(), err)) {
                 return false;
             }
 
-            memcpy(out_stereo.data() + (size_t) (ch * T + cs * up), tile.data() + (size_t) ((cs - ws) * up),
-                   (size_t) ((ce - cs) * up) * sizeof(float));
+            const int64_t source_offset = (cs - ws) * up;
+            const int64_t destination_offset = ch * T + cs * up;
+            const int64_t copy_length = (ce - cs) * up;
+            if (!tts_cpp::minimax::detail::copy_range_fits(
+                    tile.size(), out_stereo.size(), source_offset, destination_offset, copy_length)) {
+                if (err) {
+                    *err = "vocoder waveform tile copy range is invalid";
+                }
+                return false;
+            }
+            memcpy(out_stereo.data() + (size_t) destination_offset,
+                   tile.data() + (size_t) source_offset,
+                   (size_t) copy_length * sizeof(float));
         }
     }
     return true;

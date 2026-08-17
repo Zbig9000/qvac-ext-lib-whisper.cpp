@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -60,14 +61,8 @@ bool all_samples_are_finite(const std::vector<float> & pcm) {
     });
 }
 
-void verify_success(tts_cpp::minimax::Engine & engine) {
-    StageLog stages;
-    const auto result = engine.generate(
-        make_generate_params(),
-        [&stages](const std::string & stage, int64_t current, int64_t total) {
-            return stages.record(stage, current, total);
-        });
-
+void verify_result(tts_cpp::minimax::Engine & engine,
+                   const tts_cpp::minimax::GenerateResult & result) {
     CHECK(!result.pcm.empty());
     CHECK(result.sample_rate == engine.sample_rate());
     CHECK(result.sample_rate > 0);
@@ -76,12 +71,41 @@ void verify_success(tts_cpp::minimax::Engine & engine) {
     CHECK(result.emitted_frames == 1);
     CHECK(result.total_ms > 0.0);
     CHECK(all_samples_are_finite(result.pcm));
+}
+
+void verify_recursive_generation(tts_cpp::minimax::Engine & engine) {
+    StageLog stages;
+    bool attempted = false;
+    bool rejected = false;
+    std::string rejection;
+    const auto outer = engine.generate(
+        make_generate_params(),
+        [&engine, &stages, &attempted, &rejected, &rejection](
+            const std::string & stage, int64_t current, int64_t total) {
+            stages.record(stage, current, total);
+            if (!attempted) {
+                attempted = true;
+                try {
+                    engine.generate(make_generate_params());
+                } catch (const std::logic_error & error) {
+                    rejected = true;
+                    rejection = error.what();
+                }
+            }
+            return true;
+        });
+    CHECK(attempted);
+    CHECK(rejected);
+    CHECK(rejection == "minimax engine: recursive generate() is not allowed");
+    verify_result(engine, outer);
     CHECK(stages.contains("ar"));
     CHECK(stages.contains("cond"));
     CHECK(stages.contains("flow"));
     CHECK(stages.contains("vocode"));
     CHECK(stages.contains("stitch"));
     CHECK(stages.contains("done"));
+    const auto subsequent = engine.generate(make_generate_params());
+    verify_result(engine, subsequent);
 }
 
 void verify_cancellation(tts_cpp::minimax::Engine & engine) {
@@ -102,7 +126,7 @@ int run_integration(const char * models_dir) {
         std::unique_ptr<tts_cpp::minimax::Engine> engine =
             tts_cpp::minimax::Engine::create(make_engine_options(models_dir));
         CHECK(engine->backend_name() == "CPU");
-        verify_success(*engine);
+        verify_recursive_generation(*engine);
         verify_cancellation(*engine);
     } catch (const std::exception & error) {
         std::fprintf(stderr, "FAIL integration exception: %s\n", error.what());

@@ -30,6 +30,17 @@ struct GGUFModel {
 #endif
 };
 
+static bool gf_tensor_range_fits(size_t file_size, size_t data_offset, size_t tensor_offset, size_t tensor_size) {
+    if (data_offset > file_size) {
+        return false;
+    }
+    const size_t data_size = file_size - data_offset;
+    if (tensor_offset > data_size) {
+        return false;
+    }
+    return tensor_size <= data_size - tensor_offset;
+}
+
 static void gf_close(GGUFModel * gf) {
     if (gf->gguf) {
         gguf_free(gf->gguf);
@@ -119,13 +130,12 @@ static bool gf_load(GGUFModel * gf, const char * path) {
         struct ggml_tensor * t     = ggml_get_tensor(gf->meta, tname);
         size_t               toff  = gguf_get_tensor_offset(gf->gguf, i);
         size_t               tsize = ggml_nbytes(t);
-        size_t               end   = gf->data_offset + toff + tsize;
-        if (end > gf->file_size) {
+        if (!gf_tensor_range_fits(gf->file_size, gf->data_offset, toff, tsize)) {
             fprintf(stderr,
                     "[GGUF] FATAL: '%s' is truncated or corrupt.\n"
-                    "       tensor '%s' needs bytes [%zu..%zu) but file is only %zu bytes.\n"
+                    "       tensor '%s' does not fit at data offset %zu, tensor offset %zu, size %zu in %zu bytes.\n"
                     "       Re-download the file and verify its size or checksum.\n",
-                    path, tname, gf->data_offset + toff, end, gf->file_size);
+                    path, tname, gf->data_offset, toff, tsize, gf->file_size);
             gf_close(gf);
             return false;
         }
@@ -319,7 +329,7 @@ static struct ggml_tensor * gf_load_pair_fused(WeightCtx *         wctx,
 
 static uint32_t gf_get_u32(const GGUFModel & gf, const char * key) {
     int64_t idx = gguf_find_key(gf.gguf, key);
-    if (idx < 0) {
+    if (idx < 0 || gguf_get_kv_type(gf.gguf, idx) != GGUF_TYPE_UINT32) {
         return 0;
     }
     return gguf_get_val_u32(gf.gguf, idx);
@@ -327,7 +337,7 @@ static uint32_t gf_get_u32(const GGUFModel & gf, const char * key) {
 
 static float gf_get_f32(const GGUFModel & gf, const char * key) {
     int64_t idx = gguf_find_key(gf.gguf, key);
-    if (idx < 0) {
+    if (idx < 0 || gguf_get_kv_type(gf.gguf, idx) != GGUF_TYPE_FLOAT32) {
         return 0.0f;
     }
     return gguf_get_val_f32(gf.gguf, idx);
@@ -335,7 +345,7 @@ static float gf_get_f32(const GGUFModel & gf, const char * key) {
 
 static const char * gf_get_str(const GGUFModel & gf, const char * key) {
     int64_t idx = gguf_find_key(gf.gguf, key);
-    if (idx < 0) {
+    if (idx < 0 || gguf_get_kv_type(gf.gguf, idx) != GGUF_TYPE_STRING) {
         return "";
     }
     return gguf_get_val_str(gf.gguf, idx);
@@ -343,7 +353,7 @@ static const char * gf_get_str(const GGUFModel & gf, const char * key) {
 
 static bool gf_get_bool(const GGUFModel & gf, const char * key) {
     int64_t idx = gguf_find_key(gf.gguf, key);
-    if (idx < 0) {
+    if (idx < 0 || gguf_get_kv_type(gf.gguf, idx) != GGUF_TYPE_BOOL) {
         return false;
     }
     return gguf_get_val_bool(gf.gguf, idx);

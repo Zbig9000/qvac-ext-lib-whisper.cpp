@@ -56,6 +56,15 @@ class ConverterTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def assert_clean(self, transaction_id, finals):
+        for index, final in enumerate(finals):
+            self.assertFalse(pathlib.Path(
+                converter.temporary_output_path(str(final), transaction_id, index)
+            ).exists())
+            self.assertFalse(pathlib.Path(
+                converter.backup_output_path(str(final), transaction_id, index)
+            ).exists())
+
     def test_tokenizer(self):
         with self.assertRaises(SystemExit):
             converter.require_tokenizer(None)
@@ -131,8 +140,65 @@ class ConverterTests(unittest.TestCase):
                 transaction.commit()
         finally:
             converter.os.replace = original_replace
+        transaction.cleanup()
+        transaction.cleanup()
         self.assertEqual(lm.read_text(encoding="utf-8"), "old-lm")
         self.assertEqual(synth.read_text(encoding="utf-8"), "old-synth")
+        self.assert_clean("publish-failure", [lm, synth])
+
+    def test_restore_error(self):
+        lm = self.root / "mm3-lm-f16.gguf"
+        synth = self.root / "mm3-synth-f16.gguf"
+        lm.write_text("old-lm", encoding="utf-8")
+        synth.write_text("old-synth", encoding="utf-8")
+        transaction = converter.OutputTransaction("restore-failure")
+        transaction.write(FakeBundle("new-lm"), str(lm), "f16", "lm")
+        transaction.write(FakeBundle("new-synth"), str(synth), "f16", "synth")
+        original_replace = converter.os.replace
+
+        def fail_restore(source, destination):
+            if source.endswith(".tmp-restore-failure-1"):
+                raise ValueError("publish failed")
+            if source.endswith(".backup-restore-failure-1"):
+                raise OSError("restore failed")
+            original_replace(source, destination)
+
+        converter.os.replace = fail_restore
+        try:
+            with self.assertRaises(RuntimeError) as raised:
+                try:
+                    transaction.commit()
+                finally:
+                    transaction.cleanup()
+                    transaction.cleanup()
+        finally:
+            converter.os.replace = original_replace
+
+        lm_backup = pathlib.Path(
+            converter.backup_output_path(str(lm), "restore-failure", 0)
+        )
+        synth_backup = pathlib.Path(
+            converter.backup_output_path(str(synth), "restore-failure", 1)
+        )
+        expected = (
+            f"output rollback failed: backup={str(synth_backup)!r}, "
+            f"destination={str(synth)!r}, error=OSError: restore failed; "
+            "original remains at backup"
+        )
+        self.assertEqual(str(raised.exception), expected)
+        self.assertIsInstance(raised.exception.__cause__, ValueError)
+        self.assertEqual(str(raised.exception.__cause__), "publish failed")
+        self.assertEqual(lm.read_text(encoding="utf-8"), "old-lm")
+        self.assertFalse(synth.exists())
+        self.assertFalse(lm_backup.exists())
+        self.assertEqual(synth_backup.read_text(encoding="utf-8"), "old-synth")
+        self.assertEqual(transaction.restored_backups, {str(lm_backup)})
+        self.assertFalse(pathlib.Path(
+            converter.temporary_output_path(str(lm), "restore-failure", 0)
+        ).exists())
+        self.assertFalse(pathlib.Path(
+            converter.temporary_output_path(str(synth), "restore-failure", 1)
+        ).exists())
 
 
 if __name__ == "__main__":

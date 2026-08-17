@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cmath>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <stdexcept>
 
@@ -55,6 +56,26 @@ void add_error(bool condition, const std::string & message, std::vector<std::str
     if (!condition) {
         errors.push_back(message);
     }
+}
+
+bool find_nonfinite_sample(const std::vector<float> & audio, size_t & index) {
+    for (size_t current = 0; current < audio.size(); ++current) {
+        if (!std::isfinite(audio[current])) {
+            index = current;
+            return true;
+        }
+    }
+    return false;
+}
+
+void clip_audio_and_measure(std::vector<float> & audio, AudioMetrics & metrics) {
+    double sum_squared = 0.0;
+    for (float & value : audio) {
+        value = std::clamp(value, -1.0f, 1.0f);
+        metrics.peak = std::max(metrics.peak, std::fabs(value));
+        sum_squared += static_cast<double>(value) * static_cast<double>(value);
+    }
+    metrics.rms = audio.empty() ? 0.0 : std::sqrt(sum_squared / static_cast<double>(audio.size()));
 }
 
 void validate_components(const ModelCompatibility & model, std::vector<std::string> & errors) {
@@ -271,6 +292,29 @@ void flow_schedule(int steps, std::vector<float> & sigmas, std::vector<float> & 
     sigmas[static_cast<size_t>(steps)] = 1.0f;
 }
 
+void blend_latent_overlap(float * latents, const float * noise, const float * previous,
+                          int64_t channels, int64_t latent_length, int64_t overlap,
+                          int64_t previous_stride, float timestep) {
+    const float noise_scale = 1.0f - (1.0f - 1e-6f) * timestep;
+    for (int64_t channel = 0; channel < channels; ++channel) {
+        const float * channel_noise = noise + channel * latent_length;
+        const float * channel_previous = previous + channel * previous_stride;
+        float * channel_latents = latents + channel * latent_length;
+        for (int64_t index = 0; index < overlap; ++index) {
+            channel_latents[index] =
+                noise_scale * channel_noise[index] + timestep * channel_previous[index];
+        }
+    }
+}
+
+void pin_latent_overlap(float * latents, const float * previous, int64_t channels,
+                        int64_t latent_length, int64_t overlap, int64_t previous_stride) {
+    for (int64_t channel = 0; channel < channels; ++channel) {
+        memcpy(latents + channel * latent_length, previous + channel * previous_stride,
+               static_cast<size_t>(overlap) * sizeof(float));
+    }
+}
+
 int64_t condition_latent_length(const ConditionRate & rate, int64_t frames) {
     if (frames <= 0 || rate.input_sampling_rate <= 0 || rate.input_hop_length <= 0 ||
         rate.output_sampling_rate <= 0 || rate.output_hop_length <= 0) {
@@ -309,6 +353,63 @@ CropSpan crop_span(int64_t latent_length, int64_t window_index, int64_t window_c
     return {left, available > 0 ? available : 0};
 }
 
+CarryRange carry_range(int64_t latent_length, int64_t carry_span, int64_t overlap) {
+    if (latent_length < 0 || carry_span < 0 || overlap < 0 || overlap > carry_span) {
+        throw std::invalid_argument("carry values are invalid");
+    }
+    const int64_t start = std::max<int64_t>(latent_length - carry_span, 0);
+    const int64_t end = std::max<int64_t>(latent_length - overlap, start);
+    return {start, end};
+}
+
+bool copy_carry_layout(const std::vector<float> & latents, const std::vector<float> & condition,
+                       int64_t channels, int64_t condition_dimension, int64_t latent_length,
+                       CarryRange range, std::vector<float> & carry_latents,
+                       std::vector<float> & carry_condition) {
+    if (channels <= 0 || condition_dimension <= 0 || latent_length < 0 ||
+        range.start < 0 || range.end < range.start || range.end > latent_length) {
+        return false;
+    }
+    const int64_t length = range.end - range.start;
+    if (!copy_range_fits(latents.size(), latents.size(), 0, 0, channels * latent_length) ||
+        !copy_range_fits(condition.size(), condition.size(), 0, 0,
+                         condition_dimension * latent_length)) {
+        return false;
+    }
+    carry_latents.assign(static_cast<size_t>(channels * length), 0.0f);
+    for (int64_t channel = 0; channel < channels; ++channel) {
+        memcpy(carry_latents.data() + channel * length,
+               latents.data() + channel * latent_length + range.start,
+               static_cast<size_t>(length) * sizeof(float));
+    }
+    carry_condition.assign(static_cast<size_t>(condition_dimension * length), 0.0f);
+    memcpy(carry_condition.data(), condition.data() + range.start * condition_dimension,
+           static_cast<size_t>(condition_dimension * length) * sizeof(float));
+    return true;
+}
+
+bool copy_planar_window(const std::vector<float> & source, int64_t channels,
+                        int64_t source_length, int64_t source_offset,
+                        int64_t destination_length, int64_t destination_offset,
+                        int64_t copy_length, std::vector<float> & destination) {
+    if (channels <= 0 || source_length < 0 || destination_length < 0 ||
+        source_offset < 0 || destination_offset < 0 || copy_length < 0 ||
+        source_offset > source_length || copy_length > source_length - source_offset ||
+        destination_offset > destination_length ||
+        copy_length > destination_length - destination_offset ||
+        static_cast<uint64_t>(channels) * static_cast<uint64_t>(source_length) != source.size() ||
+        static_cast<uint64_t>(channels) * static_cast<uint64_t>(destination_length) !=
+            destination.size()) {
+        return false;
+    }
+    for (int64_t channel = 0; channel < channels; ++channel) {
+        memcpy(destination.data() + channel * destination_length + destination_offset,
+               source.data() + channel * source_length + source_offset,
+               static_cast<size_t>(copy_length) * sizeof(float));
+    }
+    return true;
+}
+
 int64_t stitched_sample_count(const std::vector<int64_t> & latent_lengths, int64_t upsample) {
     if (latent_lengths.empty()) {
         return 0;
@@ -316,8 +417,211 @@ int64_t stitched_sample_count(const std::vector<int64_t> & latent_lengths, int64
     return sum_crop_lengths(latent_lengths, upsample);
 }
 
+std::string vocoder_upsample_error(const std::vector<int32_t> & rates, uint32_t total_upsample) {
+    if (rates.empty()) {
+        return "vocoder upsample rates must not be empty";
+    }
+    uint32_t product = 1;
+    for (const int32_t rate : rates) {
+        if (rate <= 0) {
+            return "vocoder upsample rates must be positive";
+        }
+        const uint32_t positive_rate = static_cast<uint32_t>(rate);
+        if (product > std::numeric_limits<uint32_t>::max() / positive_rate) {
+            return "vocoder upsample rate product overflows uint32";
+        }
+        product *= positive_rate;
+    }
+    if (product != total_upsample) {
+        return "vocoder upsample rate product must equal total upsample";
+    }
+    return "";
+}
+
+std::vector<std::string> validate_synthesis_contract(const SynthesisContract & contract) {
+    std::vector<std::string> errors;
+    add_error(contract.scheduler == "FlowMatchEulerDiscrete",
+              "flow scheduler must be FlowMatchEulerDiscrete", errors);
+    add_error(contract.invert_sigmas, "flow invert_sigmas must be true", errors);
+    add_error(std::isfinite(contract.shift) && contract.shift == 1.0f,
+              "flow shift must be finite and exactly 1", errors);
+    add_error(contract.train_timesteps == 1, "flow train timesteps must be 1", errors);
+    add_error(contract.rope_type == "neox", "DiT rope type must be neox", errors);
+    add_error(contract.glu_order == "value_gate", "DiT GLU order must be value_gate", errors);
+    add_error(contract.timestep_token_prepended, "DiT timestep token must be prepended", errors);
+    add_error(contract.pre_post_conv_residual, "DiT pre/post convolution residual must be enabled", errors);
+    add_error(!contract.attn_bias, "DiT attention bias must be disabled", errors);
+    return errors;
+}
+
+std::string vocoder_output_shape_error(int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+                                       int64_t elements, size_t bytes, int64_t expected_length) {
+    if (expected_length <= 0) {
+        return "vocoder expected output length must be positive";
+    }
+    if (ne0 != expected_length || ne1 != 1 || ne2 != 1 || ne3 != 1) {
+        return "vocoder output dimensions do not match the expected mono waveform";
+    }
+    if (elements != expected_length) {
+        return "vocoder output element count does not match the expected waveform length";
+    }
+    if (static_cast<uint64_t>(expected_length) >
+        static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(float))) {
+        return "vocoder expected output byte count overflows size_t";
+    }
+    if (bytes != static_cast<size_t>(expected_length) * sizeof(float)) {
+        return "vocoder output byte count does not match the expected F32 waveform";
+    }
+    return "";
+}
+
+bool copy_range_fits(size_t source_elements, size_t destination_elements,
+                     int64_t source_offset, int64_t destination_offset, int64_t copy_length) {
+    if (source_offset < 0 || destination_offset < 0 || copy_length < 0) {
+        return false;
+    }
+    const uint64_t source_start = static_cast<uint64_t>(source_offset);
+    const uint64_t destination_start = static_cast<uint64_t>(destination_offset);
+    const uint64_t count = static_cast<uint64_t>(copy_length);
+    return source_start <= source_elements && count <= source_elements - source_start &&
+           destination_start <= destination_elements && count <= destination_elements - destination_start;
+}
+
+bool stereo_copy_ranges_fit(size_t source_elements, size_t destination_elements,
+                            int64_t source_length, int64_t source_offset,
+                            int64_t destination_length, int64_t destination_offset,
+                            int64_t copy_length) {
+    if (source_length < 0 || source_offset < 0 || destination_length < 0 ||
+        destination_offset < 0 || copy_length < 0) {
+        return false;
+    }
+    if (source_offset > source_length || copy_length > source_length - source_offset) {
+        return false;
+    }
+    if (destination_offset > destination_length ||
+        copy_length > destination_length - destination_offset) {
+        return false;
+    }
+    const uint64_t source_stereo = static_cast<uint64_t>(source_length) * 2;
+    const uint64_t destination_stereo = static_cast<uint64_t>(destination_length) * 2;
+    if (source_stereo != source_elements || destination_stereo != destination_elements) {
+        return false;
+    }
+    for (int64_t channel = 0; channel < 2; ++channel) {
+        if (!copy_range_fits(source_elements, destination_elements,
+                             channel * source_length + source_offset,
+                             channel * destination_length + destination_offset, copy_length)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool finalize_audio(std::vector<float> & audio, AudioMetrics & metrics, size_t & nonfinite_index) {
+    metrics = {};
+    nonfinite_index = 0;
+    if (find_nonfinite_sample(audio, nonfinite_index)) {
+        return false;
+    }
+    clip_audio_and_measure(audio, metrics);
+    return true;
+}
+
 int64_t sample_top_k(const float * logits, int64_t count, int top_k, std::mt19937_64 & random) {
     return mm3_sample_top_k(logits, count, top_k, random);
+}
+
+bool collect_ar_candidates(const float * logits, int64_t row_stride, int64_t eos,
+                           int64_t semantic_offset, int64_t semantic_vocab,
+                           ArCandidates & candidates, int64_t & nonfinite_count) {
+    if (!logits || row_stride <= 0 || eos < 0 || eos >= row_stride ||
+        semantic_offset < 0 || semantic_vocab <= 0 ||
+        semantic_offset > row_stride - semantic_vocab) {
+        return false;
+    }
+    const int64_t count = semantic_vocab + 1;
+    candidates.conditional.resize(static_cast<size_t>(count));
+    candidates.unconditional.resize(static_cast<size_t>(count));
+    candidates.guided.resize(static_cast<size_t>(count));
+    const float * conditional = logits;
+    const float * unconditional = logits + row_stride;
+    const auto normalize = [&nonfinite_count](float value) {
+        if (std::isnan(value) || (std::isinf(value) && value > 0.0f)) {
+            ++nonfinite_count;
+            return -INFINITY;
+        }
+        return value;
+    };
+    candidates.conditional[0] = normalize(conditional[eos]);
+    candidates.unconditional[0] = normalize(unconditional[eos]);
+    for (int64_t index = 0; index < semantic_vocab; ++index) {
+        candidates.conditional[static_cast<size_t>(index + 1)] =
+            normalize(conditional[semantic_offset + index]);
+        candidates.unconditional[static_cast<size_t>(index + 1)] =
+            normalize(unconditional[semantic_offset + index]);
+    }
+    return true;
+}
+
+void guide_ar_candidates(ArCandidates & candidates, float cfg_scale) {
+    const size_t count = candidates.conditional.size();
+    candidates.guided.resize(count);
+    for (size_t index = 0; index < count; ++index) {
+        const float unconditional = candidates.unconditional[index];
+        candidates.guided[index] =
+            unconditional + (candidates.conditional[index] - unconditional) * cfg_scale;
+    }
+}
+
+void apply_conditional_top_k(ArCandidates & candidates, int top_k) {
+    const int64_t count = static_cast<int64_t>(candidates.conditional.size());
+    int64_t selected = std::min<int64_t>(std::max(top_k, 1), count);
+    float threshold = -INFINITY;
+    if (selected < count) {
+        std::vector<float> scratch = candidates.conditional;
+        std::nth_element(scratch.begin(), scratch.begin() + selected - 1, scratch.end(),
+                         std::greater<float>());
+        threshold = scratch[static_cast<size_t>(selected - 1)];
+    }
+    for (int64_t index = 0; index < count; ++index) {
+        if (candidates.conditional[static_cast<size_t>(index)] < threshold) {
+            candidates.guided[static_cast<size_t>(index)] = -INFINITY;
+        }
+    }
+}
+
+void build_acoustic_rows(const int32_t * codes, int64_t codebooks, int64_t acoustic_vocab,
+                         std::vector<int32_t> & rows) {
+    rows.resize(static_cast<size_t>(codebooks));
+    for (int64_t index = 0; index < codebooks; ++index) {
+        rows[static_cast<size_t>(index)] =
+            codes[index] + static_cast<int32_t>(index * acoustic_vocab);
+    }
+}
+
+int64_t resolve_ar_frame_cap(int64_t requested_frames, int64_t checkpoint_frames,
+                             bool forced, int64_t forced_length, std::string & error) {
+    error.clear();
+    if (requested_frames <= 0) {
+        error = "max_frames must be positive";
+        return 0;
+    }
+    int64_t frames = checkpoint_frames > 0
+                         ? std::min(requested_frames, checkpoint_frames)
+                         : requested_frames;
+    if (!forced) {
+        return frames;
+    }
+    if (forced_length <= 0) {
+        error = "forced replay needs both forced_semantic and forced_acoustic, and a positive length";
+        return 0;
+    }
+    frames = std::min(frames, forced_length - 1);
+    if (frames <= 0) {
+        error = "forced replay needs at least 2 iterations (one un-emitted, one emitted)";
+        return 0;
+    }
+    return frames;
 }
 
 std::vector<std::string> validate_model_compatibility(const ModelCompatibility & model) {
