@@ -309,10 +309,14 @@ void test_backend_device_types() {
     CHECK(backend_reg_name_is_validated_gpu("Vulkan"));
     CHECK(backend_reg_name_is_validated_gpu("MTL"));
     CHECK(backend_reg_name_is_validated_gpu("Metal"));
+    CHECK(backend_reg_name_is_validated_gpu("CUDA"));
     // OpenCL is deliberately absent: it is reached by its own Adreno pass in
-    // backend_gpu_init(), not by this Vulkan/Metal preference.
+    // backend_gpu_init(), not by this validated-backend preference.
     CHECK(!backend_reg_name_is_validated_gpu("OpenCL"));
-    CHECK(!backend_reg_name_is_validated_gpu("CUDA"));
+    // The HIP/MUSA builds of ggml-cuda register under their own names and stay
+    // unvalidated until measured.
+    CHECK(!backend_reg_name_is_validated_gpu("ROCm"));
+    CHECK(!backend_reg_name_is_validated_gpu("MUSA"));
     CHECK(!backend_reg_name_is_validated_gpu(nullptr));
 
     // That Adreno pass gates on the generation parsed out of the device
@@ -337,6 +341,7 @@ void test_backend_device_types() {
 // backend allowlist, the CPU fallback for everything else, and the env
 // overrides layered on top.
 void test_stage_placement() {
+    using tts_cpp::acestep::backend_name_is_cuda;
     using tts_cpp::acestep::backend_name_is_metal;
     using tts_cpp::acestep::backend_name_is_opencl;
     using tts_cpp::acestep::backend_name_is_vulkan;
@@ -354,12 +359,18 @@ void test_stage_placement() {
     // not what reaches here.
     CHECK(backend_name_is_opencl("OpenCL"));
     CHECK(!backend_name_is_opencl("GPUOpenCL"));
+    // ggml-cuda's REGISTRY name; the HIP/MUSA builds of the same backend
+    // register as "ROCm"/"MUSA" and must not match.
+    CHECK(backend_name_is_cuda("CUDA"));
+    CHECK(!backend_name_is_cuda("ROCm"));
+    CHECK(!backend_name_is_cuda("MUSA"));
 
     // The input is the REGISTRY name, which carries no device-index suffix.
     // ggml_backend_name() would hand over "MTL0" / "Vulkan0" and match nothing.
     CHECK(!backend_name_is_metal("MTL0"));
     CHECK(!backend_name_is_vulkan("Vulkan0"));
     CHECK(!backend_name_is_opencl("OpenCL0"));
+    CHECK(!backend_name_is_cuda("CUDA0"));
 
     // Exact compare: no case folding, no substring match, and null/empty safe.
     CHECK(!backend_name_is_metal("mtl"));
@@ -368,15 +379,19 @@ void test_stage_placement() {
     CHECK(!backend_name_is_vulkan("vulkan"));
     CHECK(!backend_name_is_opencl("opencl"));
     CHECK(!backend_name_is_metal("CUDA"));
+    CHECK(!backend_name_is_cuda("cuda"));
     CHECK(!backend_name_is_vulkan("MTL"));
     CHECK(!backend_name_is_metal("Vulkan"));
     CHECK(!backend_name_is_opencl("Vulkan"));
+    CHECK(!backend_name_is_cuda("Vulkan"));
     CHECK(!backend_name_is_metal(""));
     CHECK(!backend_name_is_vulkan(""));
     CHECK(!backend_name_is_opencl(""));
+    CHECK(!backend_name_is_cuda(""));
     CHECK(!backend_name_is_metal(nullptr));
     CHECK(!backend_name_is_vulkan(nullptr));
     CHECK(!backend_name_is_opencl(nullptr));
+    CHECK(!backend_name_is_cuda(nullptr));
 
     const PlacementOverrides none;
 
@@ -388,10 +403,13 @@ void test_stage_placement() {
         CHECK(p.enc_on_gpu);  // encoders follow the GPU on every backend
     }
 
-    // Vulkan is validated for every stage except the autoregressive LM. On
-    // Mali-G715, GPU LM logits collapse to repeated codes and truncate songs.
-    {
-        StagePlacement p = resolve_stage_placement("Vulkan", none);
+    // Vulkan and CUDA are validated for every stage except the autoregressive
+    // LM. On Mali-G715 Vulkan, GPU LM logits collapse to repeated codes and
+    // truncate songs; on CUDA the fork's LM-shaped q4 strided-B b_absmax=1e5
+    // mul_mat stress tests NaN, so the LM stays on CPU until the model-level
+    // parity measurement is taken.
+    for (const char * detok_only : { "Vulkan", "CUDA" }) {
+        StagePlacement p = resolve_stage_placement(detok_only, none);
         CHECK(!p.lm_on_gpu);
         CHECK(p.detok_on_gpu);
         CHECK(p.enc_on_gpu);
@@ -399,9 +417,12 @@ void test_stage_placement() {
 
     // -- fallback: everything else keeps the shipping CPU placement -----------
     // Unmeasured backends must not silently pick up the GPU path. "MTL0" is in
-    // this list on purpose: a suffixed name is NOT the allowlisted one.
-    const char * const others[] = { "CUDA",     "SYCL",     "BLAS", "CPU",  "MTL0",
-                                    "Vulkan0",  "OpenCL0",  "",     nullptr };
+    // this list on purpose: a suffixed name is NOT the allowlisted one. "ROCm"
+    // and "MUSA" are the HIP/MUSA builds of ggml-cuda: same code base, different
+    // silicon, unmeasured.
+    const char * const others[] = { "ROCm",     "MUSA",     "SYCL", "BLAS", "CPU",
+                                    "MTL0",     "Vulkan0",  "OpenCL0", "CUDA0",
+                                    "",         nullptr };
     for (const char * other : others) {
         StagePlacement p = resolve_stage_placement(other, none);
         CHECK(!p.lm_on_gpu);
@@ -415,14 +436,14 @@ void test_stage_placement() {
     {
         PlacementOverrides ov;
         ov.lm_gpu        = true;
-        StagePlacement p = resolve_stage_placement("CUDA", ov);
+        StagePlacement p = resolve_stage_placement("SYCL", ov);
         CHECK(p.lm_on_gpu);
         CHECK(!p.detok_on_gpu);  // the LM hatch must not move the detokenizer
     }
     {
         PlacementOverrides ov;
         ov.detok_gpu     = true;
-        StagePlacement p = resolve_stage_placement("CUDA", ov);
+        StagePlacement p = resolve_stage_placement("SYCL", ov);
         CHECK(p.detok_on_gpu);
         CHECK(!p.lm_on_gpu);
     }

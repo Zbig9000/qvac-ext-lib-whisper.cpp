@@ -35,6 +35,13 @@ inline bool backend_name_is_opencl(const char * name) {
     return name && std::strcmp(name, "OpenCL") == 0;
 }
 
+// ggml-cuda registers as "CUDA" (also covers the HIP/MUSA builds, which reuse
+// the CUDA backend under the "ROCm"/"MUSA" names -- those stay off the
+// allowlist until measured).
+inline bool backend_name_is_cuda(const char * name) {
+    return name && std::strcmp(name, "CUDA") == 0;
+}
+
 // Environment escape hatches, read once at create(). Presence is what counts:
 // ACESTEP_LM_CPU=0 still forces the LM to the CPU, matching the getenv() checks
 // this replaced.
@@ -63,12 +70,19 @@ struct StagePlacement {
 // autoregressive LM: on Mali-G715 the LM collapses to repeated codes and may
 // terminate far short of the requested duration. Keep that stage on CPU while
 // the encoders, detokenizer, DiT and VAE remain GPU-accelerated.
-// OpenCL is validated for both stages on Adreno 740. ACESTEP_LM_GPU /
-// ACESTEP_DETOK_GPU remain available for parity measurements.
+// OpenCL is validated for both stages on Adreno 740. CUDA is validated for the
+// detokenizer (its graph is Q8_0 mul_mat + the custom SNAKE / COL2IM_1D
+// kernels, all of which test-backend-ops passes on an RTX 5090, including the
+// q8_0 b_absmax=1e5 stress cases) but NOT for the LM: the fork's
+// LM-shaped stress tests NaN on CUDA for q4_0/q4_K mul_mat with a strided B at
+// b_absmax=1e5, and the 0.6B LM really does reach ~1.02e5 activations, so the
+// LM keeps the CPU placement until the model-level parity measurement
+// (README: F32-dequantized reference) is taken. ACESTEP_LM_GPU /
+// ACESTEP_DETOK_GPU remain available for exactly that measurement.
 inline StagePlacement resolve_stage_placement(const char * reg_name, const PlacementOverrides & ov) {
     StagePlacement p;
 
-    if (backend_name_is_vulkan(reg_name)) {
+    if (backend_name_is_vulkan(reg_name) || backend_name_is_cuda(reg_name)) {
         p.lm_on_gpu = false;
     } else if (!backend_name_is_metal(reg_name) && !backend_name_is_opencl(reg_name)) {
         p.lm_on_gpu    = false;
