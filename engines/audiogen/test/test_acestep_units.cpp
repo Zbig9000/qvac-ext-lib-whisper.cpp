@@ -340,6 +340,21 @@ void test_backend_device_types() {
 // device lane. Mirrors the three branches Engine::create() relies on: the
 // backend allowlist, the CPU fallback for everything else, and the env
 // overrides layered on top.
+
+// A backend validated for every stage except the autoregressive LM keeps the
+// LM on the CPU while the detokenizer and encoders follow the GPU.
+void check_gpu_backend_keeps_lm_on_cpu(const char * name) {
+    using tts_cpp::acestep::PlacementOverrides;
+    using tts_cpp::acestep::resolve_stage_placement;
+    using tts_cpp::acestep::StagePlacement;
+
+    const PlacementOverrides none;
+    StagePlacement p = resolve_stage_placement(name, none);
+    CHECK(!p.lm_on_gpu);
+    CHECK(p.detok_on_gpu);
+    CHECK(p.enc_on_gpu);
+}
+
 void test_stage_placement() {
     using tts_cpp::acestep::backend_name_is_cuda;
     using tts_cpp::acestep::backend_name_is_metal;
@@ -404,16 +419,9 @@ void test_stage_placement() {
     }
 
     // Vulkan and CUDA are validated for every stage except the autoregressive
-    // LM. On Mali-G715 Vulkan, GPU LM logits collapse to repeated codes and
-    // truncate songs; on CUDA the fork's LM-shaped q4 strided-B b_absmax=1e5
-    // mul_mat stress tests NaN, so the LM stays on CPU until the model-level
-    // parity measurement is taken.
-    for (const char * detok_only : { "Vulkan", "CUDA" }) {
-        StagePlacement p = resolve_stage_placement(detok_only, none);
-        CHECK(!p.lm_on_gpu);
-        CHECK(p.detok_on_gpu);
-        CHECK(p.enc_on_gpu);
-    }
+    // LM (README "Backends" records the per-backend rationale).
+    check_gpu_backend_keeps_lm_on_cpu("Vulkan");
+    check_gpu_backend_keeps_lm_on_cpu("CUDA");
 
     // -- fallback: everything else keeps the shipping CPU placement -----------
     // Unmeasured backends must not silently pick up the GPU path. "MTL0" is in

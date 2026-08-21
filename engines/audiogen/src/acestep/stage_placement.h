@@ -70,15 +70,9 @@ struct StagePlacement {
 // autoregressive LM: on Mali-G715 the LM collapses to repeated codes and may
 // terminate far short of the requested duration. Keep that stage on CPU while
 // the encoders, detokenizer, DiT and VAE remain GPU-accelerated.
-// OpenCL is validated for both stages on Adreno 740. CUDA is validated for the
-// detokenizer (its graph is Q8_0 mul_mat + the custom SNAKE / COL2IM_1D
-// kernels, all of which test-backend-ops passes on an RTX 5090, including the
-// q8_0 b_absmax=1e5 stress cases) but NOT for the LM: the fork's
-// LM-shaped stress tests NaN on CUDA for q4_0/q4_K mul_mat with a strided B at
-// b_absmax=1e5, and the 0.6B LM really does reach ~1.02e5 activations, so the
-// LM keeps the CPU placement until the model-level parity measurement
-// (README: F32-dequantized reference) is taken. ACESTEP_LM_GPU /
-// ACESTEP_DETOK_GPU remain available for exactly that measurement.
+// OpenCL is validated for both stages on Adreno 740. CUDA keeps the Vulkan
+// placement -- detokenizer on the GPU, LM on the CPU until the parity
+// measurement is taken; README "Backends" records the rationale.
 inline StagePlacement resolve_stage_placement(const char * reg_name, const PlacementOverrides & ov) {
     StagePlacement p;
 
