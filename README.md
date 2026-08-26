@@ -308,7 +308,12 @@ file combinations and registry download instructions.
 
 ## Performance
 
-`RTF = inference_time / audio_duration`, lower is better. The parakeet and tts READMEs carry the full tables, methodology, and reproduction steps; audiogen has no benchmark suite yet and reports per-stage wall clock on stderr.
+`RTF = inference_time / audio_duration`, lower is better. The parakeet and tts
+READMEs carry their full tables, methodology, and reproduction steps. AudioGen
+has a reproducible
+[engine comparison harness](engines/audiogen/benchmarks/comparison/README.md)
+for CPU, Metal, Vulkan, and CUDA; `music-cli` also reports per-stage wall clock
+on stderr.
 
 ### ASR, end-of-utterance, diarization
 

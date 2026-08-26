@@ -566,10 +566,14 @@ comparison.
 
 ## Performance
 
-There is no CI benchmark suite for this engine yet. `music-cli` always enables
+There is no CI benchmark lane for this engine yet. `music-cli` always enables
 verbose engine output and prints per-stage wall clock to stderr (`[music-cli]`,
 `[acestep-timing]`). Direct library use prints `[acestep-timing]` only when
 `EngineOptions::verbose` is enabled; it defaults to `false`.
+
+For a reproducible engine-to-engine measurement against upstream
+`acestep.cpp` (`ace-lm` + `ace-synth`, no addon), see
+[`benchmarks/comparison/README.md`](benchmarks/comparison/README.md).
 
 ## License
 
