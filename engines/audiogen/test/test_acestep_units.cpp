@@ -16,22 +16,30 @@
 //   7. GPU device types    — discrete and integrated GPUs are selectable.
 //   8. stage placement     — which backend the LM / detokenizer / encoders run on.
 //   9. parallel_load       — weight-load row/chunk decomposition parity.
+//   9b. fused load         — LM q|k|v / gate|up row blocks fail closed.
 
 #include "backend_registry.h"
 #include "parallel_load.h"
 #include "audio_edit.h"
 #include "cover_noise.h"
 #include "dit_ggml.h"
+#include "dit_gguf.h"
 #include "detok_ggml.h"
 #include "generate_task.h"
 #include "generation_conditioning.h"
 #include "generation_plan.h"
+#include "lm_ggml.h"
 #include "lm_pipeline.h"
+#include "metadata_fsm.h"
 #include "philox.h"
+#include "qwen3_block.h"
 #include "stage_placement.h"
 #include "vae_encode_windows.h"
 #include "vae_ggml.h"
 #include "wav_reader.h"
+
+#include "ggml-alloc.h"
+#include "gguf.h"
 
 #include <atomic>
 #include <cmath>
@@ -41,6 +49,8 @@
 #include <cstring>
 #include <limits>
 #include <random>
+#include <sstream>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -213,6 +223,277 @@ void test_sampler() {
         int tb = sample_top_k_p(b.data(), V, 0.85f, 0.9f, 0, r2);
         CHECK(ta == tb);
         CHECK(ta >= 0 && ta < V);
+    }
+}
+
+// Compact-slice sampling must match the historical full-vocab path exactly:
+// entries below the EOS cut were only ever masked to -1e9, so sampling the
+// [eos, V) slice via index_base is an identity, RNG stream included.
+void test_sampler_compact_equivalence() {
+    using tts_cpp::acestep::sample_top_k_p;
+
+    const int V = 1000, eos = 100, base = 124;  // mirrors TOKEN_IM_END/AUDIO_CODE_BASE layout
+    std::mt19937                          gen(1234);
+    std::uniform_real_distribution<float> ud(-4.0f, 4.0f);
+
+    for (int trial = 0; trial < 20; ++trial) {
+        std::vector<float> raw(V);
+        for (float & v : raw) v = ud(gen);
+
+        std::vector<float> full(raw);
+        for (int v = 0; v < base; ++v)
+            if (v != eos) full[v] = -1e9f;
+        std::vector<float> slice(raw.begin() + eos, raw.end());
+        for (int v = 1; v < base - eos; ++v) slice[v] = -1e9f;
+
+        std::mt19937 r_full(trial), r_slice(trial);
+        const float  temp  = (trial % 5 == 0) ? 0.0f : 0.85f;  // argmax path every 5th trial
+        const float  top_p = (trial % 7 == 0) ? 0.0f : 0.9f;   // also cover the disabled-top_p path
+        int tf = sample_top_k_p(full.data(), V, temp, top_p, 0, r_full);
+        int ts = sample_top_k_p(slice.data(), V - eos, temp, top_p, 0, r_slice, eos);
+        CHECK(tf == ts);
+        CHECK(r_full == r_slice);
+
+        // Prefix form (phase-1 FSM shape): tail [base2, V) masked -> sampling
+        // only [0, base2) is the same identity.
+        const int          base2 = 900;
+        std::vector<float> full2(raw);
+        for (int v = base2; v < V; ++v) full2[v] = -1e9f;
+        std::vector<float> pre(raw.begin(), raw.begin() + base2);
+        std::mt19937       r_f2(trial + 100), r_p2(trial + 100);
+        int tf2 = sample_top_k_p(full2.data(), V, temp, top_p, 0, r_f2);
+        int tp2 = sample_top_k_p(pre.data(), base2, temp, top_p, 0, r_p2);
+        CHECK(tf2 == tp2);
+        CHECK(r_f2 == r_p2);
+    }
+}
+
+// r==0 edge of the compact form. dist(0, sum) yields exactly 0.0f only when
+// the raw 32-bit mt19937 output is 0 (sum >= 1.0, so no underflow path); an
+// all-zero engine state produces that draw deterministically. The historical
+// full-vector walk then lands on absolute index 0, and the index_base form
+// must land on the same spot - NOT on index_base + 0 (= EOS in phase 2).
+std::mt19937 make_zero_draw_rng() {
+    std::stringstream ss;
+    for (int i = 0; i < 624; ++i) ss << 0 << ' ';
+    ss << 0;
+    std::mt19937 rng;
+    ss >> rng;
+    return rng;
+}
+
+void test_sampler_r0_edge() {
+    using tts_cpp::acestep::sample_top_k_p;
+
+    {  // Portability guard: stream format / canonical mapping are stdlib-specific.
+        std::mt19937                          probe = make_zero_draw_rng();
+        std::uniform_real_distribution<float> d01(0.0f, 1.0f);
+        if (d01(probe) != 0.0f) {
+            std::fprintf(stderr, "[test-acestep-units] r==0 rng state not reproducible here, subtest skipped\n");
+            return;
+        }
+    }
+
+    const int                             V = 1000, eos = 100, base = 124;
+    std::mt19937                          gen(4321);
+    std::uniform_real_distribution<float> ud(-4.0f, 4.0f);
+    std::vector<float>                    raw(V);
+    for (float & v : raw) v = ud(gen);
+
+    for (float top_p : { 0.9f, 0.0f }) {  // top_p and disabled-top_p branches
+        std::vector<float> full(raw);
+        for (int v = 0; v < base; ++v)
+            if (v != eos) full[v] = -1e9f;
+        std::vector<float> slice(raw.begin() + eos, raw.end());
+        for (int v = 1; v < base - eos; ++v) slice[v] = -1e9f;
+
+        std::mt19937 r_full = make_zero_draw_rng(), r_slice = make_zero_draw_rng();
+        int tf = sample_top_k_p(full.data(), V, 0.85f, top_p, 0, r_full);
+        int ts = sample_top_k_p(slice.data(), V - eos, 0.85f, top_p, 0, r_slice, eos);
+        CHECK(tf == 0);
+        CHECK(ts == 0);
+        CHECK(r_full == r_slice);
+    }
+}
+
+// lm_consume_forced must be indistinguishable from masking all but one token
+// and running the full sampler: same pick, same RNG consumption.
+void test_sampler_forced_fast_path() {
+    using tts_cpp::acestep::lm_consume_forced;
+    using tts_cpp::acestep::sample_top_k_p;
+
+    const int V = 500;
+    for (int trial = 0; trial < 12; ++trial) {
+        const int   live = 37 + trial * 13;
+        const float temp = (trial % 4 == 0) ? 0.0f : 0.85f;
+
+        std::vector<float> l(V, -1e9f);
+        l[live] = 1.5f;
+        std::mt19937 r_full(trial), r_fast(trial);
+        int tf = sample_top_k_p(l.data(), V, temp, 0.9f, 0, r_full);
+        int tc = lm_consume_forced(live, temp, r_fast);
+        CHECK(tf == tc);
+        CHECK(r_full == r_fast);
+    }
+}
+
+// MetadataFSM::forced_token must agree with apply_mask: it returns exactly the
+// single surviving token when one exists, -1 when the LM still has a choice.
+void test_fsm_forced_token() {
+    using tts_cpp::acestep::MetadataFSM;
+
+    const int V         = 64;
+    auto      survivors = [&](MetadataFSM & f) {
+        std::vector<float> l(V, 1.0f);
+        f.apply_mask(l.data());
+        std::vector<int> alive;
+        for (int v = 0; v < V; ++v)
+            if (l[v] > -1e8f) alive.push_back(v);
+        return alive;
+    };
+    auto agree = [&](MetadataFSM & f) {
+        MetadataFSM probe = f;  // forced_token may seed inject_queue; probe a copy
+        int         t     = probe.forced_token();
+        auto        alive = survivors(f);
+        if (alive.size() == 1) CHECK(t == alive[0]);
+        else CHECK(t == -1);
+    };
+
+    MetadataFSM fsm;
+    fsm.enabled    = true;
+    fsm.vocab_size = V;
+
+    fsm.state    = MetadataFSM::BPM_NAME;  // name tokens force one token at a time
+    fsm.bpm_name = { 5, 7 };
+    fsm.name_pos = 0;
+    agree(fsm);
+    fsm.name_pos = 1;
+    agree(fsm);
+
+    fsm.inject_queue = { 9 };  // injected value: forced
+    agree(fsm);
+    fsm.inject_queue.clear();
+
+    fsm.state         = MetadataFSM::THINK_END;  // </think> is forced
+    fsm.think_end_tok = 20;                      // keep it inside the synthetic vocab
+    agree(fsm);
+
+    fsm.state       = MetadataFSM::BPM_VALUE;  // value tree: forced only when 1 child
+    fsm.name_pos    = (int) fsm.bpm_name.size();
+    fsm.newline_tok = 3;
+    fsm.bpm_tree.add({ 11, 12 });
+    fsm.value_acc.clear();
+    agree(fsm);  // single child {11}
+    fsm.bpm_tree.add({ 13, 12 });
+    agree(fsm);  // two children {11,13} -> free choice
+    fsm.value_acc = { 11 };
+    agree(fsm);  // single child {12}
+    fsm.value_acc = { 40 };
+    agree(fsm);  // unknown prefix -> forced newline
+}
+
+// Verbatim pre-fusion sampler, kept as an oracle: the fused sample_top_k_p must
+// match it token-for-token and draw-for-draw.
+struct RefTokenProb {
+    int   id;
+    float prob;
+};
+
+int reference_sample_top_k_p(float * logits, int V, float temperature, float top_p, int top_k, std::mt19937 & rng) {
+    if (temperature <= 0.0f) {
+        return (int) (std::max_element(logits, logits + V) - logits);
+    }
+
+    float inv_temp = 1.0f / temperature;
+    for (int i = 0; i < V; i++) logits[i] *= inv_temp;
+
+    if (top_k > 0 && top_k < V) {
+        std::vector<float> tmp(logits, logits + V);
+        std::nth_element(tmp.begin(), tmp.begin() + (top_k - 1), tmp.end(), std::greater<float>());
+        float threshold = tmp[top_k - 1];
+        for (int i = 0; i < V; i++) {
+            if (logits[i] < threshold) logits[i] = -INFINITY;
+        }
+    }
+
+    if (top_p > 0.0f && top_p < 1.0f) {
+        float max_logit = -INFINITY;
+        for (int i = 0; i < V; i++) {
+            if (logits[i] > max_logit) max_logit = logits[i];
+        }
+        float sum_exp = 0.0f;
+        for (int i = 0; i < V; i++) sum_exp += expf(logits[i] - max_logit);
+        float inv_sum = 1.0f / sum_exp;
+
+        float                     cutoff = max_logit - 16.0f;
+        std::vector<RefTokenProb> sorted;
+        for (int i = 0; i < V; i++) {
+            if (logits[i] >= cutoff) {
+                sorted.push_back({ i, expf(logits[i] - max_logit) * inv_sum });
+            } else {
+                logits[i] = -INFINITY;
+            }
+        }
+
+        int K = (int) sorted.size();
+        if (K > 0) {
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const RefTokenProb & a, const RefTokenProb & b) { return a.prob > b.prob; });
+            float cum = 0.0f;
+            for (int i = 0; i < K; i++) {
+                if (i > 0 && cum >= top_p) logits[sorted[i].id] = -INFINITY;
+                cum += sorted[i].prob;
+            }
+        }
+    }
+
+    float max_val = -INFINITY;
+    for (int i = 0; i < V; i++) {
+        if (logits[i] > max_val) max_val = logits[i];
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < V; i++) {
+        logits[i] = expf(logits[i] - max_val);
+        sum += logits[i];
+    }
+
+    std::uniform_real_distribution<float> dist(0.0f, sum);
+    float                                 r   = dist(rng);
+    float                                 acc = 0.0f;
+    for (int i = 0; i < V; i++) {
+        acc += logits[i];
+        if (acc >= r) return i;
+    }
+    return 0;
+}
+
+void test_sampler_fusion_oracle() {
+    using tts_cpp::acestep::sample_top_k_p;
+
+    const int                             V = 4096;
+    std::mt19937                          gen(77);
+    std::uniform_real_distribution<float> ud(-6.0f, 6.0f);
+
+    for (int trial = 0; trial < 30; ++trial) {
+        std::vector<float> raw(V);
+        for (float & v : raw) v = ud(gen);
+        // Adversarial shapes: -1e9 masses, -inf islands, exact ties.
+        if (trial % 3 == 0)
+            for (int i = 0; i < V; i += 2) raw[i] = -1e9f;
+        if (trial % 4 == 0)
+            for (int i = 0; i < V / 8; ++i) raw[i] = raw[V - 1 - i];
+        if (trial % 5 == 0)
+            for (int i = 100; i < 200; ++i) raw[i] = -INFINITY;
+        const float temp  = (trial % 6 == 0) ? 0.0f : 0.85f;
+        const float top_p = (trial % 7 == 0) ? 0.0f : 0.9f;  // also cover the disabled-top_p path
+        const int   top_k = (trial % 8 == 0) ? 40 : 0;
+
+        std::vector<float> a = raw, b = raw;
+        std::mt19937       r1(trial), r2(trial);
+        int ta = reference_sample_top_k_p(a.data(), V, temp, top_p, top_k, r1);
+        int tb = sample_top_k_p(b.data(), V, temp, top_p, top_k, r2);
+        CHECK(ta == tb);
+        CHECK(r1 == r2);
     }
 }
 
@@ -628,6 +909,102 @@ void test_convert_f32_to_f16_rows() {
             convert_f32_to_f16_rows(src.data(), chunked.data(), count);
         }
     }
+}
+
+// 9b. fused-load fail-closed -------------------------------------------------
+// lm_load_row_block copies one GGUF tensor into a row-concatenated fused tensor
+// at a running byte offset; lm_load_layer_fused chains q|k|v and gate|up. A
+// missing tensor must fail the load (false, offset untouched): skipping a block
+// would byte-shift every later one into silently wrong weights. The tiny GGUF
+// is written by the test itself; CPU buffers only.
+std::string write_fused_test_gguf(const std::vector<std::pair<std::string, std::vector<float>>> & tensors, int ne0) {
+    const char *      tmp  = std::getenv("TMPDIR");
+    const std::string path = std::string(tmp ? tmp : "/tmp") + "/qvac-acestep-fused-load-test.gguf";
+
+    ggml_init_params ip{ 1024 * 1024, nullptr, /*no_alloc=*/false };
+    ggml_context *   ctx = ggml_init(ip);
+    gguf_context *   gc  = gguf_init_empty();
+    for (const auto & [name, vals] : tensors) {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, (int64_t) vals.size() / ne0);
+        ggml_set_name(t, name.c_str());
+        std::memcpy(t->data, vals.data(), vals.size() * sizeof(float));
+        gguf_add_tensor(gc, t);
+    }
+    CHECK(gguf_write_to_file(gc, path.c_str(), /*only_meta=*/false));
+    gguf_free(gc);
+    ggml_free(ctx);
+    return path;
+}
+
+void test_fused_load_fail_closed() {
+    using tts_cpp::acestep::DitGGUF;
+    using tts_cpp::acestep::Qwen3Layer;
+    using tts_cpp::acestep::dit_gguf_close;
+    using tts_cpp::acestep::dit_gguf_open;
+    using tts_cpp::acestep::lm_load_layer_fused;
+    using tts_cpp::acestep::lm_load_row_block;
+
+    const int ne0 = 4;
+    auto      seq = [](int n, float base) {
+        std::vector<float> v((size_t) n);
+        for (int i = 0; i < n; ++i) v[(size_t) i] = base + (float) i;
+        return v;
+    };
+    const std::string p = "model.layers.0";
+    const auto q = seq(8, 0), k = seq(4, 100), v = seq(4, 200), gate = seq(8, 300), up = seq(8, 400);
+
+    const std::string path = write_fused_test_gguf(
+        { { p + ".self_attn.q_proj.weight", q },
+          { p + ".self_attn.k_proj.weight", k },
+          { p + ".self_attn.v_proj.weight", v },
+          { p + ".mlp.gate_proj.weight", gate },
+          { p + ".mlp.up_proj.weight", up } },
+        ne0);
+
+    DitGGUF g;
+    CHECK(dit_gguf_open(g, path));
+
+    ggml_init_params      ip{ 8 * ggml_tensor_overhead(), nullptr, /*no_alloc=*/true };
+    ggml_context *        ctx = ggml_init(ip);
+    ggml_tensor *         qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, 4);  // q(2) + k(1) + v(1) rows
+    ggml_tensor *         gu  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, 4);  // gate(2) + up(2) rows
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    CHECK(buf != nullptr);
+
+    // Happy path: all five blocks land back to back, in declaration order.
+    Qwen3Layer ly{};  // norms/o/down stay null; q3_load_* skip a null dst
+    CHECK(lm_load_layer_fused(g, p, ly, qkv, gu));
+    std::vector<float> qkv_want(q);
+    qkv_want.insert(qkv_want.end(), k.begin(), k.end());
+    qkv_want.insert(qkv_want.end(), v.begin(), v.end());
+    std::vector<float> gu_want(gate);
+    gu_want.insert(gu_want.end(), up.begin(), up.end());
+    CHECK(std::memcmp(qkv->data, qkv_want.data(), qkv_want.size() * sizeof(float)) == 0);
+    CHECK(std::memcmp(gu->data, gu_want.data(), gu_want.size() * sizeof(float)) == 0);
+
+    // Missing tensor: false, and the offset must not advance.
+    size_t off = 0;
+    CHECK(lm_load_row_block(qkv, off, g, p + ".self_attn.q_proj.weight"));
+    const size_t after_q = off;
+    CHECK(!lm_load_row_block(qkv, off, g, p + ".self_attn.absent.weight"));
+    CHECK(off == after_q);
+    dit_gguf_close(g);
+
+    // v_proj absent -> the whole fused layer load fails.
+    const std::string path2 = write_fused_test_gguf(
+        { { p + ".self_attn.q_proj.weight", q },
+          { p + ".self_attn.k_proj.weight", k },
+          { p + ".mlp.gate_proj.weight", gate },
+          { p + ".mlp.up_proj.weight", up } },
+        ne0);
+    DitGGUF g2;
+    CHECK(dit_gguf_open(g2, path2));
+    CHECK(!lm_load_layer_fused(g2, p, ly, qkv, gu));
+    dit_gguf_close(g2);
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    std::remove(path.c_str());
 }
 
 void test_generate_task_kinds() {
@@ -1236,6 +1613,11 @@ int main() {
     test_philox();
     test_fsq();
     test_sampler();
+    test_sampler_compact_equivalence();
+    test_sampler_r0_edge();
+    test_sampler_forced_fast_path();
+    test_fsm_forced_token();
+    test_sampler_fusion_oracle();
     test_vae_progress();
     test_vae_window_core();
     test_backend_device_types();
@@ -1243,6 +1625,7 @@ int main() {
     test_placement_env();
     test_parallel_rows();
     test_convert_f32_to_f16_rows();
+    test_fused_load_fail_closed();
     test_generate_task_kinds();
     test_generate_task_defaults();
     test_generate_task_audio_layout();
