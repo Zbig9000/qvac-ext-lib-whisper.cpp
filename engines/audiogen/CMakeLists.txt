@@ -308,6 +308,22 @@ if (AUDIOGEN_BUILD_TESTS)
             set_property(TEST test-minimax-converter PROPERTY ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
         endif()
     endif()
+
+    # The engine-comparison harness ships its own node:test suites
+    # (benchmarks/comparison/tests/*.test.js). Registering them keeps the
+    # harness's adapters/aggregation/report logic from rotting unnoticed;
+    # they vanish (with a status message) on hosts without node.
+    find_program(AUDIOGEN_NODE_EXECUTABLE node)
+    if (AUDIOGEN_NODE_EXECUTABLE)
+        file(GLOB _audiogen_comparison_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/comparison/tests/*.test.js)
+        add_test(NAME test-audiogen-comparison-lib
+            COMMAND ${AUDIOGEN_NODE_EXECUTABLE} --test ${_audiogen_comparison_tests}
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/comparison)
+        set_property(TEST test-audiogen-comparison-lib PROPERTY LABELS "unit")
+    else()
+        message(STATUS "audiogen: node not found - test-audiogen-comparison-lib not registered")
+    endif()
 endif()
 
 # ---- install / export -----------------------------------------------------
