@@ -2047,12 +2047,21 @@ void test_bpe_utf8_codepoint() {
     const char invalid_lead[] = { (char) 0xFF, 0, 0, 0, 0 };
     CHECK(bpe_utf8_codepoint(invalid_lead, &adv) == 0xFF && adv == 1);
 
-    // Truncated sequences still advance by the declared width, reading the
-    // padding; the buffers are NUL-padded so the reads stay in bounds here.
+    // A sequence that runs into the terminator decodes as its raw lead byte
+    // rather than consuming the declared width and reading past the end.
+    const char truncated_two[] = { (char) 0xC3, 0, 0, 0, 0 };
+    CHECK(bpe_utf8_codepoint(truncated_two, &adv) == 0xC3 && adv == 1);
     const char truncated_three[] = { (char) 0xE4, 0, 0, 0, 0 };
-    CHECK(bpe_utf8_codepoint(truncated_three, &adv) == 0x4000 && adv == 3);
-    const char truncated_four[] = { (char) 0xF0, 0, 0, 0, 0 };
-    CHECK(bpe_utf8_codepoint(truncated_four, &adv) == 0 && adv == 4);
+    CHECK(bpe_utf8_codepoint(truncated_three, &adv) == 0xE4 && adv == 1);
+    const char truncated_three_partial[] = { (char) 0xE4, (char) 0xB8, 0, 0, 0 };
+    CHECK(bpe_utf8_codepoint(truncated_three_partial, &adv) == 0xE4 && adv == 1);
+    const char truncated_four[] = { (char) 0xF0, (char) 0x90, (char) 0x90, 0, 0 };
+    CHECK(bpe_utf8_codepoint(truncated_four, &adv) == 0xF0 && adv == 1);
+
+    // A lead byte at the very end of a buffer must not be read past: this is
+    // the case that motivated the clamp.
+    const char lead_at_end[] = { (char) 0xF0, 0 };
+    CHECK(bpe_utf8_codepoint(lead_at_end, &adv) == 0xF0 && adv == 1);
 }
 
 void test_bpe_encode_merges() {
