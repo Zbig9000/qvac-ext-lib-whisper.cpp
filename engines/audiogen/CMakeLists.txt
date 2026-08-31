@@ -315,12 +315,18 @@ if (AUDIOGEN_BUILD_TESTS)
     # they vanish (with a status message) on hosts without node.
     find_program(AUDIOGEN_NODE_EXECUTABLE node)
     if (AUDIOGEN_NODE_EXECUTABLE)
-        file(GLOB _audiogen_comparison_tests
-            ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/comparison/tests/*.test.js)
+        # node discovers the suites itself from the working directory, so one
+        # added later runs without reconfiguring (a configure-time file(GLOB)
+        # would pin the list until the next cmake run). A discovery that finds
+        # nothing still exits 0, so the zero-pass summary has to fail the test:
+        # FAIL_REGULAR_EXPRESSION is additive, leaving node's exit code as the
+        # primary signal.
         add_test(NAME test-audiogen-comparison-lib
-            COMMAND ${AUDIOGEN_NODE_EXECUTABLE} --test ${_audiogen_comparison_tests}
-            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/comparison)
+            COMMAND ${AUDIOGEN_NODE_EXECUTABLE} --test
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/comparison/tests)
         set_property(TEST test-audiogen-comparison-lib PROPERTY LABELS "unit")
+        set_property(TEST test-audiogen-comparison-lib
+            PROPERTY FAIL_REGULAR_EXPRESSION "# pass 0")
     else()
         message(STATUS "audiogen: node not found - test-audiogen-comparison-lib not registered")
     endif()
