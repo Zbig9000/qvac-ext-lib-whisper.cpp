@@ -20,11 +20,6 @@ on:
       - 'engines/audiogen/**'
       - '.github/workflows/audiogen-ci.yml'
   workflow_dispatch:
-    inputs:
-      run_gpu:
-        description: 'Also run the GPU ctest lane (needs a [self-hosted, gpu] runner)'
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -158,22 +153,10 @@ jobs:
             exit 1
           fi
 
-  # Non-Metal GPU lane stays opt-in until self-hosted GPU runners exist.
-  gpu:
-    if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
-    runs-on: [self-hosted, gpu]
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build ggml + engine (native backends) and run GPU suites
-        run: |
-          git clone --depth 1 --branch "$GGML_BRANCH" "$GGML_REPO" ggml-src
-          cmake -S ggml-src -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
-            -DGGML_VULKAN=ON \
-            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
-          cmake --build ggml-src/build -j && cmake --install ggml-src/build
-          cmake -S engines/audiogen -B build -DCMAKE_BUILD_TYPE=Release \
-            -DAUDIOGEN_BUILD_TESTS=ON \
-            -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
-          cmake --build build -j
-          ctest --test-dir build -L gpu --output-on-failure --timeout 1200
+  # No opt-in GPU job here: audiogen's only gpu-labeled test is the Metal
+  # parity check (SKIP_RETURN_CODE 77 without Metal), which the build-test
+  # macOS lane already runs — and skip-guards — in its "Test (Metal)" step.
+  # On a non-Apple runner `ctest -L gpu` could only ever skip it and report a
+  # hollow pass. When audiogen grows a Vulkan/CUDA gpu-labeled test, add the
+  # lane back mirroring tts-ci.yml's gpu job (qvac-ubuntu2204-x64-gpu +
+  # runnable-arms reporter).
