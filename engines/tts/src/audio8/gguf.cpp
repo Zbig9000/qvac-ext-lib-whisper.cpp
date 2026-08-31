@@ -48,17 +48,26 @@ public:
     metadata(const gguf_context * ctx, const std::string & prefix)
         : ctx_(ctx), prefix_(prefix) {}
 
+    // gguf_get_val_* GGML_ABORTs on a type mismatch, so a mistyped key would
+    // kill the process. These readers keep their caller-supplied default when
+    // the stored type is not the one being asked for.
     void u32(const char * key, int & out) {
         const int64_t id = find(key);
-        if (id >= 0) out = static_cast<int>(gguf_get_val_u32(ctx_, id));
+        if (id >= 0 && gguf_get_kv_type(ctx_, id) == GGUF_TYPE_UINT32) {
+            out = static_cast<int>(gguf_get_val_u32(ctx_, id));
+        }
     }
     void f32(const char * key, float & out) {
         const int64_t id = find(key);
-        if (id >= 0) out = gguf_get_val_f32(ctx_, id);
+        if (id >= 0 && gguf_get_kv_type(ctx_, id) == GGUF_TYPE_FLOAT32) {
+            out = gguf_get_val_f32(ctx_, id);
+        }
     }
     void boolean(const char * key, bool & out) {
         const int64_t id = find(key);
-        if (id >= 0) out = gguf_get_val_bool(ctx_, id);
+        if (id >= 0 && gguf_get_kv_type(ctx_, id) == GGUF_TYPE_BOOL) {
+            out = gguf_get_val_bool(ctx_, id);
+        }
     }
     void ints(const char * key, std::vector<int> & out) {
         const int64_t id = find(key);
