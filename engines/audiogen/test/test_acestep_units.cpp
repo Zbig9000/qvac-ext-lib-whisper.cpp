@@ -25,6 +25,7 @@
 #include "backend_registry.h"
 #include "parallel_load.h"
 #include "audio_edit.h"
+#include "cancellation_scope.h"
 #include "bpe_tokenizer.h"
 #include "cover_noise.h"
 #include "dit_ggml.h"
@@ -2240,6 +2241,28 @@ tts_cpp::acestep::BpeTokenizer make_test_bpe_tokenizer() {
     return tok;
 }
 
+// A cancel armed before generate() must survive into the run that observes it
+// and be consumed on exit, so the next run starts clean. Pinned on the scope
+// itself: the engine-level path needs model weights.
+void test_cancellation_scope_consumes_on_exit() {
+    using tts_cpp::acestep::CancellationScope;
+
+    std::atomic<bool> cancelled{ true };
+    {
+        CancellationScope scope(cancelled);
+        CHECK(cancelled.load());
+    }
+    CHECK(!cancelled.load());
+
+    cancelled.store(false);
+    {
+        CancellationScope scope(cancelled);
+        CHECK(!cancelled.load());
+        cancelled.store(true);
+    }
+    CHECK(!cancelled.load());
+}
+
 void test_bpe_utf8_codepoint() {
     using tts_cpp::acestep::bpe_utf8_codepoint;
 
@@ -2387,6 +2410,7 @@ int main() {
     test_quantize_policy_mm3();
     test_quantize_gguf_roundtrip();
     test_quantize_gguf_roundtrip_mm3();
+    test_cancellation_scope_consumes_on_exit();
     test_bpe_utf8_codepoint();
     test_bpe_encode_merges();
     test_bpe_encode_byte_fallback();
