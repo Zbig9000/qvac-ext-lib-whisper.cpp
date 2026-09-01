@@ -25,6 +25,7 @@
 #include "backend_registry.h"
 #include "parallel_load.h"
 #include "audio_edit.h"
+#include "cancellation_scope.h"
 #include "bpe_tokenizer.h"
 #include "cover_noise.h"
 #include "dit_ggml.h"
@@ -650,6 +651,67 @@ void test_gpu_fallback_reason() {
     }
 }
 
+// 6c. GPU tier policy --------------------------------------------------------
+// Speech-engine GPU selection prefers CUDA over Vulkan on the same NVIDIA
+// card, and prefers discrete over integrated adapters. gpu_tier_for is the
+// pure ranking that captures that policy so a synthesised device topology can
+// be scored without a live ggml-backend registry.
+//
+// SCOPE: this test covers the classifier (what tier a device lands in) and
+// the enum-constant ordering (which tier outranks which). It does NOT
+// exercise backend_gpu_init's actual walk in backend_registry.h: that
+// function has its own parallel Adreno-OpenCL / CUDA-first / {require_validated,
+// {GPU, IGPU}} sequence and does not call gpu_tier_for today, so a reordering
+// of that walk would silently pass this test. Keeping the two in sync is a
+// code-review contract; the deeper fix (drive backend_gpu_init off
+// gpu_tier_for as the single source of truth) is tracked separately.
+void test_gpu_tier_policy() {
+    using tts_cpp::acestep::GpuTier;
+    using tts_cpp::acestep::gpu_tier_for;
+
+    // Adreno 700+ OpenCL wins outright — the OpenCL kernels are the validated
+    // path on Snapdragon 8 Gen 2+.
+    CHECK(gpu_tier_for("OpenCL", GGML_BACKEND_DEVICE_TYPE_GPU,  740) == GpuTier::AdrenoOpenCL700Plus);
+    CHECK(gpu_tier_for("OpenCL", GGML_BACKEND_DEVICE_TYPE_IGPU, 740) == GpuTier::AdrenoOpenCL700Plus);
+    // Adreno 6xx OpenCL is not routed to the OpenCL tier here (broken kernels)
+    // — the calling code separately skips it; the ranking treats it as generic OpenCL.
+    CHECK(gpu_tier_for("OpenCL", GGML_BACKEND_DEVICE_TYPE_GPU,  640) != GpuTier::AdrenoOpenCL700Plus);
+
+    // CUDA outranks Vulkan on the same NVIDIA card.
+    CHECK(gpu_tier_for("CUDA",   GGML_BACKEND_DEVICE_TYPE_GPU,  -1)  == GpuTier::CudaDiscrete);
+    CHECK(gpu_tier_for("Vulkan", GGML_BACKEND_DEVICE_TYPE_GPU,  -1)  == GpuTier::ValidatedDiscrete);
+    CHECK(static_cast<int>(GpuTier::CudaDiscrete) <
+          static_cast<int>(GpuTier::ValidatedDiscrete));
+
+    // Tegra / Jetson CUDA reports IGPU on some drivers — still preferred over
+    // a validated Vulkan discrete via the CUDA-first rule.
+    CHECK(gpu_tier_for("CUDA", GGML_BACKEND_DEVICE_TYPE_IGPU, -1) == GpuTier::CudaIntegrated);
+    CHECK(static_cast<int>(GpuTier::CudaIntegrated) <
+          static_cast<int>(GpuTier::ValidatedDiscrete));
+
+    // Discrete outranks integrated at every tier that has both — the
+    // other-addons behavior we are matching (llm/diffusion prefer dGPU).
+    CHECK(static_cast<int>(GpuTier::CudaDiscrete)      < static_cast<int>(GpuTier::CudaIntegrated));
+    CHECK(static_cast<int>(GpuTier::ValidatedDiscrete) < static_cast<int>(GpuTier::ValidatedIntegrated));
+    CHECK(static_cast<int>(GpuTier::OtherDiscrete)     < static_cast<int>(GpuTier::OtherIntegrated));
+
+    // Metal is validated; MTL is the new registry name for the same backend.
+    CHECK(gpu_tier_for("Metal", GGML_BACKEND_DEVICE_TYPE_GPU,  -1) == GpuTier::ValidatedDiscrete);
+    CHECK(gpu_tier_for("MTL",   GGML_BACKEND_DEVICE_TYPE_IGPU, -1) == GpuTier::ValidatedIntegrated);
+
+    // Non-GPU device types are not selectable — the ranking rejects them so
+    // the CPU/Accel devices never leak into the GPU pass.
+    CHECK(gpu_tier_for("Vulkan", GGML_BACKEND_DEVICE_TYPE_CPU,   -1) == GpuTier::NotSelectable);
+    CHECK(gpu_tier_for("BLAS",   GGML_BACKEND_DEVICE_TYPE_ACCEL, -1) == GpuTier::NotSelectable);
+    CHECK(gpu_tier_for(nullptr,  GGML_BACKEND_DEVICE_TYPE_CPU,   -1) == GpuTier::NotSelectable);
+
+    // A fake "ROCm" / "MUSA" registry lands in the Other tier — unvalidated
+    // but still a candidate below every validated GPU, matching the current
+    // {require_validated, ...} nest in backend_gpu_init.
+    CHECK(gpu_tier_for("ROCm", GGML_BACKEND_DEVICE_TYPE_GPU,  -1) == GpuTier::OtherDiscrete);
+    CHECK(gpu_tier_for("MUSA", GGML_BACKEND_DEVICE_TYPE_IGPU, -1) == GpuTier::OtherIntegrated);
+}
+
 // 7. stage placement ---------------------------------------------------------
 // Which backend each stage runs on decides which numerical path the generated
 // audio takes, so the policy is locked here rather than only observed on a
@@ -1227,6 +1289,154 @@ void test_generation_plans() {
     CHECK(plan.encode_reference);
     CHECK(!plan.reuse_source_reference);
     CHECK(plan.blend_cover_noise);
+}
+
+void test_lego_task_kinds() {
+    using tts_cpp::acestep::TASK_COVER_NOFSQ;
+    using tts_cpp::acestep::TASK_LEGO;
+    using tts_cpp::acestep::TASK_TEXT2MUSIC;
+    using tts_cpp::acestep::LEGO_TRACK_NAMES;
+    using tts_cpp::acestep::is_lego_task;
+    using tts_cpp::acestep::is_source_task;
+    using tts_cpp::acestep::is_valid_lego_track;
+
+    CHECK(is_lego_task(TASK_LEGO));
+    CHECK(!is_lego_task(TASK_TEXT2MUSIC));
+    CHECK(!is_lego_task(TASK_COVER_NOFSQ));
+    CHECK(is_source_task(TASK_LEGO));
+    CHECK(is_source_task(TASK_COVER_NOFSQ));
+    CHECK(!is_source_task(TASK_TEXT2MUSIC));
+
+    for (const char * name : LEGO_TRACK_NAMES) {
+        CHECK(is_valid_lego_track(name));
+    }
+    CHECK(!is_valid_lego_track(""));
+    CHECK(!is_valid_lego_track("piano"));
+    CHECK(!is_valid_lego_track("GUITAR"));
+}
+
+void test_lego_task_validation() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::TASK_LEGO;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask task;
+
+    params.task_type = TASK_LEGO;
+    CHECK(resolve_generate_task(params, task).find("requires source_audio") != std::string::npos);
+
+    params.source_audio.assign(3, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("source_audio must be interleaved stereo") != std::string::npos);
+
+    params.source_audio.assign(4, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("requires a track name") != std::string::npos);
+
+    params.track = "accordion";
+    CHECK(resolve_generate_task(params, task).find("unknown lego track") != std::string::npos);
+
+    params.track = "guitar";
+    CHECK(resolve_generate_task(params, task).empty());
+    CHECK(task.type == TASK_LEGO);
+    CHECK(task.track == "guitar");
+}
+
+void test_lego_generation_plan() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::GenerationPlan;
+    using tts_cpp::acestep::TASK_LEGO;
+    using tts_cpp::acestep::make_generation_plan;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask task;
+    params.task_type = TASK_LEGO;
+    params.track = "drums";
+    params.source_audio.assign(4, 0.0f);
+    CHECK(resolve_generate_task(params, task).empty());
+
+    GenerationPlan plan = make_generation_plan(params, task);
+    CHECK(plan.encode_source);
+    CHECK(!plan.encode_reference);
+    CHECK(!plan.reuse_source_reference);
+    CHECK(!plan.run_lm);
+    CHECK(!plan.run_detokenizer);
+    CHECK(!plan.blend_cover_noise);
+
+    params.reference_audio.assign(4, 0.0f);
+    CHECK(resolve_generate_task(params, task).empty());
+    plan = make_generation_plan(params, task);
+    CHECK(plan.encode_reference);
+    CHECK(!plan.reuse_source_reference);
+}
+
+void test_lego_model_policy() {
+    using tts_cpp::acestep::is_sft_model_name;
+    using tts_cpp::acestep::lego_model_error;
+
+    CHECK(is_sft_model_name("acestep-v15-sft"));
+    CHECK(is_sft_model_name("acestep-v15-xl-sft"));
+    CHECK(!is_sft_model_name("acestep-v15-base"));
+    CHECK(!is_sft_model_name("acestep-v15-xl-base"));
+    CHECK(!is_sft_model_name("acestep-v15-turbo"));
+    CHECK(!is_sft_model_name(""));
+
+    CHECK(lego_model_error(false, false).empty());
+    CHECK(lego_model_error(true, false).find("requires a base DiT") != std::string::npos);
+    CHECK(lego_model_error(true, false).find("turbo") != std::string::npos);
+    CHECK(lego_model_error(false, true).find("requires a base DiT") != std::string::npos);
+    CHECK(lego_model_error(false, true).find("sft") != std::string::npos);
+}
+
+void test_guidance_and_dcw_policy() {
+    using tts_cpp::acestep::resolve_dcw_enabled;
+    using tts_cpp::acestep::resolve_guidance_scale;
+
+    CHECK(approx(resolve_guidance_scale(0.0f, true), 1.0f));
+    CHECK(approx(resolve_guidance_scale(7.0f, true), 1.0f));
+    CHECK(approx(resolve_guidance_scale(0.0f, false), 7.0f));
+    CHECK(approx(resolve_guidance_scale(3.5f, false), 3.5f));
+
+    CHECK(resolve_dcw_enabled(true, true));
+    CHECK(!resolve_dcw_enabled(true, false));
+    CHECK(!resolve_dcw_enabled(false, true));
+    CHECK(!resolve_dcw_enabled(false, false));
+}
+
+// APG guide: golden values hand-derived from the reference apg_forward
+// (momentum -0.75, norm_threshold 2.5, projection per channel over T).
+void test_apg_guide() {
+    using tts_cpp::acestep::dit_apg_guide;
+
+    std::vector<double> momentum(2, 0.0);
+    std::vector<float> cond = { 3.0f, 4.0f };
+    std::vector<float> uncond = { 2.0f, 2.0f };
+    std::vector<float> velocity = cond;
+    dit_apg_guide(velocity, uncond, momentum, 7.0f, 2, 1, 1);
+    CHECK(approx(velocity[0], 1.08f, 1e-4f));
+    CHECK(approx(velocity[1], 5.44f, 1e-4f));
+
+    velocity = cond;
+    dit_apg_guide(velocity, uncond, momentum, 7.0f, 2, 1, 1);
+    CHECK(approx(velocity[0], 2.52f, 1e-4f));
+    CHECK(approx(velocity[1], 4.36f, 1e-4f));
+
+    std::vector<double> fresh_momentum(2, 0.0);
+    std::vector<float> parallel_cond = { 10.0f, 0.0f };
+    std::vector<float> parallel_uncond = { 6.0f, 0.0f };
+    velocity = parallel_cond;
+    dit_apg_guide(velocity, parallel_uncond, fresh_momentum, 7.0f, 2, 1, 1);
+    CHECK(approx(velocity[0], 10.0f, 1e-4f));
+    CHECK(approx(velocity[1], 0.0f, 1e-4f));
+
+    std::vector<double> zero_momentum(2, 0.0);
+    std::vector<float> equal = { 1.5f, -0.5f };
+    velocity = equal;
+    dit_apg_guide(velocity, equal, zero_momentum, 7.0f, 2, 1, 1);
+    CHECK(approx(velocity[0], equal[0]));
+    CHECK(approx(velocity[1], equal[1]));
 }
 
 void test_generation_conditioning() {
@@ -2031,6 +2241,28 @@ tts_cpp::acestep::BpeTokenizer make_test_bpe_tokenizer() {
     return tok;
 }
 
+// A cancel armed before generate() must survive into the run that observes it
+// and be consumed on exit, so the next run starts clean. Pinned on the scope
+// itself: the engine-level path needs model weights.
+void test_cancellation_scope_consumes_on_exit() {
+    using tts_cpp::acestep::CancellationScope;
+
+    std::atomic<bool> cancelled{ true };
+    {
+        CancellationScope scope(cancelled);
+        CHECK(cancelled.load());
+    }
+    CHECK(!cancelled.load());
+
+    cancelled.store(false);
+    {
+        CancellationScope scope(cancelled);
+        CHECK(!cancelled.load());
+        cancelled.store(true);
+    }
+    CHECK(!cancelled.load());
+}
+
 void test_bpe_utf8_codepoint() {
     using tts_cpp::acestep::bpe_utf8_codepoint;
 
@@ -2047,12 +2279,21 @@ void test_bpe_utf8_codepoint() {
     const char invalid_lead[] = { (char) 0xFF, 0, 0, 0, 0 };
     CHECK(bpe_utf8_codepoint(invalid_lead, &adv) == 0xFF && adv == 1);
 
-    // Truncated sequences still advance by the declared width, reading the
-    // padding; the buffers are NUL-padded so the reads stay in bounds here.
+    // A sequence that runs into the terminator decodes as its raw lead byte
+    // rather than consuming the declared width and reading past the end.
+    const char truncated_two[] = { (char) 0xC3, 0, 0, 0, 0 };
+    CHECK(bpe_utf8_codepoint(truncated_two, &adv) == 0xC3 && adv == 1);
     const char truncated_three[] = { (char) 0xE4, 0, 0, 0, 0 };
-    CHECK(bpe_utf8_codepoint(truncated_three, &adv) == 0x4000 && adv == 3);
-    const char truncated_four[] = { (char) 0xF0, 0, 0, 0, 0 };
-    CHECK(bpe_utf8_codepoint(truncated_four, &adv) == 0 && adv == 4);
+    CHECK(bpe_utf8_codepoint(truncated_three, &adv) == 0xE4 && adv == 1);
+    const char truncated_three_partial[] = { (char) 0xE4, (char) 0xB8, 0, 0, 0 };
+    CHECK(bpe_utf8_codepoint(truncated_three_partial, &adv) == 0xE4 && adv == 1);
+    const char truncated_four[] = { (char) 0xF0, (char) 0x90, (char) 0x90, 0, 0 };
+    CHECK(bpe_utf8_codepoint(truncated_four, &adv) == 0xF0 && adv == 1);
+
+    // A lead byte at the very end of a buffer must not be read past: this is
+    // the case that motivated the clamp.
+    const char lead_at_end[] = { (char) 0xF0, 0 };
+    CHECK(bpe_utf8_codepoint(lead_at_end, &adv) == 0xF0 && adv == 1);
 }
 
 void test_bpe_encode_merges() {
@@ -2144,6 +2385,7 @@ int main() {
     test_vae_window_core();
     test_backend_device_types();
     test_gpu_fallback_reason();
+    test_gpu_tier_policy();
     test_stage_placement();
     test_placement_env();
     test_parallel_rows();
@@ -2156,6 +2398,12 @@ int main() {
     test_generate_task_strengths();
     test_cover_conditioning_switch();
     test_generation_plans();
+    test_lego_task_kinds();
+    test_lego_task_validation();
+    test_lego_generation_plan();
+    test_lego_model_policy();
+    test_guidance_and_dcw_policy();
+    test_apg_guide();
     test_generation_conditioning();
     test_cover_noise_blending();
     test_repaint_config();
@@ -2171,6 +2419,7 @@ int main() {
     test_quantize_policy_mm3();
     test_quantize_gguf_roundtrip();
     test_quantize_gguf_roundtrip_mm3();
+    test_cancellation_scope_consumes_on_exit();
     test_bpe_utf8_codepoint();
     test_bpe_encode_merges();
     test_bpe_encode_byte_fallback();
