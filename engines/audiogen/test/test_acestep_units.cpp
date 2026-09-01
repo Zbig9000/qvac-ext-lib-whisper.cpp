@@ -35,6 +35,7 @@
 #include "generation_conditioning.h"
 #include "generation_plan.h"
 #include "lm_ggml.h"
+#include "loudness.h"
 #include "lm_pipeline.h"
 #include "metadata_fsm.h"
 #include "philox.h"
@@ -1187,6 +1188,119 @@ void test_generate_task_errors() {
     params.audio_cover_strength = 0.5f;
     CHECK(resolve_generate_task(params, task).empty());
     CHECK(approx(task.audio_cover_strength, 0.5f));
+}
+
+void test_simple_mode_policy() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::TASK_COVER_NOFSQ;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask task;
+    params.simple_mode = true;
+    params.caption = "a romantic modern salsa with male lead vocals for a wedding";
+    params.lyrics.clear();
+    CHECK(resolve_generate_task(params, task).empty());
+
+    params.lyrics = "[Instrumental]";
+    CHECK(resolve_generate_task(params, task).empty());
+
+    params.lyrics = "[verse]\nuser lyrics";
+    CHECK(resolve_generate_task(params, task).find("lyrics must be empty") != std::string::npos);
+
+    params.lyrics.clear();
+    params.caption.clear();
+    CHECK(resolve_generate_task(params, task).find("requires a caption") != std::string::npos);
+
+    params.caption = "a short query";
+    params.task_type = TASK_COVER_NOFSQ;
+    params.source_audio.assign(4, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("only task 'text2music'") != std::string::npos);
+
+    params.task_type.clear();
+    params.source_audio.clear();
+    params.audio_codes.assign(4, 1);
+    CHECK(resolve_generate_task(params, task).find("pre-supplied audio_codes") != std::string::npos);
+
+    params.audio_codes.clear();
+    params.edit_plan.push_back(tts_cpp::acestep::RepaintParams{});
+    CHECK(resolve_generate_task(params, task).find("combined with edit_plan") != std::string::npos);
+
+    params.edit_plan.clear();
+    params.lm_phase1 = false;
+    CHECK(resolve_generate_task(params, task).find("requires lm_phase1") != std::string::npos);
+
+    params.lm_phase1 = true;
+    params.simple_mode = false;
+    params.lyrics = "[verse]\nuser lyrics";
+    CHECK(resolve_generate_task(params, task).empty());
+}
+
+void test_simple_mode_prompt_resolvers() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::RepaintParams;
+    using tts_cpp::acestep::resolve_prompt_language;
+    using tts_cpp::acestep::resolve_prompt_lyrics;
+
+    GenerateParams params;
+    params.lyrics.clear();
+    CHECK(resolve_prompt_lyrics(params) == "[Instrumental]");
+    CHECK(resolve_prompt_language(params) == "en");
+
+    params.simple_mode = true;
+    CHECK(resolve_prompt_lyrics(params).empty());
+    CHECK(resolve_prompt_language(params).empty());
+
+    params.lyrics = "[Instrumental]";
+    params.vocal_language = "es";
+    CHECK(resolve_prompt_lyrics(params) == "[Instrumental]");
+    CHECK(resolve_prompt_language(params) == "es");
+
+    params.simple_mode = false;
+    params.lyrics.clear();
+    params.vocal_language.clear();
+    params.edit_plan.push_back(RepaintParams{});
+    CHECK(resolve_prompt_language(params) == "unknown");
+
+    params.edit_plan.clear();
+    params.task_type = tts_cpp::acestep::TASK_LEGO;
+    CHECK(resolve_prompt_language(params) == "unknown");
+}
+
+void test_normalize_loudness() {
+    using tts_cpp::acestep::normalize_loudness;
+
+    std::vector<float> pcm = { 0.1f, -0.2f, 0.4f, 0.05f };
+    normalize_loudness(pcm, 0);
+    CHECK(approx(pcm[0], 0.25f));
+    CHECK(approx(pcm[1], -0.5f));
+    CHECK(approx(pcm[2], 1.0f));
+    CHECK(approx(pcm[3], 0.125f));
+
+    std::vector<float> clipped = { 0.1f, -0.2f, 0.4f, 0.05f };
+    normalize_loudness(clipped, 10);
+    CHECK(approx(clipped[0], 0.5f));
+    CHECK(approx(clipped[1], -1.0f));
+    CHECK(approx(clipped[2], 1.0f));
+    CHECK(approx(clipped[3], 0.25f));
+
+    std::vector<float> silence(16, 0.0f);
+    normalize_loudness(silence);
+    CHECK(silence == std::vector<float>(16, 0.0f));
+
+    std::vector<float> empty;
+    normalize_loudness(empty);
+    CHECK(empty.empty());
+}
+
+void test_inspire_user_message() {
+    using tts_cpp::acestep::lm_inspire_user_message;
+
+    CHECK(lm_inspire_user_message("a short query", "") == "a short query");
+    CHECK(lm_inspire_user_message("a short query", "[Instrumental]") ==
+          "a short query\n\ninstrumental: true");
+    CHECK(lm_inspire_user_message("a short query", "[verse]\nwords") == "a short query");
 }
 
 void test_cover_conditioning_switch() {
@@ -2396,6 +2510,10 @@ int main() {
     test_generate_task_audio_layout();
     test_generate_task_errors();
     test_generate_task_strengths();
+    test_simple_mode_policy();
+    test_simple_mode_prompt_resolvers();
+    test_normalize_loudness();
+    test_inspire_user_message();
     test_cover_conditioning_switch();
     test_generation_plans();
     test_lego_task_kinds();
