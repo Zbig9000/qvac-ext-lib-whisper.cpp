@@ -131,6 +131,18 @@ inline std::string validate_lego_track(const std::string & track) {
     return {};
 }
 
+inline std::string validate_lrc_request(const GenerateParams & params) {
+    if (!params.generate_lrc) return {};
+    if (!params.edit_plan.empty()) {
+        return "acestep engine: generate_lrc is unavailable on the audio edit path";
+    }
+    if (params.simple_mode) return {};
+    if (params.lyrics.empty() || params.lyrics == INSTRUMENTAL_LYRICS) {
+        return "acestep engine: generate_lrc requires lyrics to align";
+    }
+    return {};
+}
+
 inline std::string validate_quality_score_request(const GenerateParams & params, const std::string & task_type) {
     if (!params.compute_quality_score) return {};
     if (!params.edit_plan.empty()) {
@@ -154,6 +166,9 @@ inline std::string resolve_generate_task(const GenerateParams & params, Generate
 
     const std::string simple_mode_error = validate_simple_mode(params, task.type);
     if (!simple_mode_error.empty()) return simple_mode_error;
+
+    const std::string lrc_error = validate_lrc_request(params);
+    if (!lrc_error.empty()) return lrc_error;
 
     const std::string quality_score_error = validate_quality_score_request(params, task.type);
     if (!quality_score_error.empty()) return quality_score_error;
