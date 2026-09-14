@@ -380,6 +380,21 @@ has a reproducible
 for CPU, Metal, Vulkan, and CUDA; `music-cli` also reports per-stage wall clock
 on stderr.
 
+### Multi-machine benchmarks (2026-09)
+
+Maintainer-run measurements across up to four machines — a MacBook Air M5 and
+Mac mini M4 (Metal, CPU), an RTX 3080 desktop (CUDA, Vulkan), a Strix Halo box
+(Vulkan, CPU), and an RTX 5090 box (CUDA, Vulkan, CPU) — every lane timed from
+outside the process. The engine READMEs carry the full tables, method, and
+build pins.
+
+| Task | Model | Highlights |
+|---|---|---|
+| ASR | Parakeet TDT 0.6b v3 | RTF 0.0006–0.0055 on the GPU lanes; 0.00 % / 0.80 % WER on the jfk / ls90 clips — [full table](engines/parakeet/README.md#multi-machine-benchmark-2026-09) |
+| TTS | Supertonic 3 | end-to-end wall 0.61–0.82 s on every GPU lane (RTF 0.024–0.031) — [full table](engines/tts/README.md#supertonic-3-multi-machine-benchmark-2026-09) |
+| TTS | Audio8 0.6b | GPU RTF 0.20–0.40, faster than real time on every GPU lane — [full table](engines/tts/README.md#audio8-multi-machine-benchmark-2026-09) |
+| Music | ACE-Step 1.5 | generation 1,338–2,330 ms on the GPU lanes (RTF 0.14–0.25) — [full table](engines/audiogen/README.md#ace-step-15-multi-machine-benchmark-2026-09) |
+
 ### ASR, end-of-utterance, diarization
 
 CI numbers from the published `@qvac/asr-ggml@0.1.1` addon ([run 31603189415](https://github.com/tetherto/qvac/actions/runs/31603189415), 2026-08-12), `q8_0` GGUFs, 1 warmup plus 5 timed runs, host `qvac-ubuntu2204-x64-gpu` (CPU: Intel Core i5-13500, GPU: NVIDIA RTX 4000 SFF Ada, Vulkan). Full table: [engines/parakeet/README.md](engines/parakeet/README.md#performance).

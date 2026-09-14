@@ -745,6 +745,58 @@ Source: [workflow run 31603189415](https://github.com/tetherto/qvac/actions/runs
 `@qvac/asr-ggml@0.1.1` addon (released 2026-08-03, pinning `parakeet-cpp`
 2026-08-03).
 
+### Multi-machine benchmark (2026-09)
+
+Maintainer-run measurement of Parakeet TDT 0.6b v3 across four machines and
+seven device-backend lanes, timed from outside the process — the engine's own
+timer is not quoted. Compute per transcription is an external two-point
+slope, so model load, process start-up, and wav decode cancel out of the
+number. Clips are byte-identical on all machines: `jfk.wav` 11.00 s,
+`ls90.wav` 98.49 s. Build: engine `46afe7d9`, ggml `speech@157b299f`,
+`parakeet-tdt-0.6b-v3.q8_0.gguf` (715 MiB, 100 % Q8_0 body).
+
+| Device | Backend | short 11.0 s | long 98.49 s |
+|---|---|--:|--:|
+| MacBook Air M5 | Metal | 60.53 ms (RTF 0.0055) | 755.80 ms (RTF 0.0077) |
+| MacBook Air M5 | CPU | 445.44 ms (RTF 0.0405) | withheld |
+| RTX 3080 desktop | CUDA | 13.49 ms (RTF 0.0012) | 115.51 ms (RTF 0.0012) |
+| RTX 3080 desktop | Vulkan | 15.41 ms (RTF 0.0014) | 143.98 ms (RTF 0.0015) |
+| Strix Halo | Vulkan | 30.21 ms (RTF 0.0027) | 228.27 ms (RTF 0.0023) |
+| RTX 5090 box | CUDA | 8.00 ms (RTF 0.0007) | 58.46 ms (RTF 0.0006) |
+| RTX 5090 box | Vulkan | 11.56 ms (RTF 0.0011) | 69.51 ms (RTF 0.0007) |
+
+Peak GPU memory on the long clip (`nvidia-smi` per-process sampling at 5 Hz,
+warm run only; RADV and Metal expose no equivalent counter): 2008 MiB on the
+RTX 3080 under CUDA and 1748 MiB under Vulkan; 2386 MiB on the RTX 5090
+under CUDA and 1935 MiB under Vulkan.
+
+Accuracy: jfk 0.00 % and ls90 0.80 % WER (`compute-wer.py`, `english`
+normaliser) on every lane; the statement of record stays the 500-utterance
+LibriSpeech run at 2.15–2.22 % across backends and quantisation tiers.
+
+Method and caveats:
+
+- **Two-point slope**: each cell runs the clip `R_lo=1` and `R_hi` times in
+  one process; `slope = (median_wall(R_hi) - median_wall(R_lo)) / (R_hi -
+  R_lo)`. `R_hi` = 11, or 51–101 for the short clip on the MacBook. 3 timed
+  reps per point (5 on the MacBook) plus an untimed warm-up, repeats via the
+  CLI's native `--bench-runs`, one job at a time, `CUDA_VISIBLE_DEVICES=0`,
+  `GGML_VK_VISIBLE_DEVICES=0`, thread count fixed per host (16 / 10 / 8).
+- **Backend proven per cell** by `.backend` in the bench JSON.
+- **Gate**: worst rep spread at `R_hi` per row — at most 10 % clean; rows
+  under proven host contention are withheld. The M5 CPU long row is withheld
+  because the measurement session drove the 16 GiB machine into swap, so
+  that row would measure the SSD; M5 rows in general carry fanless-throttling
+  spread of 7–24 % (three Metal sessions put the short clip at 51 / 61 /
+  81 ms), so treat them as directional.
+- **Linux CPU lanes are out of scope**: the shipping x86/Strix CPU path has
+  a known graph-structure inefficiency, fixed in engine PR #227 / registry
+  PR #360, neither of which is in the `46afe7d9` tree measured here. The M5
+  CPU short row is kept.
+- One build note: ggml needed `#include <cuda/iterator>` in
+  `src/ggml-cuda/{top-k,argsort}.cu` to compile under CUDA 13.3 (build fix
+  only).
+
 ### speech-cpp CI (2026-09-07)
 
 Fresh CPU-baseline snapshot from `speech-benchmark-desktop.yml` on the
