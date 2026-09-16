@@ -247,6 +247,14 @@ gate), outputs deterministic per cell and non-silent (peak amplitude
 `on MTL0`). One build note: the ggml Vulkan build needs the Khronos
 SPIRV-Headers include path on hosts without a system copy.
 
+The table is the campaign as measured at engine `0f9fc817`. The RTX 5090 GPU
+lanes were re-measured after the decode-loop work and the fast-AR graph cache
+(same harness, same protocol, same box): **CUDA 1.31 / 2.67 s, RTF 0.116**,
+slope 0.096 s per audio-second, and **Vulkan 1.65 / 3.73 s, RTF 0.157**, slope
+0.144. The intercept of the wall-versus-audio fit — what a caller pays before
+the first second of speech — is 0.45 s on CUDA and 0.32 s on Vulkan. The CPU
+lane and the other machines are unchanged and are not re-stated here.
+
 ## Documentation
 
 | Topic | Where |

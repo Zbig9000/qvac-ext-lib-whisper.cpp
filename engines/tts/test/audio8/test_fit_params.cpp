@@ -78,6 +78,26 @@ bool price(lm_model & lm, scratch & build, ::tts_cpp::detail::fit_graph_price & 
                                               2 * AUDIO8_MAX_NODES, out);
 }
 
+// What a real fast_step leaves allocated: one arena per position it ran.
+uint64_t real_fast_arena_bytes(const lm_model & model) {
+    uint64_t total = 0;
+    for (const lm_model::fast_graph & cached : model.fast_graphs) {
+        if (cached.allocr) total += ggml_gallocr_get_buffer_size(cached.allocr, 0);
+    }
+    return total;
+}
+
+// And in host RAM, one graph context per position. The projector multiplies
+// scratch_arena_bytes by this count, so the count is what has to be pinned --
+// the size itself comes from the same function the arenas are built with.
+uint64_t retained_fast_contexts(const lm_model & model) {
+    uint64_t kept = 0;
+    for (const lm_model::fast_graph & cached : model.fast_graphs) {
+        if (cached.ctx) ++kept;
+    }
+    return kept;
+}
+
 void run_synthetic_lm_gates() {
     const audio8_test::tiny_lm p;
     const std::string path = audio8_test::write_tiny_lm_gguf(
@@ -138,8 +158,10 @@ void run_synthetic_lm_gates() {
         }
     }
 
-    // 4. Fast arena parity: a real whole-frame fast_step vs the projected
-    //    prime/last maximum.
+    // 4. Fast arena parity: a real whole-frame fast_step vs the projected sum
+    //    over the positions. Each position keeps its own graph and its own
+    //    arena for the life of the model, so what a real frame leaves behind is
+    //    every one of them, not the widest.
     {
         std::vector<int32_t> codes;
         std::vector<float> prime_in((size_t) p.hidden, 0.0f);
@@ -147,21 +169,21 @@ void run_synthetic_lm_gates() {
         if (!fast_step(real, prime_in, p.semantic_begin, 2, pick, codes, &error)) {
             fail("real fast_step failed: " + error);
         } else {
-            ::tts_cpp::detail::fit_graph_price prime, last;
-            {
-                scratch build(AUDIO8_MAX_NODES);
-                build_fast_fit_graph(mm, build, 0, /*prime=*/true);
-                if (!price(mm, build, prime)) fail("pricing the fast prime graph failed");
+            ::tts_cpp::detail::fit_graph_price projected;
+            bool priced_on_device = true;
+            for (int position = 0; position < p.num_codebooks; ++position) {
+                scratch build(AUDIO8_FAST_MAX_NODES);
+                build_fast_fit_graph(mm, build, position, /*prime=*/position == 0);
+                ::tts_cpp::detail::fit_graph_price one;
+                if (!price(mm, build, one)) fail("pricing a fast position graph failed");
+                projected.device_bytes += one.device_bytes;
+                priced_on_device = priced_on_device && one.host_bytes == 0;
             }
-            {
-                scratch build(AUDIO8_MAX_NODES);
-                build_fast_fit_graph(mm, build, p.num_codebooks - 1, /*prime=*/false);
-                if (!price(mm, build, last)) fail("pricing the fast step graph failed");
-            }
-            if (prime.host_bytes == 0 && last.host_bytes == 0) {
-                expect_eq(std::max(prime.device_bytes, last.device_bytes),
-                          ggml_gallocr_get_buffer_size(real.fast_allocr, 0),
+            if (priced_on_device) {
+                expect_eq(projected.device_bytes, real_fast_arena_bytes(real),
                           "LM fast arena parity");
+                expect_eq((uint64_t) p.num_codebooks, retained_fast_contexts(real),
+                          "LM retained fast graph contexts");
             }
         }
     }
@@ -186,6 +208,67 @@ void run_synthetic_lm_gates() {
         fr = tts_cpp::audio8::fit_params(wrong);
         expect(fr.status == tts_cpp::FitStatus::Error,
                "wrong-architecture decoder was not Error");
+    }
+
+    // 6. A codebook count outside the supported range never reaches the
+    //    per-position pricing loop: the load rejects it first. The metadata
+    //    lies while the tensors stay tiny, which is exactly the malformed-file
+    //    shape the bound exists for.
+    {
+        const std::string absurd_path = path + ".absurd-codebooks";
+        ggml_context * headers = nullptr;
+        gguf_init_params open_params = {/*no_alloc=*/true, &headers};
+        gguf_context * g = gguf_init_from_file(path.c_str(), open_params);
+        expect(g != nullptr, "could not reopen the tiny LM to corrupt it");
+        if (g) {
+            gguf_set_val_u32(g, "audio8.lm.num_codebooks", 1u << 20);
+            gguf_write_to_file(g, absurd_path.c_str(), /*only_meta=*/true);
+            gguf_free(g);
+        }
+        if (headers) ggml_free(headers);
+
+        lm_model rejected;
+        fit_load_measure rejected_load;
+        std::string load_error;
+        expect(!load_lm_metadata_only(absurd_path, 0, rejected, rejected_load, &load_error),
+               "an absurd codebook count loaded anyway");
+        expect(load_error.find("codebooks") != std::string::npos,
+               "the rejection does not name the codebook count: '" + load_error + "'");
+        free_lm(rejected);
+        fs::remove(absurd_path);
+    }
+
+    // 7. How position prices combine, by dispatch path: replayed positions each
+    //    keep an arena and add; once any position is scheduler-backed, the
+    //    direct ones share one growing allocator and the scheduler ones share
+    //    the scheduler's, so the widest of each coexist.
+    {
+        ::tts_cpp::detail::fit_graph_price direct_small{100, 0, false};
+        ::tts_cpp::detail::fit_graph_price direct_large{300, 0, false};
+        ::tts_cpp::detail::fit_graph_price sched_small{50, 10, true};
+        ::tts_cpp::detail::fit_graph_price sched_large{200, 40, true};
+
+        ::tts_cpp::detail::fit_price_aggregate all_direct;
+        all_direct.add(direct_small);
+        all_direct.add(direct_large);
+        expect(all_direct.all_replayed(), "direct-only prices reported a scheduler");
+        expect_eq(400, all_direct.total().device_bytes, "direct-only device sum");
+
+        ::tts_cpp::detail::fit_price_aggregate mixed;
+        mixed.add(direct_small);
+        mixed.add(direct_large);
+        mixed.add(sched_small);
+        mixed.add(sched_large);
+        expect(!mixed.all_replayed(), "a scheduler-backed price went unnoticed");
+        expect_eq(500, mixed.total().device_bytes,
+                  "mixed device total is not widest-direct plus widest-sched");
+        expect_eq(40, mixed.total().host_bytes,
+                  "mixed host total is not the widest scheduler-backed portion");
+
+        ::tts_cpp::detail::fit_price_aggregate sched_only;
+        sched_only.add(sched_small);
+        sched_only.add(sched_large);
+        expect_eq(200, sched_only.total().device_bytes, "sched-only device peak");
     }
 
     fs::remove(path);
