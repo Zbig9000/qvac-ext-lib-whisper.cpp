@@ -35,8 +35,9 @@ struct parler_sampling_request {
     float top_p       = 1.0f;
 };
 
-// Reused across codebooks and decoding steps: sized on first use, so the
-// per-step sampler makes no heap allocations after the first frame.
+// Reused across codebooks and decoding steps: sized on first use, so with a
+// caller-owned frame buffer the per-step sampler makes no heap allocations
+// after the first frame.
 struct parler_sampler_scratch {
     std::vector<float>  scaled;   // temperature-scaled logits row
     std::vector<float>  work;     // top-k threshold selection workspace
@@ -53,11 +54,11 @@ parler_sampling_params parler_resolve_sampling(const parler_sampling_request & r
                                                std::string * repaired = nullptr);
 
 // logits: [n_codebooks, vocab] row-major (already logits-processed);
-// returns one token id per codebook.
-std::vector<int32_t> parler_sample_frame(const float * logits, int n_codebooks, int vocab,
-                                         const parler_sampling_params & params,
-                                         std::mt19937 & rng,
-                                         parler_sampler_scratch & scratch);
+// writes one token id per codebook into the caller-owned frame_out.
+void parler_sample_frame(const float * logits, int n_codebooks, int vocab,
+                         const parler_sampling_params & params,
+                         std::mt19937 & rng, parler_sampler_scratch & scratch,
+                         std::vector<int32_t> & frame_out);
 
 } // namespace detail
 } // namespace parler

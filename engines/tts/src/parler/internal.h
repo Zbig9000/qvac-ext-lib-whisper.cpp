@@ -212,12 +212,18 @@ bool parler_load_gguf_metadata_only(const std::string & path, parler_model & mod
                                     int n_gpu_layers, parler_fit_measure & measure,
                                     std::string * error = nullptr);
 
+// Whether the loader fuses the decode projections: GPU loads, mmap-backed CPU
+// loads (the duplicated originals stay file-backed and evictable there), and
+// metadata-only measure loads.  The CPU allocate-and-stream fallback stays
+// unfused so the projections are never resident twice in anonymous memory.
+// Setting PARLER_NO_FUSED disables fusion everywhere.
+bool parler_should_fuse_decode_weights(const parler_model & model, bool measuring);
+
 // Fuse the per-layer q|k|v projections and the n_codebooks LM heads into
 // row-concatenated tensors (fewer decode dispatches; byte-exact results).
-// Run by the loader on every backend; exposed so the model-free fused-vs-
-// separate parity test can exercise it on a synthetic model.  A non-null
-// `measure` sizes the fused buffer and wires the pointers without filling
-// (metadata-only loads have no weight data to concat).
+// Exposed so the model-free fused-vs-separate parity test can exercise it on
+// a synthetic model.  A non-null `measure` sizes the fused buffer and wires
+// the pointers without filling (metadata-only loads have no weight data).
 bool parler_fuse_decode_weights(parler_model & model,
                                 parler_fit_measure * measure = nullptr);
 

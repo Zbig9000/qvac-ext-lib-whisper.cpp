@@ -134,11 +134,11 @@ static void test_top_k_1_is_argmax() {
     parler_sampling_params p;   // sampling, but with a single-token nucleus
     p.top_k = 1;
     parler_sampler_scratch scratch;
+    std::vector<int32_t> f;
     bool all_argmax = true;
     for (int seed = 0; seed < 32; ++seed) {
         std::mt19937 rng((uint32_t) seed);
-        const std::vector<int32_t> f = parler_sample_frame(logits.data(), n_cb, vocab, p, rng,
-                                                           scratch);
+        parler_sample_frame(logits.data(), n_cb, vocab, p, rng, scratch, f);
         for (int k = 0; k < n_cb; ++k) if (f[k] != argmax[k]) all_argmax = false;
     }
     CHECK(all_argmax, "top_k=1 is argmax for every seed (this is why it is repaired)");
@@ -151,7 +151,8 @@ static void test_top_k_1_is_argmax() {
     std::set<int32_t> seen;
     std::mt19937 rng(1234);
     for (int i = 0; i < 200; ++i) {
-        seen.insert(parler_sample_frame(flat.data(), 1, vocab, s, rng, scratch)[0]);
+        parler_sample_frame(flat.data(), 1, vocab, s, rng, scratch, f);
+        seen.insert(f[0]);
     }
     CHECK(seen.size() > 1, "the repaired configuration actually samples");
 }
@@ -248,6 +249,7 @@ static void test_matches_full_vocab_reference() {
     const float ps[]    = { 1.0f, 0.9f, 0.4f };
 
     parler_sampler_scratch scratch;
+    std::vector<int32_t> frame;
     std::mt19937 gen(20260921);
     std::vector<float> row((size_t) vocab);
     bool tokens_match = true, streams_match = true;
@@ -265,9 +267,8 @@ static void test_matches_full_vocab_reference() {
                     const uint32_t seed = gen();
                     std::mt19937 rng_ref(seed), rng_new(seed);
                     const int32_t a = reference_sample_row(row.data(), vocab, p, rng_ref);
-                    const int32_t b = parler_sample_frame(row.data(), 1, vocab, p, rng_new,
-                                                          scratch)[0];
-                    if (a != b) tokens_match = false;
+                    parler_sample_frame(row.data(), 1, vocab, p, rng_new, scratch, frame);
+                    if (a != frame[0]) tokens_match = false;
                     if (rng_ref() != rng_new()) streams_match = false;
                 }
             }
@@ -281,8 +282,8 @@ static void test_matches_full_vocab_reference() {
     g.greedy = true;
     fill_row(row, gen, false, eos_id);
     std::mt19937 rng_a(7), rng_b(7);
-    CHECK(reference_sample_row(row.data(), vocab, g, rng_a) ==
-              parler_sample_frame(row.data(), 1, vocab, g, rng_b, scratch)[0],
+    parler_sample_frame(row.data(), 1, vocab, g, rng_b, scratch, frame);
+    CHECK(reference_sample_row(row.data(), vocab, g, rng_a) == frame[0],
           "greedy matches the reference argmax");
     CHECK(rng_a() == rng_b(), "greedy leaves the RNG untouched");
 }

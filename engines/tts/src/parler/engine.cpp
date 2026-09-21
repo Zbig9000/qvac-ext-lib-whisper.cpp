@@ -109,6 +109,7 @@ struct Engine::Impl {
         const parler_sampling_params & sp = sampling;
         std::mt19937 rng((uint32_t) opts.seed);
         parler_sampler_scratch scratch;
+        std::vector<int32_t> frame;
 
         parler_step_logits logits;
         int n_past = 0;
@@ -154,8 +155,9 @@ struct Engine::Impl {
         while (true) {
             check_cancel();
             st.process_logits(logits.view, hp.dec_vocab);
-            st.append(parler_sample_frame(logits.view, hp.n_codebooks, hp.dec_vocab, sp, rng,
-                                          scratch));
+            parler_sample_frame(logits.view, hp.n_codebooks, hp.dec_vocab, sp, rng, scratch,
+                                frame);
+            st.append(frame);
             if (st.finished()) break;
             if (!parler_dec_step(model, st.input_frame(), n_past, allocr, n_threads, logits)) {
                 throw std::runtime_error("parler: decoder step failed");

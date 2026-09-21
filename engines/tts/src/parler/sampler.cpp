@@ -47,39 +47,22 @@ void collect_candidates(const std::vector<float> & scaled, float thresh,
     }
 }
 
-// HF top-p: keep the smallest descending prefix whose mass exceeds top_p.
-// Restores ascending id order afterwards so the multinomial walk below sums
-// probabilities in the same order as a full-vocabulary pass.
-void shrink_to_nucleus(const std::vector<float> & scaled, float top_p,
-                       std::vector<int> & cand, std::vector<double> & probs) {
+void sort_candidates_by_logit_descending(const std::vector<float> & scaled,
+                                         std::vector<int> & cand) {
     std::sort(cand.begin(), cand.end(),
               [&](int a, int b) { return scaled[a] > scaled[b]; });
-    const float max_l = scaled[cand[0]];
-    probs.resize(cand.size());
-    double denom = 0.0;
-    for (size_t j = 0; j < cand.size(); ++j) {
-        probs[j] = std::exp((double) scaled[cand[j]] - max_l);
-        denom += probs[j];
-    }
-    size_t keep = cand.size();
-    double cum = 0.0;
-    for (size_t j = 0; j < cand.size(); ++j) {
-        cum += probs[j] / denom;
-        if (cum > top_p) {
-            keep = j + 1;
-            break;
-        }
-    }
-    cand.resize(keep);
-    std::sort(cand.begin(), cand.end());
 }
 
-// softmax + multinomial over the candidates, one uniform draw per row.
-int32_t draw_from_candidates(const std::vector<float> & scaled,
-                             const std::vector<int> & cand,
-                             std::vector<double> & probs, std::mt19937 & rng) {
+float max_candidate_logit(const std::vector<float> & scaled, const std::vector<int> & cand) {
     float max_l = -std::numeric_limits<float>::infinity();
     for (int i : cand) max_l = std::max(max_l, scaled[i]);
+    return max_l;
+}
+
+// Numerators of softmax(scaled[cand] - max_l); masked (-inf) candidates get
+// probability zero and are excluded from the returned denominator.
+double softmax_numerators(const std::vector<float> & scaled, const std::vector<int> & cand,
+                          float max_l, std::vector<double> & probs) {
     probs.assign(cand.size(), 0.0);
     double denom = 0.0;
     for (size_t j = 0; j < cand.size(); ++j) {
@@ -88,14 +71,47 @@ int32_t draw_from_candidates(const std::vector<float> & scaled,
         probs[j] = std::exp((double) v - max_l);
         denom += probs[j];
     }
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-    const double r = dist(rng) * denom;
+    return denom;
+}
+
+// HF top-p cut: the smallest descending prefix whose mass exceeds top_p.
+size_t nucleus_keep_count(const std::vector<double> & probs, double denom, float top_p) {
+    double cum = 0.0;
+    for (size_t j = 0; j < probs.size(); ++j) {
+        cum += probs[j] / denom;
+        if (cum > top_p) return j + 1;
+    }
+    return probs.size();
+}
+
+int32_t pick_by_cumulative(const std::vector<int> & cand,
+                           const std::vector<double> & probs, double r) {
     double cum = 0.0;
     for (size_t j = 0; j < cand.size(); ++j) {
         cum += probs[j];
         if (r <= cum) return cand[j];
     }
     return cand.back();
+}
+
+// Restores ascending id order afterwards so the multinomial walk sums
+// probabilities in the same order as a full-vocabulary pass.
+void shrink_to_nucleus(const std::vector<float> & scaled, float top_p,
+                       std::vector<int> & cand, std::vector<double> & probs) {
+    sort_candidates_by_logit_descending(scaled, cand);
+    const double denom = softmax_numerators(scaled, cand, scaled[cand[0]], probs);
+    cand.resize(nucleus_keep_count(probs, denom, top_p));
+    std::sort(cand.begin(), cand.end());
+}
+
+// softmax + multinomial over the candidates, one uniform draw per row.
+int32_t draw_from_candidates(const std::vector<float> & scaled,
+                             const std::vector<int> & cand,
+                             std::vector<double> & probs, std::mt19937 & rng) {
+    const float max_l = max_candidate_logit(scaled, cand);
+    const double denom = softmax_numerators(scaled, cand, max_l, probs);
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    return pick_by_cumulative(cand, probs, dist(rng) * denom);
 }
 
 int32_t sample_row(const float * row, int vocab, const parler_sampling_params & p,
@@ -143,15 +159,14 @@ parler_sampling_params parler_resolve_sampling(const parler_sampling_request & r
     return p;
 }
 
-std::vector<int32_t> parler_sample_frame(const float * logits, int n_codebooks, int vocab,
-                                         const parler_sampling_params & params,
-                                         std::mt19937 & rng,
-                                         parler_sampler_scratch & scratch) {
-    std::vector<int32_t> frame((size_t) n_codebooks);
+void parler_sample_frame(const float * logits, int n_codebooks, int vocab,
+                         const parler_sampling_params & params,
+                         std::mt19937 & rng, parler_sampler_scratch & scratch,
+                         std::vector<int32_t> & frame_out) {
+    frame_out.resize((size_t) n_codebooks);
     for (int k = 0; k < n_codebooks; ++k) {
-        frame[k] = sample_row(logits + (size_t) k * vocab, vocab, params, rng, scratch);
+        frame_out[k] = sample_row(logits + (size_t) k * vocab, vocab, params, rng, scratch);
     }
-    return frame;
 }
 
 } // namespace detail

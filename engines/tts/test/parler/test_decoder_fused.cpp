@@ -1,12 +1,16 @@
-// Model-free decoder coverage for the CPU decode optimizations: fused q|k|v +
+// Model-free decoder coverage for the CPU decode optimizations, run once per
+// supported projection quantization (f32, f16, q8_0, q6_k): fused q|k|v +
 // stacked LM-head projections must reproduce the separate-weight logits
 // byte-for-byte on the decode step (and within float tolerance on prefill,
 // where the wider GEMM may tile differently), and on a host backend the
 // prefill/step logits hand out a zero-copy view into the graph buffer.
+// Also pins the fusion gate: mmap-backed CPU, GPU, and measure loads fuse;
+// the CPU allocate-and-stream fallback and PARLER_NO_FUSED do not.
 // Runs on a synthetic two-layer model, so it needs no GGUF fixture.
 
 #include "parler/internal.h"
 #include "backend_selection.h"
+#include "../test_env_portable.h"
 
 #include <cmath>
 #include <cstdio>
@@ -27,10 +31,11 @@ static int g_failures = 0;
 
 namespace {
 
-constexpr int D          = 64;
+// q6_k superblocks span 256 values, so the fused dimension must be a multiple.
+constexpr int D          = 256;
 constexpr int N_HEAD     = 4;
 constexpr int N_LAYER    = 2;
-constexpr int D_FF       = 128;
+constexpr int D_FF       = 256;
 constexpr int N_CB       = 3;
 constexpr int VOCAB      = 32;
 constexpr int CROSS_LEN  = 5;
@@ -53,17 +58,42 @@ struct det_rng {
     }
 };
 
-void fill_tensor(ggml_tensor * t, det_rng & rng, float bias) {
-    std::vector<float> host(ggml_nelements(t));
+std::vector<float> random_host_values(ggml_tensor * t, det_rng & rng, float bias) {
+    std::vector<float> host((size_t) ggml_nelements(t));
     for (float & v : host) v = bias + rng.next();
+    return host;
+}
+
+void fill_f32_tensor(ggml_tensor * t, det_rng & rng, float bias) {
+    const std::vector<float> host = random_host_values(t, rng, bias);
     ggml_backend_tensor_set(t, host.data(), 0, host.size() * sizeof(float));
 }
 
-ggml_tensor * new_weight(ggml_context * ctx, int64_t ne0, int64_t ne1) {
+// Projection weights carry the type under test; quantization runs on the host
+// values so both decode runs see identical bytes.
+void fill_typed_tensor(ggml_tensor * t, det_rng & rng) {
+    const std::vector<float> host = random_host_values(t, rng, 0.0f);
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(t, host.data(), 0, host.size() * sizeof(float));
+        return;
+    }
+    if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> h16(host.size());
+        ggml_fp32_to_fp16_row(host.data(), h16.data(), (int64_t) host.size());
+        ggml_backend_tensor_set(t, h16.data(), 0, h16.size() * sizeof(ggml_fp16_t));
+        return;
+    }
+    std::vector<uint8_t> quantized(ggml_nbytes(t));
+    ggml_quantize_chunk(t->type, host.data(), quantized.data(), 0,
+                        t->ne[1], t->ne[0], nullptr);
+    ggml_backend_tensor_set(t, quantized.data(), 0, quantized.size());
+}
+
+ggml_tensor * new_f32(ggml_context * ctx, int64_t ne0, int64_t ne1) {
     return ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
 }
 
-bool build_model(parler_model & model) {
+bool build_model(parler_model & model, ggml_type wtype) {
     parler_hparams & hp = model.hparams;
     hp.dec_n_layer    = N_LAYER;
     hp.dec_d_model    = D;
@@ -91,30 +121,30 @@ bool build_model(parler_model & model) {
     }
     model.dec_layers.resize(N_LAYER);
     for (auto & l : model.dec_layers) {
-        l.attn_norm_w  = new_weight(model.ctx_w, D, 1);
-        l.attn_norm_b  = new_weight(model.ctx_w, D, 1);
-        l.q            = new_weight(model.ctx_w, D, D);
-        l.k            = new_weight(model.ctx_w, D, D);
-        l.v            = new_weight(model.ctx_w, D, D);
-        l.o            = new_weight(model.ctx_w, D, D);
-        l.cross_norm_w = new_weight(model.ctx_w, D, 1);
-        l.cross_norm_b = new_weight(model.ctx_w, D, 1);
-        l.cq           = new_weight(model.ctx_w, D, D);
-        l.co           = new_weight(model.ctx_w, D, D);
-        l.ffn_norm_w   = new_weight(model.ctx_w, D, 1);
-        l.ffn_norm_b   = new_weight(model.ctx_w, D, 1);
-        l.up           = new_weight(model.ctx_w, D, D_FF);
-        l.down         = new_weight(model.ctx_w, D_FF, D);
+        l.attn_norm_w  = new_f32(model.ctx_w, D, 1);
+        l.attn_norm_b  = new_f32(model.ctx_w, D, 1);
+        l.q            = ggml_new_tensor_2d(model.ctx_w, wtype, D, D);
+        l.k            = ggml_new_tensor_2d(model.ctx_w, wtype, D, D);
+        l.v            = ggml_new_tensor_2d(model.ctx_w, wtype, D, D);
+        l.o            = new_f32(model.ctx_w, D, D);
+        l.cross_norm_w = new_f32(model.ctx_w, D, 1);
+        l.cross_norm_b = new_f32(model.ctx_w, D, 1);
+        l.cq           = new_f32(model.ctx_w, D, D);
+        l.co           = new_f32(model.ctx_w, D, D);
+        l.ffn_norm_w   = new_f32(model.ctx_w, D, 1);
+        l.ffn_norm_b   = new_f32(model.ctx_w, D, 1);
+        l.up           = new_f32(model.ctx_w, D, D_FF);
+        l.down         = new_f32(model.ctx_w, D_FF, D);
     }
-    model.embed_positions   = new_weight(model.ctx_w, D, MAX_POS);
-    model.embed_prompts     = new_weight(model.ctx_w, D, PROMPT_VOCAB);
-    model.dec_output_norm_w = new_weight(model.ctx_w, D, 1);
-    model.dec_output_norm_b = new_weight(model.ctx_w, D, 1);
+    model.embed_positions   = new_f32(model.ctx_w, D, MAX_POS);
+    model.embed_prompts     = new_f32(model.ctx_w, D, PROMPT_VOCAB);
+    model.dec_output_norm_w = new_f32(model.ctx_w, D, 1);
+    model.dec_output_norm_b = new_f32(model.ctx_w, D, 1);
     model.dec_embed.resize(N_CB);
     model.lm_heads.resize(N_CB);
     for (int k = 0; k < N_CB; ++k) {
-        model.dec_embed[k] = new_weight(model.ctx_w, D, BOS_ID + 2);
-        model.lm_heads[k]  = new_weight(model.ctx_w, D, VOCAB);
+        model.dec_embed[k] = new_f32(model.ctx_w, D, BOS_ID + 2);
+        model.lm_heads[k]  = ggml_new_tensor_2d(model.ctx_w, wtype, D, VOCAB);
     }
     model.buffer_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
     if (!model.buffer_w) return false;
@@ -122,7 +152,11 @@ bool build_model(parler_model & model) {
     det_rng rng;
     for (ggml_tensor * t = ggml_get_first_tensor(model.ctx_w); t;
          t = ggml_get_next_tensor(model.ctx_w, t)) {
-        fill_tensor(t, rng, t->ne[1] == 1 ? 1.0f : 0.0f);
+        if (t->type != GGML_TYPE_F32) {
+            fill_typed_tensor(t, rng);
+        } else {
+            fill_f32_tensor(t, rng, t->ne[1] == 1 ? 1.0f : 0.0f);
+        }
     }
 
     {
@@ -144,14 +178,14 @@ bool build_model(parler_model & model) {
         model.cross_k.resize(N_LAYER);
         model.cross_v_t.resize(N_LAYER);
         for (int l = 0; l < N_LAYER; ++l) {
-            model.cross_k[l]   = new_weight(model.ctx_cross, D, CROSS_LEN);
-            model.cross_v_t[l] = new_weight(model.ctx_cross, CROSS_LEN, D);
+            model.cross_k[l]   = new_f32(model.ctx_cross, D, CROSS_LEN);
+            model.cross_v_t[l] = new_f32(model.ctx_cross, CROSS_LEN, D);
         }
         model.buffer_cross = ggml_backend_alloc_ctx_tensors(model.ctx_cross, model.backend);
         if (!model.buffer_cross) return false;
         for (int l = 0; l < N_LAYER; ++l) {
-            fill_tensor(model.cross_k[l], rng, 0.0f);
-            fill_tensor(model.cross_v_t[l], rng, 0.0f);
+            fill_f32_tensor(model.cross_k[l], rng, 0.0f);
+            fill_f32_tensor(model.cross_v_t[l], rng, 0.0f);
         }
         model.cross_len = CROSS_LEN;
     }
@@ -192,19 +226,24 @@ float max_abs_diff(const std::vector<float> & a, const std::vector<float> & b) {
     return m;
 }
 
-} // namespace
+void run_type_case(ggml_type wtype) {
+    const char * tn = ggml_type_name(wtype);
+    fprintf(stderr, "parler decoder fused: projections %s\n", tn);
 
-int main() {
     parler_model model;
-    if (!build_model(model)) {
-        fprintf(stderr, "parler decoder fused: model construction failed\n");
-        return 1;
+    if (!build_model(model, wtype)) {
+        ++g_failures;
+        fprintf(stderr, "FAIL: %s model construction\n", tn);
+        parler_free_model(model);
+        return;
     }
     ggml_gallocr_t allocr = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(model.backend));
     if (!allocr) {
-        fprintf(stderr, "parler decoder fused: allocator creation failed\n");
-        return 1;
+        ++g_failures;
+        fprintf(stderr, "FAIL: %s allocator creation\n", tn);
+        parler_free_model(model);
+        return;
     }
 
     std::vector<std::vector<float>> separate, fused;
@@ -221,7 +260,7 @@ int main() {
     if (separate.size() == fused.size() && !separate.empty()) {
         // prefill (N > 1) may tile the wider GEMM differently; the N=1 decode
         // steps are per-row dot products and must not move a single bit
-        CHECK(max_abs_diff(separate[0], fused[0]) <= 1e-6f,
+        CHECK(max_abs_diff(separate[0], fused[0]) <= 1e-5f,
               "fused prefill logits match within float tolerance");
         for (size_t s = 1; s < separate.size(); ++s) {
             CHECK(std::memcmp(separate[s].data(), fused[s].data(),
@@ -234,6 +273,40 @@ int main() {
 
     ggml_gallocr_free(allocr);
     parler_free_model(model);
+}
+
+void test_fusion_gate() {
+    parler_model m;
+    m.on_gpu  = false;
+    m.map_buf = nullptr;
+    CHECK(!parler_should_fuse_decode_weights(m, false),
+          "CPU allocate-and-stream load does not fuse");
+    CHECK(parler_should_fuse_decode_weights(m, true), "measure-mode load fuses");
+    m.on_gpu = true;
+    CHECK(parler_should_fuse_decode_weights(m, false), "GPU load fuses");
+
+    m.on_gpu = false;
+    static uint8_t backing[64];
+    m.map_buf = ggml_backend_cpu_buffer_from_ptr(backing, sizeof(backing));
+    CHECK(m.map_buf != nullptr && parler_should_fuse_decode_weights(m, false),
+          "mmap-backed CPU load fuses");
+
+    setenv("PARLER_NO_FUSED", "1", 1);
+    CHECK(!parler_should_fuse_decode_weights(m, false) &&
+              !parler_should_fuse_decode_weights(m, true),
+          "PARLER_NO_FUSED disables fusion on every path");
+    unsetenv("PARLER_NO_FUSED");
+
+    ggml_backend_buffer_free(m.map_buf);
+    m.map_buf = nullptr;
+}
+
+} // namespace
+
+int main() {
+    test_fusion_gate();
+    const ggml_type types[] = { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K };
+    for (ggml_type t : types) run_type_case(t);
 
     if (g_failures == 0) {
         fprintf(stderr, "parler decoder fused: PASS\n");
