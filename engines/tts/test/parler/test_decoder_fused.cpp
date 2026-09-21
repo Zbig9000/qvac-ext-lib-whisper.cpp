@@ -286,7 +286,8 @@ void test_fusion_gate() {
     CHECK(parler_should_fuse_decode_weights(m, false), "GPU load fuses");
 
     m.on_gpu = false;
-    static uint8_t backing[64];
+    // ggml_backend_cpu_buffer_from_ptr asserts TENSOR_ALIGNMENT (32 bytes)
+    alignas(64) static uint8_t backing[64];
     m.map_buf = ggml_backend_cpu_buffer_from_ptr(backing, sizeof(backing));
     CHECK(m.map_buf != nullptr && parler_should_fuse_decode_weights(m, false),
           "mmap-backed CPU load fuses");
