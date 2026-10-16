@@ -49,12 +49,28 @@ void expect(bool cond, const std::string & what) {
     }
 }
 
+void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+void unset_env(const char * name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
 int load(const std::string & gguf, ParakeetCtcModel & model) {
     return load_from_gguf(gguf, model, /*n_threads=*/0, /*n_gpu_layers=*/0, /*verbose=*/false);
 }
 
 void check_rejected_without_sidecar(const std::string & coreml_gguf) {
-    setenv(kDisableEnv, "1", 1);
+    set_env(kDisableEnv, "1");
     ParakeetCtcModel model;
     expect(load(coreml_gguf, model) == kGgufLoadNoEncoderWeights,
            "an encoder-less GGUF must be rejected with kGgufLoadNoEncoderWeights without a sidecar");
@@ -64,7 +80,7 @@ void check_rejected_without_sidecar(const std::string & coreml_gguf) {
     expect(load_from_gguf_metadata_only(coreml_gguf, measured, 0, 0, false, measure) ==
                kGgufLoadNoEncoderWeights,
            "the memory-fit loader must reject an encoder-less GGUF");
-    unsetenv(kDisableEnv);
+    unset_env(kDisableEnv);
 }
 
 #ifdef PARAKEET_USE_COREML
@@ -132,10 +148,10 @@ void check_coreml_only_skips_encoder_weights(const std::string & full_gguf,
     expect(full.impl && !model_encoder_owned_by_coreml(full),
            "without PARAKEET_COREML_ONLY the ggml encoder weights are loaded");
 
-    setenv(kOnlyEnv, "1", 1);
+    set_env(kOnlyEnv, "1");
     ParakeetCtcModel owned;
     expect(load(staged.string(), owned) == 0, "the full GGUF must load under PARAKEET_COREML_ONLY");
-    unsetenv(kOnlyEnv);
+    unset_env(kOnlyEnv);
     expect(owned.impl && model_encoder_owned_by_coreml(owned),
            "PARAKEET_COREML_ONLY must hand the encoder to Core ML");
     if (full.impl && owned.impl) {
