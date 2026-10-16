@@ -291,6 +291,84 @@ Source: [workflow run 31603189415](https://github.com/tetherto/qvac/actions/runs
 `@qvac/asr-ggml@0.1.1` addon (released 2026-08-03, pinning `parakeet-cpp`
 2026-08-03).
 
+## TranscribePsy long-form CPU windows (2026-10)
+
+[TranscribePsy-250M-EU-sub](https://huggingface.co/qvac/TranscribePsy-250M-EU-sub-gguf)
+q8_0 on a 412.7 s recording (the three `test/samples` clips concatenated twelve
+times), x86-64 Linux, eight threads, ggml CPU encoder and decoder. The engine's
+automatic long-form window (300 s, 256 frames of context) against the 60 s /
+25 % windows the model was validated with on phones
+(`--window-sec 60 --overlap 0.25`), and the memory work that lets a windowed
+pass hold one encoder graph and release the audio and STFT scratch once the mel
+exists:
+
+| Build | Windows | Mel | Encoder | Decoder | Peak RSS |
+|---|---|--:|--:|--:|--:|
+| before this work, automatic window | 2 x 300 s | 38 ms | 19.6 s | 92 ms | 4.4 GB |
+| this work, automatic window | 2 x 300 s | 19 ms | 18.0 s | 102 ms | 2.4 GB |
+| this work, `--window-sec 60 --overlap 0.25` | 10 x 60 s | 19 ms | 10.8 s | 86 ms | 0.9 GB |
+| TranscribePsy fork (q8_0 host decoder), 60 s / 25 % default | 10 x 60 s | 141 ms | 12.8 s | 379 ms | 1.6 GB |
+
+The ggml-graph CPU decoder is 3 to 4 times faster than the fork's packed q8_0
+host decoder on the same input (92 ms against 379 ms here; 5 ms against 12 ms
+on `jfk.wav`), which is why that decoder was not brought over. The blocked STFT
+halves the mel time and bounds its scratch by a 2048-frame block instead of the
+input length. Short clips are unchanged: `jfk.wav` (11 s) encodes in 170 ms and
+decodes in 5 ms, RTF 0.016.
+
+### TranscribePsy on the Apple Neural Engine (Mac mini M4, 2026-10)
+
+The same 412.7 s recording on a Mac mini M4 (macOS 15.3, six threads), built
+with `PARAKEET_COREML=ON`, with the published
+[Core ML distribution](https://huggingface.co/qvac/TranscribePsy-250M-EU-sub-coreml)
+(encoder-less GGUF, fixed-window Neural Engine encoder, 16-lane TDT decoder)
+against the q8_0 GGUF on the ggml CPU encoder and decoder. Engine times are
+`EngineResult` stage times from `test-transcribepsy --long-wav`; CLI times are
+the `[BENCH]` line and `/usr/bin/time -l`:
+
+| Path | Encoder | Decoder | Total | RTF | Peak RSS |
+|---|--:|--:|--:|--:|--:|
+| `Engine::transcribe`, Core ML GGUF: 34 pause-cut segments on the Neural Engine encoder, batched Neural Engine decoder | 529 ms | 420 ms | 968 ms | 0.0023 | |
+| `Engine::transcribe`, q8_0 GGUF: ggml CPU, automatic 300 s windows | 27.5 s | 202 ms | 27.7 s | 0.067 | |
+| CLI, Core ML GGUF: 34 Neural Engine encoder windows (15 s, 16 frames of context), ggml CPU decoder | 501 ms | 191 ms | 709 ms | 0.0017 | 251 MB |
+| CLI, q8_0 GGUF: ggml CPU, `--window-sec 60 --overlap 0.25` | 12.0 s | 192 ms | 12.2 s | 0.030 | 1.0 GB |
+
+`jfk.wav` (11 s): 18 ms on the Neural Engine encoder against 145 ms on the M4
+CPU; the batched decoder takes 59 ms for that single segment against 5 ms for
+the sequential CPU decoder, since one segment fills one of its 16 lanes. The
+Neural Engine decoder pays off on phones, where the prediction network is
+memory-bandwidth bound; on the M4 the CPU decoder is faster, and
+`PARAKEET_ANE_BATCH_DECODE=0` keeps the Neural Engine encoder with the
+sequential decoder.
+
+Accuracy on that recording, word error rate against the three clips' own
+single-clip transcripts repeated twelve times (the clips are concatenated
+without pauses, so every seam falls in running speech). The 15 s Neural
+Engine windows with 1.28 s of seam context are the fork's published geometry;
+the same geometry on the ggml encoder is given for reference, and the TDT
+greedy decoder's sensitivity to it is large (187 against 188 encoder frames per
+window changes the result by three points):
+
+| Path | WER |
+|---|--:|
+| CLI, q8_0 GGUF, ggml CPU, `--window-sec 60 --overlap 0.25` | 5.1 % |
+| `Engine::transcribe`, q8_0 GGUF, ggml CPU, automatic 300 s windows | 7.1 % |
+| CLI, ggml CPU at the Neural Engine geometry (187-frame windows, 16 frames of context) | 8.1 % |
+| CLI, ggml CPU, 188-frame windows, 16 frames of context | 11.2 % |
+| CLI, Core ML GGUF, Neural Engine encoder windows, ggml decoder | 10.5 % |
+| CLI, Core ML GGUF, Neural Engine encoder windows with 32 frames of context (`PARAKEET_COREML_ANE_CONTEXT_FRAMES=32`) | 8.4 % |
+| `Engine::transcribe`, Core ML GGUF, pause-cut segments and the batched Neural Engine decoder | 11.6 % |
+| The TranscribePsy fork's own CLI on the Core ML GGUF (its internal 1500-frame tiler and q8_0 host decoder) | 7.1 % |
+
+The committed frames nearest a window's right edge differ most from the
+full-context encoder (cosine 0.63 to 0.72 against 0.84 mid-window), so the
+loss comes from the short seam context, not from the Neural Engine arithmetic:
+a single 15 s window matches the ggml encoder frame for frame (cosine 0.98)
+and transcribes the sample clips identically. Long recordings where accuracy
+matters more than speed should take the 60 s / 25 % CPU windows; the Neural
+Engine paths are the fastest and lightest option and were validated by the
+fork on short utterances and pause-rich recordings.
+
 ## Multi-machine benchmark (2026-09)
 
 Maintainer-run measurement of Parakeet TDT 0.6b v3 across four machines and
