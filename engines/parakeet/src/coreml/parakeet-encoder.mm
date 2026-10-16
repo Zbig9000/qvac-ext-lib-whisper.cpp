@@ -34,6 +34,9 @@ namespace {
 NSString * const kAneMelInput     = @"mel";
 NSString * const kAnePadMaskInput = @"pad_mask";
 NSString * const kAneKeyBiasInput = @"key_bias";
+// Optional: exports that mask every subsampling resolution take the
+// mel-frame validity too; the published TranscribePsy export does not.
+NSString * const kAneMelMaskInput = @"mel_mask";
 
 // Additive attention bias for pad keys. Matches KEY_BIAS_PAD in the exporter:
 // fp16 -inf would make an all-pad softmax row NaN, -1e4 saturates just as hard.
@@ -387,6 +390,7 @@ struct parakeet_coreml_context {
     const void * valid_mask_array   = nullptr;  // retained MLMultiArray * (AOSC)
     const void * pad_mask_array     = nullptr;  // retained MLMultiArray * (fixed-window export)
     const void * key_bias_array     = nullptr;  // retained MLMultiArray * (fixed-window export)
+    const void * mel_mask_array     = nullptr;  // retained MLMultiArray * (fixed-window export, optional)
     const void * input_provider     = nullptr;  // retained MLDictionaryFeatureProvider *
     const void * output_array       = nullptr;  // retained MLMultiArray * (when shape is fixed)
     const void * prediction_options = nullptr;  // retained MLPredictionOptions *
@@ -443,6 +447,7 @@ void release_cached_io(parakeet_coreml_context * ctx) {
     if (ctx->valid_mask_array   != nullptr) CFRelease(ctx->valid_mask_array);
     if (ctx->pad_mask_array     != nullptr) CFRelease(ctx->pad_mask_array);
     if (ctx->key_bias_array     != nullptr) CFRelease(ctx->key_bias_array);
+    if (ctx->mel_mask_array     != nullptr) CFRelease(ctx->mel_mask_array);
     if (ctx->input_array        != nullptr) CFRelease(ctx->input_array);
     ctx->prediction_options = nullptr;
     ctx->output_array       = nullptr;
@@ -450,6 +455,7 @@ void release_cached_io(parakeet_coreml_context * ctx) {
     ctx->valid_mask_array   = nullptr;
     ctx->pad_mask_array     = nullptr;
     ctx->key_bias_array     = nullptr;
+    ctx->mel_mask_array     = nullptr;
     ctx->input_array        = nullptr;
     ctx->cached_mel_frames  = 0;
     ctx->cached_mels        = 0;
@@ -471,6 +477,7 @@ bool prepare_cached_ane_io(parakeet_coreml_context * ctx, MLModel * model, NSStr
     MLMultiArrayConstraint * mel_c  = ins[kAneMelInput].multiArrayConstraint;
     MLMultiArrayConstraint * mask_c = ins[kAnePadMaskInput].multiArrayConstraint;
     MLMultiArrayConstraint * bias_c = ins[kAneKeyBiasInput].multiArrayConstraint;
+    MLMultiArrayConstraint * mel_mask_c = ins[kAneMelMaskInput].multiArrayConstraint;
     MLMultiArrayConstraint * out_c  =
         model.modelDescription.outputDescriptionsByName[out_name].multiArrayConstraint;
     if (mel_c == nil || mask_c == nil || bias_c == nil || out_c == nil) return false;
@@ -485,12 +492,20 @@ bool prepare_cached_ane_io(parakeet_coreml_context * ctx, MLModel * model, NSStr
     MLMultiArray * out_arr  = build_array(out_c.shape,  out_c.dataType,  &err);
     if (out_arr == nil || err != nil) return false;
 
+    NSMutableDictionary<NSString *, id> * inputs = [NSMutableDictionary dictionaryWithDictionary:@{
+        kAneMelInput     : mel_arr,
+        kAnePadMaskInput : mask_arr,
+        kAneKeyBiasInput : bias_arr,
+    }];
+    MLMultiArray * mel_mask_arr = nil;
+    if (mel_mask_c != nil) {
+        mel_mask_arr = build_array(mel_mask_c.shape, mel_mask_c.dataType, &err);
+        if (mel_mask_arr == nil || err != nil) return false;
+        inputs[kAneMelMaskInput] = mel_mask_arr;
+    }
+
     MLDictionaryFeatureProvider * provider =
-        [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{
-            kAneMelInput     : mel_arr,
-            kAnePadMaskInput : mask_arr,
-            kAneKeyBiasInput : bias_arr,
-        } error:&err];
+        [[MLDictionaryFeatureProvider alloc] initWithDictionary:inputs error:&err];
     if (provider == nil || err != nil) return false;
 
     MLPredictionOptions * options = [[MLPredictionOptions alloc] init];
@@ -499,6 +514,7 @@ bool prepare_cached_ane_io(parakeet_coreml_context * ctx, MLModel * model, NSStr
     ctx->input_array        = CFBridgingRetain(mel_arr);
     ctx->pad_mask_array     = CFBridgingRetain(mask_arr);
     ctx->key_bias_array     = CFBridgingRetain(bias_arr);
+    if (mel_mask_arr != nil) ctx->mel_mask_array = CFBridgingRetain(mel_mask_arr);
     ctx->input_provider     = CFBridgingRetain(provider);
     ctx->prediction_options = CFBridgingRetain(options);
     ctx->output_array       = CFBridgingRetain(out_arr);
@@ -542,8 +558,9 @@ bool bind_ane_window(parakeet_coreml_context * ctx, MLModel * model, NSString * 
 
 // One window of the fixed-window export: a shorter input is zero-padded to the
 // window and its padded encoder frames are masked out of attention and the
-// convolution module, so the valid frames come out as if the input had ended
-// there. `n_enc_frames` is the caller's frame count for `n_mel_frames`.
+// convolution module (and, when the export takes `mel_mask`, out of every
+// subsampling resolution), so the valid frames come out as if the input had
+// ended there. `n_enc_frames` is the caller's frame count for `n_mel_frames`.
 int encode_ane_window(parakeet_coreml_context * ctx,
                       int64_t n_mel_frames, int64_t n_mels, const float * mel,
                       int64_t n_enc_frames, int64_t d_model, float * encoder_out) {
@@ -561,6 +578,10 @@ int encode_ane_window(parakeet_coreml_context * ctx,
     if (!fill_input_array(mel_arr, /*transpose=*/true, mel, n_mel_frames, ane.window_mel, n_mels)) return 3;
     if (!fill_split_array(mask_arr, n_enc_frames, ane.enc_frames, 1.0f, 0.0f)) return 3;
     if (!fill_split_array(bias_arr, n_enc_frames, ane.enc_frames, 0.0f, kAneKeyBiasPad)) return 3;
+    if (ctx->mel_mask_array != nullptr) {
+        MLMultiArray * mel_mask_arr = (__bridge MLMultiArray *) ctx->mel_mask_array;
+        if (!fill_split_array(mel_mask_arr, n_mel_frames, ane.window_mel, 1.0f, 0.0f)) return 3;
+    }
 
     NSError * err = nil;
     MLDictionaryFeatureProvider * provider =

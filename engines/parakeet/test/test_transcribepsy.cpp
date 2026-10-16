@@ -7,7 +7,10 @@
 //      the main thread, changes neither result;
 //   4. a 150 s tiling transcribed with the 60 s / 25 % windows recommended on
 //      phones matches the single pass to a high word similarity;
-//   5. EngineResult's stage times account for total_ms.
+//   5. EngineResult's stage times account for total_ms;
+//   6. transcribe_mel rejects a PrecomputedMel whose buffer does not hold the
+//      declared frames x bins (empty, truncated, oversized, zero frames, wrong
+//      bin count, absurd frame count) and still accepts an intact one.
 //
 // With --long-wav it additionally transcribes that recording once and prints
 // the stage times and the transcript, for measuring a long input on whichever
@@ -28,6 +31,7 @@
 #include <cstdlib>
 #include <exception>
 #include <future>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -174,6 +178,51 @@ int check_concurrent_mel(Engine & engine, const Opts & o, const EngineResult & j
     return 0;
 }
 
+int expect_mel_rejected(Engine & engine, PrecomputedMel mel, const char * what) {
+    try {
+        engine.transcribe_mel(std::move(mel));
+    } catch (const std::exception &) {
+        return 0;
+    }
+    std::fprintf(stderr, "FAIL: transcribe_mel accepted %s\n", what);
+    return 1;
+}
+
+// A PrecomputedMel is a public struct: every inconsistency between its
+// declared shape and its buffer must be refused before the encoder reads it.
+int check_mel_rejections(Engine & engine, const Opts & o, const EngineResult & jfk) {
+    const PrecomputedMel good = engine.compute_mel_wav(o.wav_path);
+
+    PrecomputedMel empty_buffer = good;
+    empty_buffer.mel.clear();
+    PrecomputedMel truncated = good;
+    truncated.mel.pop_back();
+    PrecomputedMel oversized = good;
+    oversized.mel.push_back(0.0f);
+    PrecomputedMel no_frames = good;
+    no_frames.n_frames = 0;
+    PrecomputedMel wrong_bins = good;
+    wrong_bins.n_mels += 1;
+    PrecomputedMel absurd_frames = good;
+    absurd_frames.n_frames = std::numeric_limits<int>::max();
+
+    int rc = 0;
+    rc |= expect_mel_rejected(engine, empty_buffer, "an empty buffer with positive n_frames");
+    rc |= expect_mel_rejected(engine, truncated, "a buffer one value short");
+    rc |= expect_mel_rejected(engine, oversized, "a buffer one value long");
+    rc |= expect_mel_rejected(engine, no_frames, "n_frames == 0");
+    rc |= expect_mel_rejected(engine, wrong_bins, "a bin count the model does not have");
+    rc |= expect_mel_rejected(engine, absurd_frames, "an INT_MAX frame count");
+    if (rc != 0) return rc;
+
+    const EngineResult intact = engine.transcribe_mel(good);
+    if (!same_tokens(jfk, intact)) {
+        std::fprintf(stderr, "FAIL: an intact PrecomputedMel no longer transcribes like transcribe()\n");
+        return 1;
+    }
+    return 0;
+}
+
 std::string transcribe_tiled(const Opts & o, int window_frames, int context_frames,
                              const std::vector<float> & samples, int sample_rate) {
     EngineOptions eo;
@@ -255,6 +304,7 @@ int main(int argc, char ** argv) {
         if (check_stage_times(jfk) != 0) return 1;
         if (check_precomputed_mel_parity(engine, opts, jfk) != 0) return 1;
         if (check_concurrent_mel(engine, opts, jfk) != 0) return 1;
+        if (check_mel_rejections(engine, opts, jfk) != 0) return 1;
         if (check_phone_windows(opts) != 0) return 1;
         if (transcribe_long_recording(engine, opts) != 0) return 1;
     } catch (const std::exception & e) {

@@ -958,15 +958,36 @@ PrecomputedMel Engine::compute_mel_wav(const std::string & wav_path) const {
     return out;
 }
 
-EngineResult Engine::transcribe_mel(PrecomputedMel mel) {
+namespace {
+
+// A PrecomputedMel is a plain public struct, so the frame count, the bin count
+// and the buffer it carries are checked against each other before the encoder
+// reads it. The product is formed in size_t and checked by division so an
+// oversized frame count cannot wrap into a plausible size.
+void require_mel_buffer(const PrecomputedMel & mel, int expected_n_mels) {
     if (mel.empty()) {
         throw std::runtime_error("parakeet::Engine::transcribe_mel: empty mel");
     }
-    if (mel.n_mels != pimpl_->model.mel_cfg.n_mels) {
+    if (mel.n_mels != expected_n_mels) {
         throw std::runtime_error("parakeet::Engine::transcribe_mel: mel has " +
                                  std::to_string(mel.n_mels) + " bins but model expects " +
-                                 std::to_string(pimpl_->model.mel_cfg.n_mels));
+                                 std::to_string(expected_n_mels));
     }
+    const size_t frames   = (size_t) mel.n_frames;
+    const size_t bins     = (size_t) mel.n_mels;
+    const size_t expected = frames * bins;
+    if (expected / bins != frames || mel.mel.size() != expected) {
+        throw std::runtime_error("parakeet::Engine::transcribe_mel: mel buffer holds " +
+                                 std::to_string(mel.mel.size()) + " values but " +
+                                 std::to_string(mel.n_frames) + " frames x " +
+                                 std::to_string(mel.n_mels) + " bins were declared");
+    }
+}
+
+}  // namespace
+
+EngineResult Engine::transcribe_mel(PrecomputedMel mel) {
+    require_mel_buffer(mel, pimpl_->model.mel_cfg.n_mels);
     require_transcription_model(pimpl_->model, "transcribe_mel");
     pimpl_->cancel_flag.store(false);
     // The mel was timed on whichever thread built it; only the stages from

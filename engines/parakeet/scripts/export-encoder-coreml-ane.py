@@ -9,9 +9,13 @@ The exported graph:
   - has a fixed window length (--window-mel-frames); the engine's long-form
     plan tiles longer audio across overlapping windows, and the engine's
     independent-segment path cuts audio into windows of at most this length;
-  - takes runtime masks: `pad_mask` zeroes invalid frames and `key_bias`
-    masks invalid attention keys, so a partially filled window uses the
-    same graph;
+  - takes runtime masks: `mel_mask` zeroes padded mel frames and, through
+    its even-index slices, the padded frames at every subsampling
+    resolution (the valid length after a stride-2 conv is exactly the
+    number of even indices below the previous one), `pad_mask` zeroes
+    invalid encoder frames and `key_bias` masks invalid attention keys, so
+    a partially filled window uses the same graph and padding never reaches
+    a valid frame through a convolution kernel;
   - stores palettized weights (6-bit by default; --nbits 0 for fp16).
 
 The output approximates the ggml encoder but is not bit-identical (fp16
@@ -20,9 +24,13 @@ throughout, palettized weights, different accumulation order).
 I/O contract (see src/coreml/parakeet-encoder.h):
 
     mel          fp16 [1, n_mels, 1, window_mel_frames]
+    mel_mask     fp16 [1, 1, 1, window_mel_frames]  1.0 valid, 0.0 pad
     pad_mask     fp16 [1, 1, 1, enc_frames]     1.0 valid, 0.0 pad
     key_bias     fp16 [1, enc_frames, 1, 1]     0.0 valid, -1e4 pad
     encoder_out  fp16 [1, d_model, 1, enc_frames]
+
+The engine fills `mel_mask` when the export declares it; exports without it
+(the published TranscribePsy model) still load and mask after subsampling only.
 
 Example:
 
@@ -210,18 +218,34 @@ class AneEncoder(torch.nn.Module):
     def _norm_apply(self, x, name):
         return channel_norm(x, getattr(self, f"{name}_g"), getattr(self, f"{name}_b"), self.eps)
 
-    def subsample(self, mel):
+    @staticmethod
+    def halve_mask(mask):
+        # A stride-2, kernel-3, pad-1 conv keeps floor((v - 1) / 2) + 1 valid
+        # frames out of v, which is exactly the count of even indices below v,
+        # so the next resolution's mask is this one's even entries.
+        return mask[:, :, 0::2]
+
+    def subsample(self, mel, mel_mask):
         # Runs in (time, freq) orientation, the orientation the GGUF subsampling
         # kernels are stored for; the result is permuted into channel-first
-        # once, before the conformer blocks.
-        x = mel.squeeze(2).transpose(1, 2).unsqueeze(1)           # [1, 1, T_mel, n_mels]
-        x = F.relu(F.conv2d(x, self.sub_conv0_w, self.sub_conv0_b, stride=2, padding=1))
+        # once, before the conformer blocks. Padded frames are zeroed at every
+        # resolution, as the reference encoder does, so they cannot leak into
+        # valid boundary frames through the conv kernels.
+        mask = mel_mask.reshape(1, 1, -1, 1)                       # [1, 1, T_mel, 1]
+        x = mel.squeeze(2).transpose(1, 2).unsqueeze(1) * mask     # [1, 1, T_mel, n_mels]
+        x = F.conv2d(x, self.sub_conv0_w, self.sub_conv0_b, stride=2, padding=1)
+        mask = self.halve_mask(mask)
+        x = F.relu(x * mask)
         x = F.conv2d(x, self.sub_conv1_dw_w, self.sub_conv1_dw_b,
                      stride=2, padding=1, groups=x.size(1))
-        x = F.relu(F.conv2d(x, self.sub_conv1_pw_w, self.sub_conv1_pw_b))
+        mask = self.halve_mask(mask)
+        x = F.conv2d(x * mask, self.sub_conv1_pw_w, self.sub_conv1_pw_b)
+        x = F.relu(x * mask)
         x = F.conv2d(x, self.sub_conv2_dw_w, self.sub_conv2_dw_b,
                      stride=2, padding=1, groups=x.size(1))
-        x = F.relu(F.conv2d(x, self.sub_conv2_pw_w, self.sub_conv2_pw_b))
+        mask = self.halve_mask(mask)
+        x = F.conv2d(x * mask, self.sub_conv2_pw_w, self.sub_conv2_pw_b)
+        x = F.relu(x * mask)
         # [1, C, T_enc, F] -> [1, C*F, 1, T_enc], channel index c*F + f, which is
         # the input ordering encoder.subsampling.out.weight expects.
         b, c, t, f = x.shape
@@ -293,40 +317,71 @@ class AneEncoder(torch.nn.Module):
 
         return self._norm_apply(x, f"b{i}_n_out")
 
-    def forward(self, mel, pad_mask, key_bias):
-        x = self.subsample(mel) * pad_mask
+    def forward(self, mel, mel_mask, pad_mask, key_bias):
+        x = self.subsample(mel, mel_mask) * pad_mask
         for i in range(self.n_layers):
             x = self.block(x, pad_mask, key_bias, i)
         return x
 
 
-def check_parity(model, ref, weights, meta, seed=0):
-    """Compare the ANE graph against the reference encoder on a full window.
+PARITY_REL_TOLERANCE = 1e-4
 
-    Returns True if the relative error is below 1e-4.
-    """
-    torch.manual_seed(seed)
-    mel_2d = torch.randn(model.n_mels, model.window_mel_frames)
 
+def window_inputs(model, mel_2d):
+    """The graph's four inputs for a mel of at most one window: the mel padded
+    with zeros to the window and the three masks for its valid part."""
+    valid_mel = mel_2d.shape[1]
+    valid_enc = encoder_frames_for_mel(valid_mel, causal=False)
+    mel = torch.zeros(1, model.n_mels, 1, model.window_mel_frames)
+    mel[0, :, 0, :valid_mel] = mel_2d
+    mel_mask = torch.zeros(1, 1, 1, model.window_mel_frames)
+    mel_mask[..., :valid_mel] = 1.0
+    pad_mask = torch.zeros(1, 1, 1, model.enc_frames)
+    pad_mask[..., :valid_enc] = 1.0
+    key_bias = torch.full((1, model.enc_frames, 1, 1), KEY_BIAS_PAD)
+    key_bias[:, :valid_enc] = 0.0
+    return (mel, mel_mask, pad_mask, key_bias), valid_enc
+
+
+def ane_encoder_frames(model, mel_2d):
+    """Valid encoder frames of the ANE graph for a mel of at most one window, as [T, d_model]."""
+    inputs, valid_enc = window_inputs(model, mel_2d)
+    with torch.inference_mode():
+        out = model(*inputs)
+    return out[0, :, 0, :valid_enc].transpose(0, 1)
+
+
+def compare_with_reference(model, ref, weights, meta, mel_2d, label):
     with torch.inference_mode():
         want = ref.encoder_forward(mel_2d, weights, meta)[0]        # [T, d_model]
-        got = model(mel_2d.reshape(1, model.n_mels, 1, -1),
-                    torch.ones(1, 1, 1, model.enc_frames),
-                    torch.zeros(1, model.enc_frames, 1, 1))
-    got = got[0, :, 0, :].transpose(0, 1)                           # [T, d_model]
-
+    got = ane_encoder_frames(model, mel_2d)
     if got.shape != want.shape:
-        print(f"[check] FAIL shape: ane={tuple(got.shape)} ref={tuple(want.shape)}")
+        print(f"[check] FAIL {label} shape: ane={tuple(got.shape)} ref={tuple(want.shape)}")
         return False
     diff = (got - want).double()
     rel = float(torch.sqrt((diff * diff).sum() / (want.double() ** 2).sum()))
-    print(f"[check] encoder_out rel={rel:.3e} max_abs={float(diff.abs().max()):.3e} "
+    print(f"[check] {label} rel={rel:.3e} max_abs={float(diff.abs().max()):.3e} "
           f"shape={tuple(got.shape)}")
-    if rel >= 1e-4:
-        print("[check] FAIL: the ANE graph does not match the reference encoder.")
+    if rel >= PARITY_REL_TOLERANCE:
+        print(f"[check] FAIL: the ANE graph does not match the reference encoder on {label}.")
         return False
-    print("[check] OK")
     return True
+
+
+def check_parity(model, ref, weights, meta, seed=0):
+    """Compare the ANE graph against the reference encoder on a full window
+    and on a partially filled one, whose valid frames must match the
+    reference run on the short input alone.
+
+    Returns True if both relative errors are below PARITY_REL_TOLERANCE.
+    """
+    torch.manual_seed(seed)
+    full = torch.randn(model.n_mels, model.window_mel_frames)
+    partial = full[:, : model.window_mel_frames // 3 + 7]
+    ok = compare_with_reference(model, ref, weights, meta, full, "full window")
+    ok = compare_with_reference(model, ref, weights, meta, partial, "partial window") and ok
+    print("[check] OK" if ok else "[check] FAIL")
+    return ok
 
 
 def palettize(mlmodel, nbits):
@@ -430,9 +485,10 @@ def main():
         return 1
 
     mel = torch.zeros(1, model.n_mels, 1, model.window_mel_frames)
+    mel_mask = torch.ones(1, 1, 1, model.window_mel_frames)
     pad_mask = torch.ones(1, 1, 1, model.enc_frames)
     key_bias = torch.zeros(1, model.enc_frames, 1, 1)
-    example = (mel, pad_mask, key_bias)
+    example = (mel, mel_mask, pad_mask, key_bias)
 
     with torch.inference_mode():
         out = model(*example)
@@ -443,6 +499,7 @@ def main():
         traced,
         inputs=[
             ct.TensorType(name="mel", shape=mel.shape, dtype=np.float16),
+            ct.TensorType(name="mel_mask", shape=mel_mask.shape, dtype=np.float16),
             ct.TensorType(name="pad_mask", shape=pad_mask.shape, dtype=np.float16),
             ct.TensorType(name="key_bias", shape=key_bias.shape, dtype=np.float16),
         ],

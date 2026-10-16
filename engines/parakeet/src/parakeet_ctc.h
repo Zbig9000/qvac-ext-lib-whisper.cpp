@@ -518,6 +518,11 @@ ggml_backend_t init_engine_backend(bool use_gpu, const std::string & requested);
 ggml_backend_t init_engine_cpu_backend();
 void set_opencl_cache_dir(const std::string & dir);
 
+// load_from_gguf result for a GGUF that holds no encoder weights when no Core
+// ML encoder sidecar can take the encoder over (every non-Apple build, a build
+// without PARAKEET_COREML, PARAKEET_COREML_DISABLE, or a missing sidecar).
+constexpr int kGgufLoadNoEncoderWeights = 17;
+
 int load_from_gguf(const std::string & gguf_path,
                    ParakeetCtcModel  & out_model,
                    int                 n_threads,

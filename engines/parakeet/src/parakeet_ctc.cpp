@@ -2303,7 +2303,7 @@ static int load_from_gguf_impl(const std::string & gguf_path,
         PARAKEET_LOG_ERROR("gguf: %s holds no encoder weights; it runs only with its "
                            "%s sidecar on an Apple build with PARAKEET_COREML=ON\n",
                            gguf_path.c_str(), "-encoder.mlmodelc");
-        return 17;
+        return kGgufLoadNoEncoderWeights;
     }
     const bool owns_encoder = impl->coreml_owns_encoder;
 

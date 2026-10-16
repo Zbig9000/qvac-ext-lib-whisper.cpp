@@ -665,6 +665,8 @@ if (PARAKEET_BUILD_TESTS)
     set(_qvp_tdt_f16_gguf  "${PARAKEET_TEST_MODEL_DIR}/parakeet-tdt-0.6b-v3.f16.gguf")
     set(_qvp_tdt_coreml     "${PARAKEET_TEST_MODEL_DIR}/parakeet-tdt-0.6b-v3-encoder.mlmodelc")
     set(_qvp_transcribepsy_gguf "${PARAKEET_TEST_MODEL_DIR}/transcribepsy-250m-eu-sub.gguf")
+    set(_qvp_transcribepsy_coreml_gguf "${PARAKEET_TEST_MODEL_DIR}/transcribepsy-250m-eu-sub-coreml.gguf")
+    set(_qvp_transcribepsy_coreml_encoder "${PARAKEET_TEST_MODEL_DIR}/transcribepsy-250m-eu-sub-coreml-encoder.mlmodelc")
     set(_qvp_eou_q8_gguf   "${PARAKEET_TEST_MODEL_DIR}/parakeet_realtime_eou_120m-v1.q8_0.gguf")
     set(_qvp_eou_coreml    "${PARAKEET_TEST_MODEL_DIR}/parakeet_realtime_eou_120m-v1-encoder.mlmodelc")
     set(_qvp_nemotron_f16_gguf "${PARAKEET_TEST_MODEL_DIR}/nemotron-3.5-asr-streaming-0.6b.f16.gguf")
@@ -2325,6 +2327,68 @@ if (PARAKEET_BUILD_TESTS)
         EXE      test-long-form
         ARGS     "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+
+    # The ggml encoder graph cache: eviction when the limit is lowered, and the
+    # windowed encoder holding one graph and restoring the limit afterwards.
+    add_executable(test-encoder-graph-cache
+        test/test_encoder_graph_cache.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
+        src/parakeet_unified.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/parakeet_diarization_v3.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-encoder-graph-cache PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-encoder-graph-cache PRIVATE src include ggml/include)
+    parakeet_apply_backend_defs(test-encoder-graph-cache)
+    parakeet_apply_ccache(test-encoder-graph-cache)
+    parakeet_register_test(test-encoder-graph-cache
+        LABEL    "fixture"
+        ARGS     "--model" "${_qvp_transcribepsy_gguf}" "--wav" "${_qvp_jfk_wav}"
+        REQUIRES "${_qvp_transcribepsy_gguf}" "${_qvp_jfk_wav}")
+
+    # The Core ML-owned encoder: an encoder-less GGUF is rejected without its
+    # sidecar on every platform; with Core ML and the sidecar it loads, runs,
+    # refuses the ggml encoder, and PARAKEET_COREML_ONLY skips the encoder
+    # weights of a full GGUF.
+    add_executable(test-coreml-encoder-owner
+        test/test_coreml_encoder_owner.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_coreml_path.cpp
+        src/coreml/parakeet_coreml_shape.cpp
+        src/parakeet_log.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp)
+    target_link_libraries(test-coreml-encoder-owner PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-coreml-encoder-owner PRIVATE include src ggml/include)
+    parakeet_apply_backend_defs(test-coreml-encoder-owner)
+    parakeet_apply_ccache(test-coreml-encoder-owner)
+    if (PARAKEET_COREML)
+        target_sources(test-coreml-encoder-owner PRIVATE
+            src/coreml/parakeet-encoder.mm src/coreml/parakeet-decoder.mm)
+        set_source_files_properties(src/coreml/parakeet-encoder.mm src/coreml/parakeet-decoder.mm
+            PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        target_compile_definitions(test-coreml-encoder-owner PRIVATE PARAKEET_USE_COREML)
+        target_link_libraries(test-coreml-encoder-owner PRIVATE
+            ${PARAKEET_FOUNDATION_FRAMEWORK} ${PARAKEET_COREML_FRAMEWORK})
+    endif()
+    parakeet_register_test(test-coreml-encoder-owner-reject
+        LABEL    "fixture"
+        EXE      test-coreml-encoder-owner
+        ARGS     "--coreml-gguf" "${_qvp_transcribepsy_coreml_gguf}"
+        REQUIRES "${_qvp_transcribepsy_coreml_gguf}")
+    parakeet_register_test(test-coreml-encoder-owner
+        LABEL    "fixture;coreml"
+        ARGS     "--coreml-gguf" "${_qvp_transcribepsy_coreml_gguf}"
+                 "--full-gguf" "${_qvp_transcribepsy_gguf}" "--wav" "${_qvp_jfk_wav}"
+        REQUIRES "${_qvp_transcribepsy_coreml_gguf}" "${_qvp_transcribepsy_coreml_encoder}"
+                 "${_qvp_transcribepsy_gguf}" "${_qvp_jfk_wav}")
 
     # TranscribePsy on the engine API: expected transcript, precomputed-mel
     # parity (also from a worker thread), and the 60 s / 25 % long-form

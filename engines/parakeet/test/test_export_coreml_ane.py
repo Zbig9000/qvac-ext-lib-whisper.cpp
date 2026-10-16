@@ -29,6 +29,12 @@ if "coremltools" not in sys.modules:
     except ModuleNotFoundError:
         sys.modules["coremltools"] = types.ModuleType("coremltools")
 
+try:
+    import gguf  # noqa: F401
+except ModuleNotFoundError:
+    print("SKIP: gguf is not installed")
+    raise SystemExit(0)
+
 SCRIPTS = Path(__file__).parents[1] / "scripts"
 
 
@@ -41,6 +47,61 @@ def load(name, module_name):
 
 ENCODER = load("export-encoder-coreml-ane.py", "export_encoder_coreml_ane")
 DECODER = load("export-decoder-coreml-ane.py", "export_decoder_coreml_ane")
+REFERENCE = load("ref-encoder-from-gguf.py", "ref_encoder_from_gguf")
+
+
+def toy_encoder_weights(d_model=8, n_layers=2, n_heads=2, n_mels=8, channels=4, ff_dim=16,
+                        conv_kernel=5):
+    """Random FastConformer weights in the GGUF layout both scripts read."""
+    torch.manual_seed(2)
+    w = {}
+
+    def rand(*shape, scale=0.3):
+        return torch.randn(*shape) * scale
+
+    w["preproc.mel_filterbank"] = torch.ones(n_mels, 9)
+    w["encoder.subsampling.conv0.weight"] = rand(channels, 1, 3, 3)
+    w["encoder.subsampling.conv0.bias"] = rand(channels, scale=0.1)
+    for stage in ("conv1", "conv2"):
+        w[f"encoder.subsampling.{stage}_dw.weight"] = rand(channels, 1, 3, 3)
+        w[f"encoder.subsampling.{stage}_dw.bias"] = rand(channels, scale=0.1)
+        w[f"encoder.subsampling.{stage}_pw.weight"] = rand(channels, channels, 1, 1)
+        w[f"encoder.subsampling.{stage}_pw.bias"] = rand(channels, scale=0.1)
+    freq_out = ENCODER.encoder_frames_for_mel(n_mels, causal=False)
+    w["encoder.subsampling.out.weight"] = rand(d_model, channels * freq_out)
+    w["encoder.subsampling.out.bias"] = rand(d_model, scale=0.1)
+    for i in range(n_layers):
+        p = f"encoder.blk.{i}"
+        for norm in ("norm_ff1", "norm_attn", "norm_conv", "norm_ff2", "norm_out", "conv.norm"):
+            w[f"{p}.{norm}.weight"] = 1.0 + rand(d_model, scale=0.1)
+            w[f"{p}.{norm}.bias"] = rand(d_model, scale=0.1)
+        for ff in ("ff1", "ff2"):
+            w[f"{p}.{ff}.linear1.weight"] = rand(ff_dim, d_model)
+            w[f"{p}.{ff}.linear1.bias"] = rand(ff_dim, scale=0.1)
+            w[f"{p}.{ff}.linear2.weight"] = rand(d_model, ff_dim)
+            w[f"{p}.{ff}.linear2.bias"] = rand(d_model, scale=0.1)
+        for proj in ("q", "k", "v", "out", "pos"):
+            w[f"{p}.attn.{proj}.weight"] = rand(d_model, d_model)
+            if proj != "pos":
+                w[f"{p}.attn.{proj}.bias"] = rand(d_model, scale=0.1)
+        w[f"{p}.attn.pos_bias_u"] = rand(n_heads, d_model // n_heads, scale=0.1)
+        w[f"{p}.attn.pos_bias_v"] = rand(n_heads, d_model // n_heads, scale=0.1)
+        w[f"{p}.conv.pw1.weight"] = rand(2 * d_model, d_model)
+        w[f"{p}.conv.pw1.bias"] = rand(2 * d_model, scale=0.1)
+        w[f"{p}.conv.dw.weight"] = rand(d_model, 1, conv_kernel)
+        w[f"{p}.conv.dw.bias"] = rand(d_model, scale=0.1)
+        w[f"{p}.conv.pw2.weight"] = rand(d_model, d_model)
+        w[f"{p}.conv.pw2.bias"] = rand(d_model, scale=0.1)
+    meta = {
+        "parakeet.encoder.d_model": d_model,
+        "parakeet.encoder.n_layers": n_layers,
+        "parakeet.encoder.n_heads": n_heads,
+        "parakeet.encoder.xscaling": True,
+        "parakeet.encoder.conv_norm_type": "layer_norm",
+        "parakeet.encoder.causal_downsampling": False,
+        "parakeet.encoder.pos_emb_max_len": 64,
+    }
+    return w, meta
 
 
 class EncoderHelperTests(unittest.TestCase):
@@ -68,6 +129,43 @@ class EncoderHelperTests(unittest.TestCase):
 
     def test_key_bias_pad_is_finite(self):
         self.assertTrue(np.isfinite(np.float16(ENCODER.KEY_BIAS_PAD)))
+
+    def test_halved_mask_keeps_exactly_the_valid_frames(self):
+        # Every valid length v: the conv keeps floor((v - 1) / 2) + 1 frames,
+        # and the even-index slice of a v-frame mask has that many ones.
+        for valid in range(1, 40):
+            mask = torch.zeros(1, 1, 40, 1)
+            mask[:, :, :valid] = 1.0
+            halved = ENCODER.AneEncoder.halve_mask(mask)
+            self.assertEqual(int(halved.sum()), ENCODER.conv_out_len(valid), valid)
+            self.assertEqual(halved.shape[2], ENCODER.conv_out_len(40))
+
+
+class EncoderGraphTests(unittest.TestCase):
+    WINDOW = 64
+
+    def setUp(self):
+        self.weights, self.meta = toy_encoder_weights()
+        self.model = ENCODER.AneEncoder(REFERENCE, self.weights, self.meta, self.WINDOW).eval()
+
+    def test_full_window_matches_reference(self):
+        torch.manual_seed(0)
+        mel = torch.randn(self.model.n_mels, self.WINDOW)
+        self.assertTrue(ENCODER.compare_with_reference(
+            self.model, REFERENCE, self.weights, self.meta, mel, "full"))
+
+    def test_partial_window_valid_frames_match_short_input(self):
+        # The valid frames of a padded, masked window must equal the reference
+        # run on the short input alone; without masks at every subsampling
+        # resolution the last valid frames absorb the padding.
+        torch.manual_seed(1)
+        for valid in (13, 22, 37, 51):
+            mel = torch.randn(self.model.n_mels, valid)
+            self.assertTrue(ENCODER.compare_with_reference(
+                self.model, REFERENCE, self.weights, self.meta, mel, f"partial {valid}"), valid)
+
+    def test_check_parity_covers_full_and_partial_windows(self):
+        self.assertTrue(ENCODER.check_parity(self.model, REFERENCE, self.weights, self.meta))
 
 
 def toy_tdt_weights(h_pred=4, h_joint=3, d_enc=5, vocab=6, n_durations=3, layers=2):

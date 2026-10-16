@@ -398,10 +398,15 @@ offline TDT GGUF. Both sit next to the GGUF under the usual derived names:
 
 The **fixed-window encoder** is a channel-first `[1, C, 1, T]` graph over a
 fixed window (`--window-mel-frames`, 1500 mel frames = 15 s by default) with
-two runtime masks: `pad_mask` zeroes the padded encoder frames and `key_bias`
-masks them out of attention, so a partially filled window uses the same graph
-and its valid frames come out as if the input had ended there. The wrapper
-recognises the three inputs (`mel`, `pad_mask`, `key_bias`), reports the window
+runtime masks: `mel_mask` zeroes the padded mel frames and, through its
+even-index slices, the padded frames at every subsampling resolution;
+`pad_mask` zeroes the padded encoder frames and `key_bias` masks them out of
+attention, so a partially filled window uses the same graph and its valid
+frames come out as the reference encoder's for the short input alone (the
+exporter's `--check` verifies both a full and a partial window). The published
+TranscribePsy export predates `mel_mask` and masks after subsampling only; the
+wrapper fills `mel_mask` when an export declares it. The wrapper
+recognises the inputs (`mel`, `pad_mask`, `key_bias`, optionally `mel_mask`), reports the window
 as the sidecar's fixed capacity, and the engine's long-form plan tiles longer
 audio across overlapping windows with 16 encoder frames (1.28 s) of seam
 context each side, the setting the export was validated with

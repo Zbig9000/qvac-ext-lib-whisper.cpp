@@ -96,7 +96,11 @@ for (size_t i = 0; i < files.size(); ++i) {
 
 `transcribe_mel(compute_mel(...))` returns exactly what `transcribe_samples`
 returns on the same audio; `compute_mel*` is the only member that may run
-concurrently with a `transcribe*` call on the same engine.
+concurrently with a `transcribe*` call on the same engine. `PrecomputedMel` is
+a plain struct, so `transcribe_mel` validates it before the encoder reads it
+and throws `std::runtime_error` when the buffer does not hold exactly
+`n_frames * n_mels` values, when `n_frames` is zero, or when `n_mels` is not
+the model's bin count.
 
 ## Sortformer AOSC
 

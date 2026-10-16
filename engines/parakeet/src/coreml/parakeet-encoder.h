@@ -19,6 +19,8 @@
 //       `mel`       {1, n_mels, 1, window_mel_frames}
 //       `pad_mask`  {1, 1, 1, enc_frames}          1.0 valid, 0.0 pad
 //       `key_bias`  {1, enc_frames, 1, 1}          0.0 valid, -1e4 pad
+//     plus, on exports that mask every subsampling resolution, a fourth:
+//       `mel_mask`  {1, 1, 1, window_mel_frames}   1.0 valid, 0.0 pad
 //   - One MLMultiArray output {1, d_model, 1, enc_frames}.
 //   The graph only ever sees one window: the wrapper zero-pads a shorter input
 //   to the window and masks the padded encoder frames, and
