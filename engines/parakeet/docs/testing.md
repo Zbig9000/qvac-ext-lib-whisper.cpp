@@ -52,8 +52,10 @@ the NeMo `token_ids.npy` dump are available. It requires bit-exact token IDs
 between the reference and the current shared RNN-T/TDT decoder.
 
 Model-free logic tests (`-L unit`) cover the CTC language mask, mel FFT
-parity, the blocked STFT's independence from its block size and per-feature
-CMVN, RNN-T graph construction, long-form window planning and the CLI's
+parity, the blocked STFT's independence from its block size, a reused
+`MelState` or `IncrementalMelState` following tables that changed at the same
+address, per-feature CMVN, the fixed-window Core ML export's valid lengths for
+a slab with zeroed trailing padding, RNN-T graph construction, long-form window planning and the CLI's
 `--window-sec` / `--overlap` conversions, the pause-cut segment planner and
 the batched TDT lane walk behind the Core ML decoder sidecar (driven by a
 scripted stepper), Sortformer finalization and probability thresholding, the

@@ -560,13 +560,17 @@ bool bind_ane_window(parakeet_coreml_context * ctx, MLModel * model, NSString * 
 // window and its padded encoder frames are masked out of attention and the
 // convolution module (and, when the export takes `mel_mask`, out of every
 // subsampling resolution), so the valid frames come out as if the input had
-// ended there. `n_enc_frames` is the caller's frame count for `n_mel_frames`.
+// ended there. The masks follow `n_mel_valid`, not the slab length, so the
+// mel front-end's zeroed trailing frames count as padding too.
+// `n_enc_frames` is the caller's frame count for `n_mel_frames`.
 int encode_ane_window(parakeet_coreml_context * ctx,
-                      int64_t n_mel_frames, int64_t n_mels, const float * mel,
+                      int64_t n_mel_frames, int64_t n_mel_valid, int64_t n_mels, const float * mel,
                       int64_t n_enc_frames, int64_t d_model, float * encoder_out) {
     const AneWindow & ane = ctx->ane;
     if (n_mels != ane.n_mels || d_model != ane.d_model) return 2;
     if (n_mel_frames > ane.window_mel || n_enc_frames > ane.enc_frames) return 2;
+    const parakeet::CoremlAneValidity valid =
+        parakeet::coreml_ane_valid_lengths(n_mel_frames, n_mel_valid, n_enc_frames);
 
     MLModel  * model    = (__bridge MLModel *) ctx->model;
     NSString * out_name = [NSString stringWithUTF8String:ctx->output_name.c_str()];
@@ -576,11 +580,11 @@ int encode_ane_window(parakeet_coreml_context * ctx,
     MLMultiArray * mask_arr = (__bridge MLMultiArray *) ctx->pad_mask_array;
     MLMultiArray * bias_arr = (__bridge MLMultiArray *) ctx->key_bias_array;
     if (!fill_input_array(mel_arr, /*transpose=*/true, mel, n_mel_frames, ane.window_mel, n_mels)) return 3;
-    if (!fill_split_array(mask_arr, n_enc_frames, ane.enc_frames, 1.0f, 0.0f)) return 3;
-    if (!fill_split_array(bias_arr, n_enc_frames, ane.enc_frames, 0.0f, kAneKeyBiasPad)) return 3;
+    if (!fill_split_array(mask_arr, valid.enc_frames, ane.enc_frames, 1.0f, 0.0f)) return 3;
+    if (!fill_split_array(bias_arr, valid.enc_frames, ane.enc_frames, 0.0f, kAneKeyBiasPad)) return 3;
     if (ctx->mel_mask_array != nullptr) {
         MLMultiArray * mel_mask_arr = (__bridge MLMultiArray *) ctx->mel_mask_array;
-        if (!fill_split_array(mel_mask_arr, n_mel_frames, ane.window_mel, 1.0f, 0.0f)) return 3;
+        if (!fill_split_array(mel_mask_arr, valid.mel_frames, ane.window_mel, 1.0f, 0.0f)) return 3;
     }
 
     NSError * err = nil;
@@ -802,6 +806,7 @@ int64_t parakeet_coreml_fixed_output_rows(
 
 int parakeet_coreml_encode(struct parakeet_coreml_context * ctx,
                            int64_t       n_mel_frames,
+                           int64_t       n_mel_valid,
                            int64_t       n_mels,
                            const float * mel,
                            int64_t       n_enc_frames,
@@ -814,8 +819,8 @@ int parakeet_coreml_encode(struct parakeet_coreml_context * ctx,
     @autoreleasepool {
         std::lock_guard<std::mutex> lock(ctx->mutex);
         if (ctx->ane.active) {
-            return encode_ane_window(ctx, n_mel_frames, n_mels, mel, n_enc_frames, d_model,
-                                     encoder_out);
+            return encode_ane_window(ctx, n_mel_frames, n_mel_valid, n_mels, mel, n_enc_frames,
+                                     d_model, encoder_out);
         }
         MLModel  * model    = (__bridge MLModel *) ctx->model;
         NSString * in_name  = [NSString stringWithUTF8String:ctx->input_name.c_str()];

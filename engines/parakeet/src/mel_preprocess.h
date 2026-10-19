@@ -85,9 +85,13 @@ struct MelState {
     std::vector<float>               power;
     std::vector<MelFilterBand>       filter_bands;
 
+    // The tables the two caches were built from, kept by value: a state can
+    // outlive the engine whose config built it (Engine::compute_mel's
+    // thread-local), and a later engine may reuse that config's address with
+    // other tables, so validity is decided by contents, never by address.
     int                              window_padded_n_fft = 0;
-    const std::vector<float> *       window_padded_src   = nullptr;
-    const std::vector<float> *       filter_bands_src    = nullptr;
+    std::vector<float>               window_src;
+    std::vector<float>               filterbank_src;
 
     // Frees the two block buffers while keeping the cached window and filter
     // bands, for callers that hold the state idle between utterances.

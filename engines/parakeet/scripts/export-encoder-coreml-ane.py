@@ -327,13 +327,16 @@ class AneEncoder(torch.nn.Module):
 PARITY_REL_TOLERANCE = 1e-4
 
 
-def window_inputs(model, mel_2d):
+def window_inputs(model, mel_2d, valid_mel=None):
     """The graph's four inputs for a mel of at most one window: the mel padded
-    with zeros to the window and the three masks for its valid part."""
-    valid_mel = mel_2d.shape[1]
+    with zeros to the window and the three masks for its valid part, which is
+    the whole mel unless `valid_mel` says its trailing frames are padding."""
+    n_frames = mel_2d.shape[1]
+    if valid_mel is None:
+        valid_mel = n_frames
     valid_enc = encoder_frames_for_mel(valid_mel, causal=False)
     mel = torch.zeros(1, model.n_mels, 1, model.window_mel_frames)
-    mel[0, :, 0, :valid_mel] = mel_2d
+    mel[0, :, 0, :n_frames] = mel_2d
     mel_mask = torch.zeros(1, 1, 1, model.window_mel_frames)
     mel_mask[..., :valid_mel] = 1.0
     pad_mask = torch.zeros(1, 1, 1, model.enc_frames)
@@ -343,24 +346,40 @@ def window_inputs(model, mel_2d):
     return (mel, mel_mask, pad_mask, key_bias), valid_enc
 
 
-def ane_encoder_frames(model, mel_2d):
+def ane_encoder_frames(model, mel_2d, valid_mel=None):
     """Valid encoder frames of the ANE graph for a mel of at most one window, as [T, d_model]."""
-    inputs, valid_enc = window_inputs(model, mel_2d)
+    inputs, valid_enc = window_inputs(model, mel_2d, valid_mel)
     with torch.inference_mode():
         out = model(*inputs)
     return out[0, :, 0, :valid_enc].transpose(0, 1)
 
 
-def compare_with_reference(model, ref, weights, meta, mel_2d, label):
+def relative_error(got, want):
+    """Relative L2 distance of `got` from `want`; infinite when the shapes differ."""
+    if got.shape != want.shape:
+        return float("inf")
+    diff = (got - want).double()
+    return float(torch.sqrt((diff * diff).sum() / (want.double() ** 2).sum()))
+
+
+def reference_frames(ref, weights, meta, mel_2d, valid_mel=None):
+    """Reference encoder frames for the audio frames of `mel_2d` (all of them,
+    or the first `valid_mel`), as [T, d_model]."""
+    audio = mel_2d if valid_mel is None else mel_2d[:, :valid_mel]
     with torch.inference_mode():
-        want = ref.encoder_forward(mel_2d, weights, meta)[0]        # [T, d_model]
-    got = ane_encoder_frames(model, mel_2d)
+        return ref.encoder_forward(audio, weights, meta)[0]
+
+
+def compare_with_reference(model, ref, weights, meta, mel_2d, label, valid_mel=None):
+    """True when the graph's valid frames match the reference on the audio
+    frames of `mel_2d` (all of them, or the first `valid_mel`)."""
+    want = reference_frames(ref, weights, meta, mel_2d, valid_mel)
+    got = ane_encoder_frames(model, mel_2d, valid_mel)
     if got.shape != want.shape:
         print(f"[check] FAIL {label} shape: ane={tuple(got.shape)} ref={tuple(want.shape)}")
         return False
-    diff = (got - want).double()
-    rel = float(torch.sqrt((diff * diff).sum() / (want.double() ** 2).sum()))
-    print(f"[check] {label} rel={rel:.3e} max_abs={float(diff.abs().max()):.3e} "
+    rel = relative_error(got, want)
+    print(f"[check] {label} rel={rel:.3e} max_abs={float((got - want).abs().max()):.3e} "
           f"shape={tuple(got.shape)}")
     if rel >= PARITY_REL_TOLERANCE:
         print(f"[check] FAIL: the ANE graph does not match the reference encoder on {label}.")

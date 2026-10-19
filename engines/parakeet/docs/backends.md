@@ -403,7 +403,9 @@ even-index slices, the padded frames at every subsampling resolution;
 `pad_mask` zeroes the padded encoder frames and `key_bias` masks them out of
 attention, so a partially filled window uses the same graph and its valid
 frames come out as the reference encoder's for the short input alone (the
-exporter's `--check` verifies both a full and a partial window). The published
+exporter's `--check` verifies both a full and a partial window). The wrapper
+derives all three masks from the frames that hold audio, so the mel
+front-end's zeroed trailing padding frame counts as padding as well. The published
 TranscribePsy export predates `mel_mask` and masks after subsampling only; the
 wrapper fills `mel_mask` when an export declares it. The wrapper
 recognises the inputs (`mel`, `pad_mask`, `key_bias`, optionally `mel_mask`), reports the window

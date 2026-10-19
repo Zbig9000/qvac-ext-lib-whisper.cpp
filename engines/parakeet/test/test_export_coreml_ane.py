@@ -164,6 +164,21 @@ class EncoderGraphTests(unittest.TestCase):
             self.assertTrue(ENCODER.compare_with_reference(
                 self.model, REFERENCE, self.weights, self.meta, mel, f"partial {valid}"), valid)
 
+    def test_trailing_padding_frame_is_masked_at_the_valid_length(self):
+        # The mel front-end pads the last frame with zeros; the engine passes
+        # the audio length to the wrapper, which must mask from there. Marking
+        # the padding frame valid lets its conv activations reach the last
+        # audio frames.
+        torch.manual_seed(3)
+        padded = torch.randn(self.model.n_mels, 37)
+        padded[:, -1] = 0.0
+        want = ENCODER.reference_frames(REFERENCE, self.weights, self.meta, padded, valid_mel=36)
+        masked_at_audio = ENCODER.ane_encoder_frames(self.model, padded, valid_mel=36)
+        padding_marked_valid = ENCODER.ane_encoder_frames(self.model, padded, valid_mel=37)
+        self.assertLess(ENCODER.relative_error(masked_at_audio, want), ENCODER.PARITY_REL_TOLERANCE)
+        self.assertGreater(ENCODER.relative_error(padding_marked_valid[: want.shape[0]], want),
+                           ENCODER.PARITY_REL_TOLERANCE)
+
     def test_check_parity_covers_full_and_partial_windows(self):
         self.assertTrue(ENCODER.check_parity(self.model, REFERENCE, self.weights, self.meta))
 

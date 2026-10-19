@@ -360,6 +360,14 @@ std::vector<float> make_padded_window(const std::vector<float> & hann400, int n_
     return out;
 }
 
+// A cached table is valid only while its source still holds the same values;
+// the address of the source proves nothing once configs come and go.
+bool same_table(const std::vector<float> & cached, const std::vector<float> & source) {
+    return cached.size() == source.size() &&
+           (cached.empty() ||
+            std::memcmp(cached.data(), source.data(), cached.size() * sizeof(float)) == 0);
+}
+
 }
 
 std::vector<MelFilterBand> make_filter_bands(const std::vector<float> & filterbank, int n_mels, int n_bins) {
@@ -457,17 +465,14 @@ int compute_log_mel_impl(const float        * samples,
     const int n_bins = cfg.n_fft / 2 + 1;
     const int n_mels = cfg.n_mels;
 
-    // Window padding only depends on cfg.n_fft + the (immutable) cfg.window
-    // contents. Cache the result on `state` so we rebuild it at most once
-    // per engine lifetime.
-    if (state.window_padded_n_fft != cfg.n_fft || state.window_padded_src != &cfg.window) {
-        state.window_padded     = make_padded_window(cfg.window, cfg.n_fft);
+    if (state.window_padded_n_fft != cfg.n_fft || !same_table(state.window_src, cfg.window)) {
+        state.window_padded       = make_padded_window(cfg.window, cfg.n_fft);
         state.window_padded_n_fft = cfg.n_fft;
-        state.window_padded_src = &cfg.window;
+        state.window_src          = cfg.window;
     }
-    if (state.filter_bands_src != &cfg.filterbank || state.filter_bands.size() != (size_t) n_mels) {
-        state.filter_bands     = make_filter_bands(cfg.filterbank, n_mels, n_bins);
-        state.filter_bands_src = &cfg.filterbank;
+    if (state.filter_bands.size() != (size_t) n_mels || !same_table(state.filterbank_src, cfg.filterbank)) {
+        state.filter_bands   = make_filter_bands(cfg.filterbank, n_mels, n_bins);
+        state.filterbank_src = cfg.filterbank;
     }
 
     const int block = stft_block_frames(cfg, n_frames);
@@ -509,13 +514,13 @@ struct IncrementalMelState::Impl {
     std::vector<float> power;
     std::vector<std::complex<float>> fft;
     std::vector<MelFilterBand> filter_bands;
-    const std::vector<float> * filter_bands_src = nullptr;
+    std::vector<float> filterbank_src;
 
     int64_t sample_base = 0;
     int64_t total_samples = 0;
     int64_t next_frame = 0;
     int window_n_fft = 0;
-    const std::vector<float> * window_source = nullptr;
+    std::vector<float> window_src;
     float last_raw_sample = 0.0f;
     bool has_last_raw_sample = false;
     bool finalized = false;
@@ -601,13 +606,13 @@ void prepare_incremental_window(
     IncrementalMelState::Impl & state,
     const MelConfig & config) {
     if (state.window_n_fft == config.n_fft &&
-        state.window_source == &config.window) {
+        same_table(state.window_src, config.window)) {
         return;
     }
     state.window = make_padded_window(
         config.window, config.n_fft);
     state.window_n_fft = config.n_fft;
-    state.window_source = &config.window;
+    state.window_src = config.window;
     state.windowed.resize(static_cast<size_t>(config.n_fft));
     state.power.resize(
         static_cast<size_t>(config.n_fft / 2 + 1));
@@ -636,10 +641,10 @@ void compute_incremental_frame(
         state.fft.data());
 
     const int bins = config.n_fft / 2 + 1;
-    if (state.filter_bands_src != &config.filterbank ||
-        state.filter_bands.size() != static_cast<size_t>(config.n_mels)) {
-        state.filter_bands     = make_filter_bands(config.filterbank, config.n_mels, bins);
-        state.filter_bands_src = &config.filterbank;
+    if (state.filter_bands.size() != static_cast<size_t>(config.n_mels) ||
+        !same_table(state.filterbank_src, config.filterbank)) {
+        state.filter_bands   = make_filter_bands(config.filterbank, config.n_mels, bins);
+        state.filterbank_src = config.filterbank;
     }
     log_mel_frame(state.power.data(), bins, config.n_mels, config.filterbank.data(),
                   state.filter_bands.data(), config.log_zero_guard_value, destination);

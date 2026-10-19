@@ -94,6 +94,11 @@ int64_t parakeet_coreml_seam_context_frames(const struct parakeet_coreml_context
 //
 //   mel           log-mel features, row-major (n_mel_frames, n_mels),
 //                 n_mels contiguous (the layout `compute_log_mel` emits).
+//   n_mel_valid   frames of `mel` that hold audio; the frames from there to
+//                 n_mel_frames are the front-end's zeroed padding and the
+//                 fixed-window export masks them out at every resolution
+//                 (<= 0 or >= n_mel_frames: every frame holds audio). Other
+//                 exports take the whole slab and ignore it.
 //   encoder_out   destination for the encoder hidden states, row-major
 //                 (n_enc_frames, d_model), d_model contiguous. The caller
 //                 sizes it to n_enc_frames * d_model floats.
@@ -106,6 +111,7 @@ int64_t parakeet_coreml_seam_context_frames(const struct parakeet_coreml_context
 // which case the caller falls back to the ggml encoder.
 int parakeet_coreml_encode(struct parakeet_coreml_context * ctx,
                            int64_t       n_mel_frames,
+                           int64_t       n_mel_valid,
                            int64_t       n_mels,
                            const float * mel,
                            int64_t       n_enc_frames,

@@ -146,6 +146,80 @@ int section_repeated_call_invariance(const parakeet::MelConfig & cfg,
     return 0;
 }
 
+// Engine::compute_mel keeps a thread-local MelState that outlives the engine,
+// and a later engine can place another model's tables at the same address;
+// the state's caches must follow the table contents, never the address.
+int section_reused_state_after_table_change(const parakeet::MelConfig & cfg,
+                                            const std::vector<float> & signal) {
+    using namespace parakeet;
+
+    MelState  state;
+    MelConfig same_address = cfg;
+    std::vector<float> before, reused, fresh;
+    int n_before = 0, n_reused = 0, n_fresh = 0;
+    if (compute_log_mel(signal.data(), (int) signal.size(), same_address, state, before, n_before) != 0) {
+        std::fprintf(stderr, "[reload] compute_log_mel failed before the table change\n");
+        return 1;
+    }
+
+    for (float & w : same_address.window)     w *= 0.75f;
+    for (float & f : same_address.filterbank) f *= 0.5f;
+
+    if (compute_log_mel(signal.data(), (int) signal.size(), same_address, state, reused, n_reused) != 0 ||
+        compute_log_mel(signal.data(), (int) signal.size(), same_address, fresh, n_fresh) != 0) {
+        std::fprintf(stderr, "[reload] compute_log_mel failed after the table change\n");
+        return 1;
+    }
+    if (bit_equal(fresh, before)) {
+        std::fprintf(stderr, "[reload] FAIL: the changed tables did not change the mel\n");
+        return 1;
+    }
+    if (n_reused != n_fresh || !bit_equal(reused, fresh)) {
+        report_first_diff(fresh, reused, "reload");
+        std::fprintf(stderr, "[reload] FAIL: a reused state kept the previous tables' caches\n");
+        return 1;
+    }
+    std::fprintf(stderr, "[reload] PASS  reused state follows new tables at the same address\n");
+    return 0;
+}
+
+int section_incremental_state_after_table_change(const parakeet::MelConfig & cfg,
+                                                 const std::vector<float> & signal) {
+    using namespace parakeet;
+
+    IncrementalMelState state;
+    MelConfig same_address = cfg;
+    same_address.normalize = MelNormalize::None;
+    std::vector<float> before, reused, fresh;
+    int n_before = 0, n_reused = 0, n_fresh = 0;
+    if (append_log_mel(signal.data(), (int) signal.size(), true, same_address, state, before, n_before) != 0) {
+        std::fprintf(stderr, "[reload-incremental] append_log_mel failed before the table change\n");
+        return 1;
+    }
+
+    for (float & w : same_address.window)     w *= 0.75f;
+    for (float & f : same_address.filterbank) f *= 0.5f;
+
+    reset_incremental_mel(state);
+    IncrementalMelState fresh_state;
+    if (append_log_mel(signal.data(), (int) signal.size(), true, same_address, state, reused, n_reused) != 0 ||
+        append_log_mel(signal.data(), (int) signal.size(), true, same_address, fresh_state, fresh, n_fresh) != 0) {
+        std::fprintf(stderr, "[reload-incremental] append_log_mel failed after the table change\n");
+        return 1;
+    }
+    if (bit_equal(fresh, before)) {
+        std::fprintf(stderr, "[reload-incremental] FAIL: the changed tables did not change the mel\n");
+        return 1;
+    }
+    if (n_reused != n_fresh || !bit_equal(reused, fresh)) {
+        report_first_diff(fresh, reused, "reload-incremental");
+        std::fprintf(stderr, "[reload-incremental] FAIL: a reused incremental state kept the previous tables' caches\n");
+        return 1;
+    }
+    std::fprintf(stderr, "[reload-incremental] PASS  reused incremental state follows new tables\n");
+    return 0;
+}
+
 int section_stateful_vs_stateless_parity(const parakeet::MelConfig & cfg,
                                          const std::vector<float> & signal) {
     using namespace parakeet;
@@ -677,6 +751,8 @@ int main(int /*argc*/, char ** /*argv*/) {
     rc |= section_real_fft_parity(cfg, signal);
     rc |= section_stateful_vs_stateless_parity(cfg, signal);
     rc |= section_repeated_call_invariance(cfg, signal);
+    rc |= section_reused_state_after_table_change(cfg, signal);
+    rc |= section_incremental_state_after_table_change(cfg, signal);
     rc |= section_incremental_short_input_parity(cfg);
     rc |= section_per_feature_cmvn();
     rc |= section_per_feature_valid_frame_zeroing();
