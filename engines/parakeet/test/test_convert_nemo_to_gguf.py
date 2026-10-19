@@ -349,6 +349,19 @@ class ConverterRnntTests(unittest.TestCase):
         self.assertFalse(
             any("duration" in name for name in writer.values))
 
+    def test_long_form_hint_frames(self):
+        # 60 s at the 80 ms stride is 750 frames; a 25 % overlap is 94 frames each side.
+        self.assertEqual(CONVERTER.long_form_hint_frames(160, 16000, 8, 60.0, 0.25), (750, 94))
+        self.assertEqual(CONVERTER.long_form_hint_frames(160, 16000, 8, 60.0, None), (750, 0))
+
+    def test_long_form_hint_keys_written_only_when_requested(self):
+        writer = RecordingWriter()
+        CONVERTER.write_long_form_hint(writer, 160, 16000, unified_config(), None, None)
+        self.assertNotIn("parakeet.long_form.window_frames", writer.values)
+        CONVERTER.write_long_form_hint(writer, 160, 16000, unified_config(), 60.0, 0.25)
+        self.assertEqual(writer.values["parakeet.long_form.window_frames"], 750)
+        self.assertEqual(writer.values["parakeet.long_form.context_frames"], 94)
+
     def test_tdt_durations_from_model_defaults(self):
         config = unified_config()
         config["model_defaults"]["tdt_durations"] = [0, 1, 2, 3, 4]

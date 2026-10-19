@@ -59,6 +59,25 @@ def parse_args(
         ),
     )
     parser.add_argument(
+        "--long-form-window-sec",
+        type=float,
+        default=None,
+        help=(
+            "Long-form window the model recommends, in seconds, written as "
+            "parakeet.long_form.window_frames; the engine takes it when the "
+            "caller leaves the window automatic (TranscribePsy: 60)."
+        ),
+    )
+    parser.add_argument(
+        "--long-form-overlap",
+        type=float,
+        default=None,
+        help=(
+            "Fraction of the recommended window shared with its neighbours, "
+            "written as parakeet.long_form.context_frames (TranscribePsy: 0.25)."
+        ),
+    )
+    parser.add_argument(
         "--head",
         choices=HEAD_CHOICES,
         default="auto",

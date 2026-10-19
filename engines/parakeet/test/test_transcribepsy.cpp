@@ -16,7 +16,9 @@
 //      within one percent word error, both with the engine's default options
 //      and with the 60 s / 25 % windows, on whichever backend the test runs
 //      (ggml CPU, a GPU through --n-gpu-layers, or the Core ML sidecars of
-//      the encoder-less GGUF), so every backend is held to the same accuracy.
+//      the encoder-less GGUF), so every backend is held to the same accuracy;
+//      on the ggml paths the default options take the model's validated
+//      windows and transcribe exactly like the explicit request.
 //
 // With --long-wav it additionally transcribes that recording once and prints
 // the stage times and the transcript, for measuring a long input on whichever
@@ -244,8 +246,8 @@ int check_mel_rejections(Engine & engine, const Opts & o, const EngineResult & j
     return 0;
 }
 
-std::string transcribe_tiled(const Opts & o, int window_frames, int context_frames,
-                             const std::vector<float> & samples, int sample_rate) {
+EngineResult transcribe_tiled(const Opts & o, int window_frames, int context_frames,
+                              const std::vector<float> & samples, int sample_rate) {
     EngineOptions eo;
     eo.model_gguf_path          = o.model_path;
     eo.n_threads                = o.n_threads;
@@ -253,7 +255,7 @@ std::string transcribe_tiled(const Opts & o, int window_frames, int context_fram
     eo.long_form_window_frames  = window_frames;
     eo.long_form_context_frames = context_frames;
     Engine engine(eo);
-    return engine.transcribe_samples(samples.data(), (int) samples.size(), sample_rate).text;
+    return engine.transcribe_samples(samples.data(), (int) samples.size(), sample_rate);
 }
 
 std::vector<float> concat_tiles(const std::vector<float> & a, const std::vector<float> & b, int tiles) {
@@ -289,6 +291,18 @@ int check_long_accuracy(const char * label, const std::string & text, const std:
     return 0;
 }
 
+// TranscribePsy's GGUF is recognised by the loader, so the default options
+// plan its validated 60 s / 25 % windows on the ggml paths and transcribe
+// exactly like the explicit request; the Core ML segments path is its own.
+int check_defaults_take_validated_windows(const EngineResult & defaults, const EngineResult & windowed) {
+    if (defaults.encoder_used_coreml) return 0;
+    if (!same_tokens(defaults, windowed)) {
+        std::fprintf(stderr, "FAIL: the default options did not take TranscribePsy's validated windows\n");
+        return 1;
+    }
+    return 0;
+}
+
 // The same recording must transcribe to the same words on every backend: the
 // default options (one pass, or the Core ML segments of the encoder-less GGUF)
 // and the 60 s / 25 % windows are each held to kMinLongAccuracy against the
@@ -306,16 +320,17 @@ int check_long_english_accuracy(const Opts & o) {
     const std::vector<float> samples  = concat_tiles(jfk, sample, kLongEnglishTiles);
     const std::string        expected = expected_long_english_words(kLongEnglishTiles);
 
-    const std::string defaults = transcribe_tiled(o, 0, 0, samples, sample_rate);
-    const std::string windowed = transcribe_tiled(o, kPhoneWindowFrames, kPhoneContextFrames,
-                                                  samples, sample_rate);
+    const EngineResult defaults = transcribe_tiled(o, 0, 0, samples, sample_rate);
+    const EngineResult windowed = transcribe_tiled(o, kPhoneWindowFrames, kPhoneContextFrames,
+                                                   samples, sample_rate);
     if (o.verbose) {
         std::printf("--- long English, default options ---\n%s\n--- long English, 60 s / 25 %% windows ---\n%s\n",
-                    defaults.c_str(), windowed.c_str());
+                    defaults.text.c_str(), windowed.text.c_str());
     }
     int rc = 0;
-    rc |= check_long_accuracy("default options", defaults, expected);
-    rc |= check_long_accuracy("60 s / 25 % windows", windowed, expected);
+    rc |= check_long_accuracy("default options", defaults.text, expected);
+    rc |= check_long_accuracy("60 s / 25 % windows", windowed.text, expected);
+    rc |= check_defaults_take_validated_windows(defaults, windowed);
     return rc;
 }
 
@@ -328,9 +343,9 @@ int check_phone_windows(const Opts & o) {
     }
     const std::vector<float> samples = tile_to_seconds(base, sample_rate, kTiledSeconds);
 
-    const std::string single   = transcribe_tiled(o, -1, 0, samples, sample_rate);
+    const std::string single   = transcribe_tiled(o, -1, 0, samples, sample_rate).text;
     const std::string windowed = transcribe_tiled(o, kPhoneWindowFrames, kPhoneContextFrames,
-                                                  samples, sample_rate);
+                                                  samples, sample_rate).text;
     if (o.verbose) {
         std::printf("--- single pass ---\n%s\n--- 60 s / 25 %% windows ---\n%s\n",
                     single.c_str(), windowed.c_str());

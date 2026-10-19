@@ -30,10 +30,12 @@ windows, so the encoder's memory depends on the window rather than on the
 length of the recording. `--window-sec S` sets the window (at least 256 encoder
 frames, 20.5 s at the 80 ms stride; at most the model's positional range, 400 s
 for TranscribePsy) and `--overlap F` the fraction of each window shared with its
-neighbours, from 0 to 0.5. Without the flags the engine's automatic window
-applies (the fewest windows of at most 300 s, or the model's range if shorter,
-balanced to equal length, with 256 frames of context each
-side); `--window-sec 0` encodes the whole input in one pass, whose memory grows
+neighbours, from 0 to 0.5. Without the flags the model's own recommended
+window applies when its GGUF carries one, which TranscribePsy's does (60 s
+with 25 % overlap, the setting the research team validated on phones);
+otherwise the engine's automatic window applies (the fewest windows of at most
+300 s, or the model's range if shorter, balanced to equal length, with 256
+frames of context each side). `--window-sec 0` encodes the whole input in one pass, whose memory grows
 with the square of its length. Inputs shorter than the window are encoded in
 one pass at their own length either way. `--stream`, `--diarization-model` and
 `--profile` run their own encoder passes and ignore both flags with a warning.

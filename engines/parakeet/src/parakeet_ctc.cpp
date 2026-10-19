@@ -1,6 +1,7 @@
 // FastConformer encoder ggml graph, GGUF load, CTC head, and encoder execution.
 
 #include "parakeet_ctc.h"
+#include "long_form.h"
 #include "parakeet_log.h"
 #include "backend_util.h"
 
@@ -2463,6 +2464,11 @@ static int load_from_gguf_impl(const std::string & gguf_path,
 
     // Optional variant tag (empty for legacy GGUFs that predate the key).
     out_model.model_variant = get_str(g, "parakeet.model_variant", "");
+    long_form_hint_for_model(get_u32(g, "parakeet.long_form.window_frames", 0),
+                             get_u32(g, "parakeet.long_form.context_frames", 0),
+                             get_str(g, "general.description", ""),
+                             out_model.encoder_cfg.long_form_window_hint,
+                             out_model.encoder_cfg.long_form_context_hint);
     if (out_model.model_type == ParakeetModelType::NEMOTRON) {
         load_nemotron_metadata(g, out_model);
     }

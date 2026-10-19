@@ -71,6 +71,10 @@ struct EncoderConfig {
     int  subsampling_channels     = 256;
     int  subsampling_freq_bins    = 10;
     int  pos_emb_max_len          = 5000;
+    // The long-form window the model recommends when the caller leaves
+    // EngineOptions::long_form_* automatic (0 = none; see long_form.h).
+    int  long_form_window_hint    = 0;
+    int  long_form_context_hint   = 0;
     bool xscaling                 = true;
     bool untie_biases             = true;
     bool use_bias                 = true;

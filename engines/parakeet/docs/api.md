@@ -74,7 +74,14 @@ Long-form one-shot transcription uses bounded encoder windows when
 A windowed pass holds one encoder graph at a time and releases the audio and
 the STFT scratch once the mel exists, so peak memory is bounded by the window.
 `long_form_window_frames = 750` with `long_form_context_frames = 94` is the
-60 s / 25 % setting validated for TranscribePsy on phones. With a Core ML TDT
+60 s / 25 % setting validated for TranscribePsy on phones, and the engine
+takes it by itself when both options are left at 0: a GGUF recommends its
+window through `parakeet.long_form.window_frames` and
+`parakeet.long_form.context_frames` (the converter writes them from
+`--long-form-window-sec` and `--long-form-overlap`), and the published
+TranscribePsy GGUF, which predates the keys, is recognised by its
+description. Any other model keeps the automatic window: the fewest windows
+of at most 300 s, balanced to equal length. With a Core ML TDT
 decoder sidecar the engine instead cuts the recording at pauses into
 independent segments and decodes them batched on the Neural Engine; see
 [Neural Engine sidecars](backends.md#neural-engine-fixed-window-encoder-and-tdt-decoder-sidecars).

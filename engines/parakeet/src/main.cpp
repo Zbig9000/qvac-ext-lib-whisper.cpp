@@ -473,10 +473,15 @@ void log_cli_long_form(const parakeet::ParakeetCtcModel & model, const parakeet:
         return;
     }
     const double frame_sec = encoder_frame_seconds(model);
+    int requested_window  = long_form_opts.long_form_window_frames;
+    int requested_context = long_form_opts.long_form_context_frames;
+    parakeet::apply_long_form_hint(model.encoder_cfg.long_form_window_hint,
+                                   model.encoder_cfg.long_form_context_hint,
+                                   requested_window, requested_context);
     const int window_frames = parakeet::resolve_long_form_window_frames(
-        long_form_opts.long_form_window_frames, model.encoder_cfg.pos_emb_max_len,
+        requested_window, model.encoder_cfg.pos_emb_max_len,
         parakeet::kLongFormAutoWindowFrames, parakeet::kLongFormMinWindowFrames);
-    int context_frames = long_form_opts.long_form_context_frames;
+    int context_frames = requested_context;
     if (context_frames == 0) context_frames = parakeet::kLongFormAutoContextFrames;
     if (context_frames < 0) context_frames = 0;
     context_frames = std::min(context_frames, window_frames / 4);

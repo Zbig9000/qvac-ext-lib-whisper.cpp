@@ -181,11 +181,14 @@ struct EngineOptions {
     // and never exceeds the encoder's trained positional range
     // (pos_emb_max_len), which is a hard ceiling:
     //     > 0  explicit request (still clamped to pos_emb_max_len).
-    //     = 0  auto: at most min(pos_emb_max_len, 3750), which keeps each
-    //          window inside the model's trained positional range and caps
-    //          the attention score tensor at a few hundred MB; the input is
-    //          split into the fewest such windows and they share it equally,
-    //          so a recording just past one window gets two half windows.
+    //     = 0  auto: the window the model recommends when its GGUF carries
+    //          one (TranscribePsy: 750 frames with 94 of context, the 60 s /
+    //          25 % setting validated on phones), otherwise at most
+    //          min(pos_emb_max_len, 3750), which keeps each window inside the
+    //          model's trained positional range and caps the attention score
+    //          tensor at a few hundred MB; the input is then split into the
+    //          fewest such windows and they share it equally, so a recording
+    //          just past one window gets two half windows.
     //     < 0  disabled: always single-pass (legacy behaviour; OOMs on long
     //          inputs -- for A/B testing only).
     //

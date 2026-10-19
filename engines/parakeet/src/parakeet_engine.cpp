@@ -183,9 +183,13 @@ int decode_transducer(const ParakeetCtcModel & model,
 LongFormPlan resolve_long_form_plan(const ParakeetCtcModel & model,
                                     const EngineOptions & opts,
                                     int n_mel_frames) {
+    int requested_window  = opts.long_form_window_frames;
+    int requested_context = opts.long_form_context_frames;
+    apply_long_form_hint(model.encoder_cfg.long_form_window_hint,
+                         model.encoder_cfg.long_form_context_hint,
+                         requested_window, requested_context);
     const LongFormPlan normal =
-        resolve_long_form_plan_frames(opts.long_form_window_frames,
-                                      opts.long_form_context_frames,
+        resolve_long_form_plan_frames(requested_window, requested_context,
                                       model.encoder_cfg.pos_emb_max_len,
                                       model.encoder_cfg.subsampling_factor,
                                       n_mel_frames);

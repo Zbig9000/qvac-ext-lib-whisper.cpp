@@ -21,7 +21,11 @@ dependencies before running its converter.
 [TranscribePsy-250M-EU-sub](https://huggingface.co/qvac/TranscribePsy-250M-EU-sub)
 is a 254M FastConformer-TDT distilled from Parakeet-TDT-0.6B-v3 for Dutch,
 English, French, German, Italian, Polish, Portuguese and Spanish. It is
-published ready to run, so there is nothing to convert:
+published ready to run, so there is nothing to convert; the engine recognises
+it and transcribes long recordings with the 60 s / 25 % windows the research
+team validated unless the caller asks for a window (a re-export can state the
+window itself with the converter's `--long-form-window-sec 60
+--long-form-overlap 0.25`):
 
 ```bash
 engines/parakeet/scripts/download-all-models.sh transcribepsy

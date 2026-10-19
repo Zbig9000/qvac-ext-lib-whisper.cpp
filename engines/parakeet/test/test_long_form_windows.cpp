@@ -133,6 +133,44 @@ void check_balanced_automatic_plan() {
            "a long input keeps nearly full centres");
 }
 
+// A model's recommended window replaces the automatic one, and only that one.
+void check_long_form_hint() {
+    using namespace parakeet;
+    int window = -1, context = -1;
+
+    expect(long_form_hint_for_model(0, 0, "TranscribePsy-250M-EU-sub, FastConformer-TDT", window, context) &&
+           window == kTranscribePsyWindowFrames && context == kTranscribePsyContextFrames,
+           "hint: a TranscribePsy description gives its validated 750 / 94 frames");
+    expect(long_form_hint_for_model(1000, 100, "TranscribePsy-250M-EU-sub", window, context) &&
+           window == 1000 && context == 100,
+           "hint: explicit GGUF keys win over the description");
+    expect(long_form_hint_for_model(1000, 0, "", window, context) && window == 1000 && context == 0,
+           "hint: a window key without a context key leaves the context automatic");
+    expect(!long_form_hint_for_model(0, 0, "NVIDIA Parakeet-TDT FastConformer ASR", window, context) &&
+           window == 0 && context == 0,
+           "hint: other models recommend nothing");
+
+    int w = 0, c = 0;
+    apply_long_form_hint(750, 94, w, c);
+    expect(w == 750 && c == 94, "apply: automatic window and context take the hint");
+    w = 0; c = 50;
+    apply_long_form_hint(750, 94, w, c);
+    expect(w == 750 && c == 50, "apply: a caller's context is kept");
+    w = 1500; c = 0;
+    apply_long_form_hint(750, 94, w, c);
+    expect(w == 1500 && c == 0, "apply: an explicit window is left alone");
+    w = -1; c = 0;
+    apply_long_form_hint(750, 94, w, c);
+    expect(w == -1 && c == 0, "apply: a disabled window stays disabled");
+    w = 0; c = 0;
+    apply_long_form_hint(0, 0, w, c);
+    expect(w == 0 && c == 0, "apply: no hint changes nothing");
+
+    const LongFormPlan hinted = resolve_long_form_plan_frames(750, 94, 5000, 8, 41272);
+    expect(hinted.enabled && hinted.window_frames == 750 && hinted.center_frames == 750 - 2 * 94,
+           "a hinted window plans like a requested one");
+}
+
 void check_window_resolution() {
     constexpr int kAuto = 3750;
     constexpr int kMin  = 256;
@@ -485,6 +523,7 @@ void check_shared_final_span() {
 }  // namespace
 
 int main() {
+    check_long_form_hint();
     check_balanced_automatic_plan();
 
     // Planner: single-window, exact multiples, remainders, degenerate context.

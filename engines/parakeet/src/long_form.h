@@ -22,6 +22,7 @@
 #include <climits>
 #include <cmath>
 #include <cstddef>
+#include <string>
 #include <vector>
 
 namespace parakeet {
@@ -133,6 +134,49 @@ plan_long_form_windows(int n_units, int center_units, int ctx_units,
 //     than one that exceeds the trained range.
 //
 // Exercised model-free by test/test_long_form_windows.cpp.
+// The 60 s / 25 % windows the research team validated TranscribePsy with on
+// phones: 750 encoder frames at the 80 ms stride, 12.5 % of context each side.
+constexpr int kTranscribePsyWindowFrames  = 750;
+constexpr int kTranscribePsyContextFrames = 94;
+constexpr const char * kTranscribePsyDescriptionMark = "TranscribePsy";
+
+// The window a model recommends for the automatic long-form plan: the GGUF's
+// parakeet.long_form.window_frames / context_frames keys when it carries
+// them, or TranscribePsy's validated setting for a GGUF whose description
+// names the model (the published file predates the keys). Returns false,
+// with both outputs 0, when the model recommends nothing.
+inline bool long_form_hint_for_model(int window_key, int context_key,
+                                     const std::string & description,
+                                     int & window, int & context) {
+    if (window_key > 0) {
+        window  = window_key;
+        context = context_key > 0 ? context_key : 0;
+        return true;
+    }
+    if (description.find(kTranscribePsyDescriptionMark) != std::string::npos) {
+        window  = kTranscribePsyWindowFrames;
+        context = kTranscribePsyContextFrames;
+        return true;
+    }
+    window  = 0;
+    context = 0;
+    return false;
+}
+
+// A caller who left the window automatic (0) gets the model's recommended
+// window, and its recommended context unless the caller set one; explicit
+// and disabled (< 0) requests are left alone.
+inline void apply_long_form_hint(int hint_window, int hint_context,
+                                 int & requested_window, int & requested_context) {
+    if (requested_window != 0 || hint_window <= 0) {
+        return;
+    }
+    requested_window = hint_window;
+    if (requested_context == 0 && hint_context > 0) {
+        requested_context = hint_context;
+    }
+}
+
 // Centre frames of the automatic windows for an input of `n_enc_frames`: the
 // fewest windows whose centres fit `center_frames`, then every window takes an
 // equal share, so a recording just past one window is encoded as two half

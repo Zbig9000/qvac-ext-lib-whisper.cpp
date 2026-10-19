@@ -959,6 +959,28 @@ def detect_sortformer_variant(ckpt: Path) -> str:
     return ""
 
 
+def long_form_hint_frames(hop_length: int, sample_rate: int, subsampling_factor: int,
+                          window_sec: float, overlap: float | None) -> tuple:
+    """Encoder frames of a recommended long-form window and of the context
+    on each side for a share `overlap` of the window (half of it each side)."""
+    frame_sec = hop_length * subsampling_factor / sample_rate
+    window_frames = int(round(window_sec / frame_sec))
+    context_frames = 0 if not overlap else int(round(window_frames * overlap / 2))
+    return window_frames, context_frames
+
+
+def write_long_form_hint(writer, hop_length: int, sample_rate: int, cfg: dict,
+                         window_sec: float | None, overlap: float | None):
+    """parakeet.long_form.* keys for a model that recommends its own window."""
+    if window_sec is None:
+        return
+    subsampling_factor = int(cfg.get("encoder", {}).get("subsampling_factor", 8))
+    window_frames, context_frames = long_form_hint_frames(
+        hop_length, sample_rate, subsampling_factor, window_sec, overlap)
+    writer.add_uint32("parakeet.long_form.window_frames", window_frames)
+    writer.add_uint32("parakeet.long_form.context_frames", context_frames)
+
+
 def write_provenance(writer, model_type: str, description=None):
     """general.description plus the per-family license keys.
 
@@ -990,7 +1012,8 @@ def write_provenance(writer, model_type: str, description=None):
 
 def write_gguf(out: Path, ckpt: Path, cfg: dict, sd: dict, tok_bytes: bytes,
                multilingual_tok: dict, quant: str, head: str = "auto",
-               description=None):
+               description=None,
+               long_form_window_sec=None, long_form_overlap=None):
     model_type = detect_model_type(cfg, head)
     if model_type == "rnnt":
         validate_rnnt_contract(cfg, sd)
@@ -1039,6 +1062,7 @@ def write_gguf(out: Path, ckpt: Path, cfg: dict, sd: dict, tok_bytes: bytes,
     }[model_type]
     writer.add_name(model_name)
     write_provenance(writer, model_type, description)
+    write_long_form_hint(writer, hop_length, sample_rate, cfg, long_form_window_sec, long_form_overlap)
     writer.add_file_type(FILE_TYPE_MAP[quant])
 
     writer.add_string("parakeet.model.type", model_type)
@@ -1402,6 +1426,7 @@ def main():
     write_gguf(
         args.out, ckpt, cfg, sd, tok_bytes, multilingual_tok, args.quant,
         args.head, args.description,
+        args.long_form_window_sec, args.long_form_overlap,
     )
 
 
