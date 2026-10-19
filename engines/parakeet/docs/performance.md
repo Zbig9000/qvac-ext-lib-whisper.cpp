@@ -838,15 +838,15 @@ the fork's crash on long recordings on CUDA and Metal:
 | Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | CPU, CLI, 60 s / 25 % windows | 413 s | 21.8 s | 22.3 s | 98 % |
 | Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | CPU, CLI, 60 s / 25 % windows | 619 s | 38.9 s | 40.0 s | 97 % |
 | Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | CPU, CLI, 60 s / 25 % windows, 4 threads | 413 s | 36.0 s | 40.4 s | 89 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 11 s | 169 ms | 204 ms | 83 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 413 s | 25.6 s | 26.1 s | 98 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 619 s | 41.1 s | 46.8 s | 88 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, default options on both | 11 s | 155 ms | 202 ms | 77 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, default options on both | 413 s | 23.1 s | 77.1 s | 30 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, default options on both | 619 s | 40.7 s | reboots the phone (out of memory) | - |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, 750-frame windows / 94 context | 11 s | 167 ms | 202 ms | 83 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, 750-frame windows / 94 context | 413 s | 26.5 s | 26.5 s | 100 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, 750-frame windows / 94 context | 619 s | 40.7 s | 47.0 s | 87 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, best of two interleaved rounds | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 11 s | 169 ms | 204 ms | 83 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, best of two interleaved rounds | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 413 s | 25.6 s | 26.1 s | 98 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, best of two interleaved rounds | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 619 s | 41.1 s | 46.8 s | 88 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, best of two interleaved rounds | CPU, engine API, default options on both | 11 s | 155 ms | 202 ms | 77 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, best of two interleaved rounds | CPU, engine API, default options on both | 413 s | 23.1 s | 77.1 s | 30 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, best of two interleaved rounds | CPU, engine API, default options on both | 619 s | 40.7 s | reboots the phone (out of memory) | - |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, best of two interleaved rounds | CPU, engine API, 750-frame windows / 94 context | 11 s | 167 ms | 202 ms | 83 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, best of two interleaved rounds | CPU, engine API, 750-frame windows / 94 context | 413 s | 26.5 s | 26.5 s | 100 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, best of two interleaved rounds | CPU, engine API, 750-frame windows / 94 context | 619 s | 40.7 s | 47.0 s | 87 % |
 | Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, one run | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 2063 s | 135.7 s | 165.7 s | 82 % |
 | Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, one run | CPU, engine API, port default vs the fork's 750-frame windows (its default exceeds the phone's memory) | 2063 s | 134.2 s | 165.0 s | 81 % |
 
