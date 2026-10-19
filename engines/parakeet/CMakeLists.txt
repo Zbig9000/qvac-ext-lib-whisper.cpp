@@ -685,6 +685,7 @@ if (PARAKEET_BUILD_TESTS)
     set(_qvp_jfk_wav       "${PARAKEET_TEST_AUDIO_DIR}/jfk.wav")
     set(_qvp_diar_wav      "${PARAKEET_TEST_AUDIO_DIR}/diarization-sample-16k.wav")
     set(_qvp_fr_multipiece_wav "${PARAKEET_TEST_AUDIO_DIR}/fr-multipiece-16k.wav")
+    set(_qvp_sample_wav    "${PARAKEET_TEST_AUDIO_DIR}/sample-16k.wav")
     set(_qvp_hi_wav        "${PARAKEET_TEST_AUDIO_DIR}/hi-16k.wav")
     set(_qvp_rnnt_hybrid_wav "${PARAKEET_TEST_AUDIO_DIR}/rnnt-ka-16k.wav")
     set(_qvp_hi_expected   "${PARAKEET_TEST_AUDIO_DIR}/hi-16k.expected.txt")
@@ -2391,17 +2392,38 @@ if (PARAKEET_BUILD_TESTS)
                  "${_qvp_transcribepsy_gguf}" "${_qvp_jfk_wav}")
 
     # TranscribePsy on the engine API: expected transcript, precomputed-mel
-    # parity (also from a worker thread), and the 60 s / 25 % long-form
-    # windows recommended on phones against the single pass.
+    # parity (also from a worker thread), the 60 s / 25 % long-form windows
+    # recommended on phones against the single pass, and a three-minute
+    # pause-free English recording held to one percent word error. The same
+    # binary runs on the ggml CPU, on the GPU backend of the build, and on the
+    # Core ML sidecars of the encoder-less GGUF, so every backend meets the
+    # same accuracy bar.
     add_executable(test-transcribepsy test/test_transcribepsy.cpp)
     target_link_libraries(test-transcribepsy PRIVATE qvac-parakeet)
     target_include_directories(test-transcribepsy PRIVATE include src ggml/include)
     parakeet_apply_ccache(test-transcribepsy)
+    set(_qvp_transcribepsy_clips
+        "--wav" "${_qvp_jfk_wav}" "--wav2" "${_qvp_fr_multipiece_wav}" "--wav-sample" "${_qvp_sample_wav}")
+    set(_qvp_transcribepsy_clip_files "${_qvp_jfk_wav}" "${_qvp_fr_multipiece_wav}" "${_qvp_sample_wav}")
     parakeet_register_test(test-transcribepsy
         LABEL    "fixture"
-        ARGS     "--model" "${_qvp_transcribepsy_gguf}" "--wav" "${_qvp_jfk_wav}"
-                 "--wav2" "${_qvp_fr_multipiece_wav}"
-        REQUIRES "${_qvp_transcribepsy_gguf}" "${_qvp_jfk_wav}" "${_qvp_fr_multipiece_wav}")
+        ARGS     "--model" "${_qvp_transcribepsy_gguf}" ${_qvp_transcribepsy_clips}
+        REQUIRES "${_qvp_transcribepsy_gguf}" ${_qvp_transcribepsy_clip_files})
+    if (GGML_VULKAN OR GGML_METAL OR GGML_CUDA)
+        parakeet_register_test(test-transcribepsy-gpu
+            LABEL    "fixture;gpu"
+            EXE      test-transcribepsy
+            ARGS     "--model" "${_qvp_transcribepsy_gguf}" ${_qvp_transcribepsy_clips} "--n-gpu-layers" "999"
+            REQUIRES "${_qvp_transcribepsy_gguf}" ${_qvp_transcribepsy_clip_files})
+    endif()
+    if (PARAKEET_COREML)
+        parakeet_register_test(test-transcribepsy-coreml
+            LABEL    "fixture;coreml"
+            EXE      test-transcribepsy
+            ARGS     "--model" "${_qvp_transcribepsy_coreml_gguf}" ${_qvp_transcribepsy_clips}
+            REQUIRES "${_qvp_transcribepsy_coreml_gguf}" "${_qvp_transcribepsy_coreml_encoder}"
+                     ${_qvp_transcribepsy_clip_files})
+    endif()
 
     if (GGML_VULKAN OR GGML_METAL OR GGML_CUDA)
         add_executable(test-gpu-vs-cpu

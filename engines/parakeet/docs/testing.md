@@ -65,8 +65,14 @@ the Neural Engine Core ML exporters (Python).
 (`scripts/download-all-models.sh transcribepsy`): it checks the published
 GGUF's transcript of `jfk.wav`, `transcribe_mel` parity with `transcribe`
 including a mel computed on a worker thread, the rejection of a
-`PrecomputedMel` whose buffer does not match its declared shape, and the
-60 s / 25 % long-form windows against the single pass. Two more fixture tests
+`PrecomputedMel` whose buffer does not match its declared shape, the
+60 s / 25 % long-form windows against the single pass, and a 187 s pause-free
+English recording (`jfk.wav` and `sample-16k.wav` six times) held to one
+percent word error with the default options and with the 60 s / 25 % windows.
+`test-transcribepsy-gpu` (`-L gpu`) runs the same binary with
+`--n-gpu-layers 999` on the GPU backend of the build, and on a Core ML build
+`test-transcribepsy-coreml` (`-L coreml`) runs it on the encoder-less Core ML
+GGUF with its sidecars, so every backend meets the same accuracy bar. Two more fixture tests
 use the same GGUF: `test-encoder-graph-cache` fills the ggml encoder graph
 cache with several shapes, lowers the limit and checks the eviction, then
 checks that a windowed pass holds one graph and restores the limit on both a
