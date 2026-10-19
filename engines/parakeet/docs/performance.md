@@ -743,6 +743,322 @@ What the table says:
   GGUF with its sidecars (`test-transcribepsy-coreml`), and passes on all
   three on the M4 with no word error.
 
+### TranscribePsy: port against the research fork, final pass (2026-10-19)
+
+The port at `2a0d4df1` (with the balanced automatic windows and
+TranscribePsy's validated 60 s / 25 % windows as its default) against the
+fork at `364ec36`, both built Release with the same flags per machine, on the
+four machines available for this pass: the Linux box (Ubuntu 25.10, Ryzen 9
+9950X with 10 cores exposed, RTX 5090 on GPU 0, CUDA 13.3, 8 threads and a
+4-thread row), a DGX Spark (GB10, 20 cores, CUDA 13.3 with
+`CMAKE_CUDA_ARCHITECTURES=121`, 10 threads and a 20-thread row), the Mac mini
+M4 (16 GB, macOS 15.3, Metal and the Core ML distribution, 6 threads and a
+4-thread row) and a Samsung S25 (SM-S931B, Snapdragon 8 Elite, 8 cores,
+12 GB) over adb, both trees cross-compiled with the fork's own Android
+recipe (NDK r29, arm64-v8a, CPU only, static; 6 threads and a 4-thread row).
+Method and recordings are those of the previous sections: three timed runs
+after a warm-up (two on the phone), peak RSS from `/usr/bin/time` or, on
+the phone, the engine driver's own `getrusage`, WER against the clips' own
+transcripts. The phone throttles under a 40-minute run, so its default and
+engine rows were measured again in an interleaved fork/port round with 45 s
+cool-downs before every run (the phone left the USB link before a second
+round and before the engine rows of the 619 s recording); its 60 s / 25 %
+CLI rows are from the first pass, where fork and port ran back to back.
+
+Total time, port over fork (below 100 %: the port is faster); "fails" is
+the fork's crash on long recordings on CUDA and Metal:
+
+| Machine | Backend / path | Audio | Port | Fork | Port / fork |
+|---|---|---|--:|--:|--:|
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CPU, CLI, 60 s / 25 % windows | 11 s | 152 ms | 190 ms | 80 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CPU, CLI, 60 s / 25 % windows | 413 s | 12.1 s | 13.2 s | 92 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CPU, CLI, 60 s / 25 % windows | 619 s | 17.0 s | 18.8 s | 90 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 11 s | 154 ms | 190 ms | 81 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 413 s | 12.2 s | 13.2 s | 92 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 619 s | 16.9 s | 18.8 s | 90 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CPU, engine API, default options on both | 11 s | 153 ms | 192 ms | 80 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CPU, engine API, default options on both | 413 s | 12.2 s | 19.9 s | 61 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CPU, engine API, default options on both | 619 s | 16.9 s | 32.6 s | 52 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CPU, engine API, 750-frame windows / 94 context | 11 s | 153 ms | 194 ms | 79 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CPU, engine API, 750-frame windows / 94 context | 413 s | 12.1 s | 12.1 s | 99 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CPU, engine API, 750-frame windows / 94 context | 619 s | 16.8 s | 17.9 s | 94 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CPU, CLI, 60 s / 25 % windows, 4 threads | 413 s | 22.1 s | 22.1 s | 100 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CUDA, CLI, 60 s / 25 % windows | 11 s | 8 ms | 17 ms | 47 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CUDA, CLI, 60 s / 25 % windows | 413 s | 211 ms | fails | - |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CUDA, CLI, 60 s / 25 % windows | 619 s | 296 ms | fails | - |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CUDA, engine API, default options | 11 s | 8 ms | 17 ms | 45 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CUDA, engine API, default options | 413 s | 209 ms | fails | - |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | CUDA, engine API, default options | 619 s | 297 ms | fails | - |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CPU, CLI, 60 s / 25 % windows | 11 s | 181 ms | 234 ms | 77 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CPU, CLI, 60 s / 25 % windows | 413 s | 12.7 s | 14.0 s | 90 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CPU, CLI, 60 s / 25 % windows | 619 s | 17.6 s | 19.8 s | 89 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 11 s | 178 ms | 234 ms | 76 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 413 s | 12.6 s | 14.0 s | 90 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 619 s | 17.7 s | 19.8 s | 90 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CPU, engine API, default options on both | 11 s | 183 ms | 235 ms | 78 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CPU, engine API, default options on both | 413 s | 12.7 s | 17.3 s | 74 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CPU, engine API, default options on both | 619 s | 17.6 s | 27.8 s | 63 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CPU, engine API, 750-frame windows / 94 context | 11 s | 181 ms | 235 ms | 77 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CPU, engine API, 750-frame windows / 94 context | 413 s | 12.7 s | 12.7 s | 100 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CPU, engine API, 750-frame windows / 94 context | 619 s | 17.7 s | 19.2 s | 92 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CPU, CLI, 60 s / 25 % windows, 20 threads | 413 s | 11.3 s | 12.7 s | 89 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CUDA, CLI, 60 s / 25 % windows | 11 s | 15 ms | 33 ms | 46 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CUDA, CLI, 60 s / 25 % windows | 413 s | 604 ms | fails | - |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CUDA, CLI, 60 s / 25 % windows | 619 s | 830 ms | fails | - |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CUDA, engine API, default options | 11 s | 15 ms | 34 ms | 45 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CUDA, engine API, default options | 413 s | 602 ms | fails | - |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | CUDA, engine API, default options | 619 s | 835 ms | fails | - |
+| Mac mini M4 (16 GB), 6 threads | CPU, CLI, 60 s / 25 % windows | 11 s | 138 ms | 189 ms | 73 % |
+| Mac mini M4 (16 GB), 6 threads | CPU, CLI, 60 s / 25 % windows | 413 s | 11.6 s | 13.7 s | 85 % |
+| Mac mini M4 (16 GB), 6 threads | CPU, CLI, 60 s / 25 % windows | 619 s | 16.4 s | 19.4 s | 85 % |
+| Mac mini M4 (16 GB), 6 threads | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 11 s | 142 ms | 189 ms | 75 % |
+| Mac mini M4 (16 GB), 6 threads | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 413 s | 11.8 s | 13.7 s | 86 % |
+| Mac mini M4 (16 GB), 6 threads | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 619 s | 16.4 s | 19.4 s | 85 % |
+| Mac mini M4 (16 GB), 6 threads | CPU, engine API, default options on both | 11 s | 140 ms | 182 ms | 77 % |
+| Mac mini M4 (16 GB), 6 threads | CPU, engine API, default options on both | 413 s | 11.8 s | 24.1 s | 49 % |
+| Mac mini M4 (16 GB), 6 threads | CPU, engine API, default options on both | 619 s | 16.4 s | 40.9 s | 40 % |
+| Mac mini M4 (16 GB), 6 threads | CPU, engine API, 750-frame windows / 94 context | 11 s | 140 ms | 186 ms | 75 % |
+| Mac mini M4 (16 GB), 6 threads | CPU, engine API, 750-frame windows / 94 context | 413 s | 11.8 s | 12.5 s | 94 % |
+| Mac mini M4 (16 GB), 6 threads | CPU, engine API, 750-frame windows / 94 context | 619 s | 16.4 s | 18.6 s | 88 % |
+| Mac mini M4 (16 GB), 6 threads | CPU, CLI, 60 s / 25 % windows, 4 threads | 413 s | 12.2 s | 15.8 s | 78 % |
+| Mac mini M4 (16 GB), 6 threads | Metal, CLI, 60 s / 25 % windows | 11 s | 48 ms | 106 ms | 45 % |
+| Mac mini M4 (16 GB), 6 threads | Metal, CLI, 60 s / 25 % windows | 413 s | 2.6 s | fails | - |
+| Mac mini M4 (16 GB), 6 threads | Metal, CLI, 60 s / 25 % windows | 619 s | 3.6 s | fails | - |
+| Mac mini M4 (16 GB), 6 threads | Metal, engine API, default options | 11 s | 48 ms | 106 ms | 45 % |
+| Mac mini M4 (16 GB), 6 threads | Metal, engine API, default options | 413 s | 2.5 s | fails | - |
+| Mac mini M4 (16 GB), 6 threads | Metal, engine API, default options | 619 s | 3.6 s | fails | - |
+| Mac mini M4 (16 GB), 6 threads | Core ML (Neural Engine), CLI | 11 s | 20 ms | 27 ms | 73 % |
+| Mac mini M4 (16 GB), 6 threads | Core ML (Neural Engine), CLI | 413 s | 689 ms | 986 ms | 70 % |
+| Mac mini M4 (16 GB), 6 threads | Core ML (Neural Engine), CLI | 619 s | 1.0 s | 1.5 s | 68 % |
+| Mac mini M4 (16 GB), 6 threads | Core ML (Neural Engine), engine API | 11 s | 76 ms | 77 ms | 99 % |
+| Mac mini M4 (16 GB), 6 threads | Core ML (Neural Engine), engine API | 413 s | 955 ms | 1.0 s | 92 % |
+| Mac mini M4 (16 GB), 6 threads | Core ML (Neural Engine), engine API | 619 s | 1.3 s | 1.5 s | 91 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | CPU, CLI, 60 s / 25 % windows | 11 s | 171 ms | 199 ms | 86 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | CPU, CLI, 60 s / 25 % windows | 413 s | 21.8 s | 22.3 s | 98 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | CPU, CLI, 60 s / 25 % windows | 619 s | 38.9 s | 40.0 s | 97 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | CPU, CLI, 60 s / 25 % windows, 4 threads | 413 s | 36.0 s | 40.4 s | 89 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 11 s | 169 ms | 205 ms | 82 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 413 s | 26.8 s | 28.3 s | 95 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 619 s | 42.3 s | 46.8 s | 91 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, default options on both | 11 s | 155 ms | 205 ms | 75 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, default options on both | 413 s | 27.3 s | 96.8 s | 28 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, default options on both | 619 s | - | - | - |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, 750-frame windows / 94 context | 11 s | 167 ms | 204 ms | 82 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, 750-frame windows / 94 context | 413 s | 28.4 s | 29.3 s | 97 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, 750-frame windows / 94 context | 619 s | - | - | - |
+
+What changed since the first pass and what the table says:
+
+- The port's CLI without flags and the engine API with default options now
+  plan TranscribePsy's validated 60 s / 25 % windows, so its default rows
+  equal its `--window-sec 60 --overlap 0.25` rows: 8 to 15 % faster than the
+  fork's CLI default on long recordings on the Linux box, the Spark and the
+  M4, and 20 to 27 % faster on short clips. Against the fork's engine API
+  default (its automatic 300 s window) the port is 1.3 to 2.5 times faster
+  on long recordings.
+- The engine API at the same 750-frame windows is equal on the 413 s
+  recording (99 to 100 %) and 6 to 12 % faster on the 619 s one.
+- CUDA and Metal: twice as fast on short clips; the fork fails on the long
+  recordings, the port transcribes them (RTF 0.0005 on the RTX 5090, 0.0015
+  on the GB10, 0.006 on the M4).
+- Core ML on the M4: the CLI is 27 to 32 % faster, the engine path 8 to 9 %
+  faster on long recordings and equal on `jfk.wav` (76 against 77 ms, ten
+  runs), where the single-lane batched decoder dominates on both.
+- Samsung S25, CPU only, interleaved round: port default against
+  fork default 82 %, 95 %, 91 % (11 s, 413 s, 619 s); engine API
+  defaults 75 %, 28 %, -; engine API at 750-frame windows 82 %, 97 %, -.
+  The phone throttles, so the first pass had put the port's re-measured
+  rows at a disadvantage; the interleaved round removes it.
+
+Accuracy per backend on this pass (same recordings and references as the
+previous section; the port's default rows now coincide with its 60 s rows):
+
+| Machine | Build, backend and path | EN no pauses 374 s | EN pauses 390 s | FR no pauses 98 s | FR pauses 119 s | EN+FR no pauses 413 s |
+|---|---|--:|--:|--:|--:|--:|
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | port, CPU, 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.1 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | port, CPU, default | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.1 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | fork, CPU, its default 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.3 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | port, CUDA, 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.3 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | port, CUDA, default | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.3 % |
+| Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads | fork, CUDA | fails | fails | 21.9 % | 28.6 % | fails |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | port, CPU, 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.3 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | port, CPU, default | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.3 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | fork, CPU, its default 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.3 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | port, CUDA, 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 4.9 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | port, CUDA, default | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 4.9 % |
+| DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads | fork, CUDA | fails | fails | 21.9 % | 28.6 % | fails |
+| Mac mini M4 (16 GB), 6 threads | port, CPU, 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.1 % |
+| Mac mini M4 (16 GB), 6 threads | port, CPU, default | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.1 % |
+| Mac mini M4 (16 GB), 6 threads | fork, CPU, its default 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.3 % |
+| Mac mini M4 (16 GB), 6 threads | port, Metal, 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.1 % |
+| Mac mini M4 (16 GB), 6 threads | port, Metal, default | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.1 % |
+| Mac mini M4 (16 GB), 6 threads | fork, Metal | fails | fails | 21.9 % | 28.6 % | fails |
+| Mac mini M4 (16 GB), 6 threads | port, Core ML, CLI windows | 0.6 % | 0.1 % | 21.0 % | 29.5 % | 10.5 % |
+| Mac mini M4 (16 GB), 6 threads | port, Core ML, engine API | 0.0 % | 0.0 % | 20.0 % | 27.6 % | 11.6 % |
+| Mac mini M4 (16 GB), 6 threads | fork, Core ML, CLI | 2.7 % | 0.6 % | 21.0 % | 35.7 % | 7.1 % |
+| Mac mini M4 (16 GB), 6 threads | fork, Core ML, engine API | 0.1 % | 0.0 % | 21.0 % | 27.1 % | 12.9 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | port, CPU, 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | - |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | port, CPU, default | 0.0 % | 0.2 % | 21.9 % | 28.6 % | - |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | fork, CPU, its default 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | - |
+
+Per-machine detail (`jfk.wav`, long-mix and the 619 s recording):
+**Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads**
+
+| Clip | Build and path | Mel | Encoder | Decoder | Total | RTF | Peak RSS | WER |
+|---|---|--:|--:|--:|--:|--:|--:|--:|
+| 11 s | fork CLI, default 60 s / 25 % windows | 4 ms | 177 ms | 9 ms | 190 ms | 0.0173 | 765 MB | 0.0 % |
+| 11 s | port CLI, `--window-sec 60 --overlap 0.25` | 1 ms | 147 ms | 3 ms | 152 ms | 0.0138 | 620 MB | 0.0 % |
+| 11 s | port CLI, default (balanced automatic windows) | 1 ms | 150 ms | 3 ms | 154 ms | 0.0140 | 619 MB | 0.0 % |
+| 11 s | fork engine API, default options | 4 ms | 179 ms | 9 ms | 192 ms | 0.0175 | 765 MB | 0.0 % |
+| 11 s | port engine API, default options | 1 ms | 149 ms | 3 ms | 153 ms | 0.0140 | 617 MB | 0.0 % |
+| 11 s | fork engine API, 750-frame windows, 94 context | 4 ms | 181 ms | 9 ms | 194 ms | 0.0177 | 764 MB | 0.0 % |
+| 11 s | port engine API, 750-frame windows, 94 context | 1 ms | 149 ms | 3 ms | 153 ms | 0.0139 | 617 MB | 0.0 % |
+| 11 s | fork CLI, CUDA | 4 ms | 10 ms | 3 ms | 17 ms | 0.0015 | 603 MB | 0.0 % |
+| 11 s | port CLI, CUDA, 60 s / 25 % windows | 1 ms | 6 ms | 2 ms | 8 ms | 0.0007 | 619 MB | 0.0 % |
+| 11 s | port CLI, CUDA, default | 1 ms | 6 ms | 1 ms | 8 ms | 0.0007 | 619 MB | 0.0 % |
+| 11 s | fork engine API, CUDA | 4 ms | 10 ms | 3 ms | 17 ms | 0.0016 | 604 MB | 0.0 % |
+| 11 s | port engine API, CUDA, default | 1 ms | 6 ms | 2 ms | 8 ms | 0.0007 | 619 MB | 0.0 % |
+| 413 s | fork CLI, default 60 s / 25 % windows | 144 ms | 12.7 s | 388 ms | 13.2 s | 0.0320 | 1.8 GB | 5.3 % |
+| 413 s | port CLI, `--window-sec 60 --overlap 0.25` | 19 ms | 12.0 s | 111 ms | 12.1 s | 0.0293 | 1.1 GB | 5.1 % |
+| 413 s | port CLI, default (balanced automatic windows) | 19 ms | 12.0 s | 111 ms | 12.2 s | 0.0295 | 1.1 GB | 5.1 % |
+| 413 s | fork engine API, default options | 151 ms | 19.3 s | 421 ms | 19.9 s | 0.0483 | 9.7 GB | 6.3 % |
+| 413 s | port engine API, default options | 16 ms | 12.0 s | 112 ms | 12.2 s | 0.0295 | 1.1 GB | 5.1 % |
+| 413 s | fork engine API, 750-frame windows, 94 context | 152 ms | 11.6 s | 397 ms | 12.1 s | 0.0294 | 3.2 GB | 5.8 % |
+| 413 s | port engine API, 750-frame windows, 94 context | 15 ms | 11.9 s | 110 ms | 12.1 s | 0.0293 | 1.1 GB | 5.1 % |
+| 413 s | fork CLI, CUDA | fails | | | | | | |
+| 413 s | port CLI, CUDA, 60 s / 25 % windows | 17 ms | 132 ms | 62 ms | 211 ms | 0.0005 | 679 MB | 5.3 % |
+| 413 s | port CLI, CUDA, default | 16 ms | 132 ms | 62 ms | 210 ms | 0.0005 | 681 MB | 5.3 % |
+| 413 s | fork engine API, CUDA | fails | | | | | | |
+| 413 s | port engine API, CUDA, default | 16 ms | 132 ms | 60 ms | 209 ms | 0.0005 | 676 MB | 5.3 % |
+| 619 s | fork CLI, default 60 s / 25 % windows | 227 ms | 18.0 s | 595 ms | 18.8 s | 0.0303 | 1.8 GB | 4.7 % |
+| 619 s | port CLI, `--window-sec 60 --overlap 0.25` | 29 ms | 16.8 s | 166 ms | 17.0 s | 0.0274 | 1.1 GB | 4.7 % |
+| 619 s | port CLI, default (balanced automatic windows) | 28 ms | 16.7 s | 167 ms | 16.9 s | 0.0273 | 1.1 GB | 4.7 % |
+| 619 s | fork engine API, default options | 235 ms | 31.7 s | 646 ms | 32.6 s | 0.0526 | 14.7 GB | 6.6 % |
+| 619 s | port engine API, default options | 24 ms | 16.7 s | 166 ms | 16.9 s | 0.0273 | 1.1 GB | 4.7 % |
+| 619 s | fork engine API, 750-frame windows, 94 context | 217 ms | 17.1 s | 580 ms | 17.9 s | 0.0290 | 3.7 GB | 4.8 % |
+| 619 s | port engine API, 750-frame windows, 94 context | 28 ms | 16.6 s | 166 ms | 16.8 s | 0.0271 | 1.1 GB | 4.7 % |
+| 619 s | fork CLI, CUDA | fails | | | | | | |
+| 619 s | port CLI, CUDA, 60 s / 25 % windows | 23 ms | 183 ms | 90 ms | 296 ms | 0.0005 | 682 MB | 4.8 % |
+| 619 s | port CLI, CUDA, default | 23 ms | 183 ms | 93 ms | 299 ms | 0.0005 | 682 MB | 4.8 % |
+| 619 s | fork engine API, CUDA | fails | | | | | | |
+| 619 s | port engine API, CUDA, default | 23 ms | 183 ms | 91 ms | 297 ms | 0.0005 | 675 MB | 4.8 % |
+
+**DGX Spark, GB10 (20 cores, CUDA 13.3), 10 threads**
+
+| Clip | Build and path | Mel | Encoder | Decoder | Total | RTF | Peak RSS | WER |
+|---|---|--:|--:|--:|--:|--:|--:|--:|
+| 11 s | fork CLI, default 60 s / 25 % windows | 4 ms | 211 ms | 18 ms | 234 ms | 0.0213 | 846 MB | 0.0 % |
+| 11 s | port CLI, `--window-sec 60 --overlap 0.25` | 2 ms | 175 ms | 4 ms | 181 ms | 0.0164 | 701 MB | 0.0 % |
+| 11 s | port CLI, default (balanced automatic windows) | 2 ms | 173 ms | 4 ms | 178 ms | 0.0162 | 701 MB | 0.0 % |
+| 11 s | fork engine API, default options | 4 ms | 212 ms | 19 ms | 235 ms | 0.0214 | 846 MB | 0.0 % |
+| 11 s | port engine API, default options | 2 ms | 178 ms | 4 ms | 183 ms | 0.0166 | 699 MB | 0.0 % |
+| 11 s | fork engine API, 750-frame windows, 94 context | 4 ms | 213 ms | 18 ms | 235 ms | 0.0214 | 846 MB | 0.0 % |
+| 11 s | port engine API, 750-frame windows, 94 context | 2 ms | 176 ms | 4 ms | 181 ms | 0.0165 | 699 MB | 0.0 % |
+| 11 s | fork CLI, CUDA | 4 ms | 24 ms | 5 ms | 33 ms | 0.0030 | 560 MB | 0.0 % |
+| 11 s | port CLI, CUDA, 60 s / 25 % windows | 1 ms | 12 ms | 2 ms | 15 ms | 0.0014 | 569 MB | 0.0 % |
+| 11 s | port CLI, CUDA, default | 1 ms | 11 ms | 2 ms | 15 ms | 0.0013 | 569 MB | 0.0 % |
+| 11 s | fork engine API, CUDA | 4 ms | 24 ms | 5 ms | 34 ms | 0.0031 | 560 MB | 0.0 % |
+| 11 s | port engine API, CUDA, default | 1 ms | 11 ms | 2 ms | 15 ms | 0.0014 | 570 MB | 0.0 % |
+| 413 s | fork CLI, default 60 s / 25 % windows | 150 ms | 13.1 s | 766 ms | 14.0 s | 0.0340 | 1.9 GB | 5.3 % |
+| 413 s | port CLI, `--window-sec 60 --overlap 0.25` | 25 ms | 12.5 s | 139 ms | 12.7 s | 0.0308 | 1.2 GB | 5.3 % |
+| 413 s | port CLI, default (balanced automatic windows) | 24 ms | 12.5 s | 138 ms | 12.6 s | 0.0306 | 1.2 GB | 5.3 % |
+| 413 s | fork engine API, default options | 151 ms | 16.3 s | 826 ms | 17.3 s | 0.0419 | 9.8 GB | 6.2 % |
+| 413 s | port engine API, default options | 24 ms | 12.6 s | 138 ms | 12.7 s | 0.0308 | 1.2 GB | 5.3 % |
+| 413 s | fork engine API, 750-frame windows, 94 context | 151 ms | 11.9 s | 696 ms | 12.7 s | 0.0309 | 3.3 GB | 5.8 % |
+| 413 s | port engine API, 750-frame windows, 94 context | 25 ms | 12.6 s | 143 ms | 12.7 s | 0.0309 | 1.2 GB | 5.3 % |
+| 413 s | fork CLI, CUDA | fails | | | | | | |
+| 413 s | port CLI, CUDA, 60 s / 25 % windows | 25 ms | 483 ms | 96 ms | 604 ms | 0.0015 | 637 MB | 4.9 % |
+| 413 s | port CLI, CUDA, default | 24 ms | 479 ms | 96 ms | 600 ms | 0.0015 | 637 MB | 4.9 % |
+| 413 s | fork engine API, CUDA | fails | | | | | | |
+| 413 s | port engine API, CUDA, default | 24 ms | 478 ms | 96 ms | 602 ms | 0.0015 | 651 MB | 4.9 % |
+| 619 s | fork CLI, default 60 s / 25 % windows | 227 ms | 18.5 s | 1.1 s | 19.8 s | 0.0319 | 1.9 GB | 4.8 % |
+| 619 s | port CLI, `--window-sec 60 --overlap 0.25` | 36 ms | 17.3 s | 210 ms | 17.6 s | 0.0284 | 1.2 GB | 4.7 % |
+| 619 s | port CLI, default (balanced automatic windows) | 36 ms | 17.5 s | 214 ms | 17.7 s | 0.0286 | 1.2 GB | 4.7 % |
+| 619 s | fork engine API, default options | 234 ms | 26.5 s | 1.1 s | 27.8 s | 0.0450 | 14.8 GB | 6.6 % |
+| 619 s | port engine API, default options | 37 ms | 17.4 s | 209 ms | 17.6 s | 0.0285 | 1.2 GB | 4.7 % |
+| 619 s | fork engine API, 750-frame windows, 94 context | 230 ms | 17.8 s | 1.2 s | 19.2 s | 0.0311 | 3.8 GB | 4.9 % |
+| 619 s | port engine API, 750-frame windows, 94 context | 38 ms | 17.4 s | 216 ms | 17.7 s | 0.0285 | 1.2 GB | 4.7 % |
+| 619 s | fork CLI, CUDA | fails | | | | | | |
+| 619 s | port CLI, CUDA, 60 s / 25 % windows | 38 ms | 648 ms | 145 ms | 830 ms | 0.0013 | 661 MB | 4.4 % |
+| 619 s | port CLI, CUDA, default | 37 ms | 647 ms | 145 ms | 829 ms | 0.0013 | 661 MB | 4.4 % |
+| 619 s | fork engine API, CUDA | fails | | | | | | |
+| 619 s | port engine API, CUDA, default | 37 ms | 649 ms | 145 ms | 835 ms | 0.0013 | 693 MB | 4.4 % |
+
+**Mac mini M4 (16 GB), 6 threads**
+
+| Clip | Build and path | Mel | Encoder | Decoder | Total | RTF | Peak RSS | WER |
+|---|---|--:|--:|--:|--:|--:|--:|--:|
+| 11 s | fork CLI, default 60 s / 25 % windows | 4 ms | 176 ms | 9 ms | 189 ms | 0.0171 | 627 MB | 0.0 % |
+| 11 s | port CLI, `--window-sec 60 --overlap 0.25` | 1 ms | 133 ms | 5 ms | 138 ms | 0.0126 | 458 MB | 0.0 % |
+| 11 s | port CLI, default (balanced automatic windows) | 1 ms | 137 ms | 5 ms | 142 ms | 0.0129 | 457 MB | 0.0 % |
+| 11 s | fork engine API, default options | 3 ms | 169 ms | 9 ms | 182 ms | 0.0166 | 621 MB | 0.0 % |
+| 11 s | port engine API, default options | 0 ms | 135 ms | 5 ms | 140 ms | 0.0127 | 459 MB | 0.0 % |
+| 11 s | fork engine API, 750-frame windows, 94 context | 3 ms | 174 ms | 9 ms | 186 ms | 0.0169 | 625 MB | 0.0 % |
+| 11 s | port engine API, 750-frame windows, 94 context | 0 ms | 135 ms | 5 ms | 140 ms | 0.0127 | 461 MB | 0.0 % |
+| 11 s | fork CLI, Metal | 3 ms | 84 ms | 19 ms | 106 ms | 0.0097 | 400 MB | 0.0 % |
+| 11 s | port CLI, Metal, 60 s / 25 % windows | 0 ms | 39 ms | 9 ms | 48 ms | 0.0043 | 370 MB | 0.0 % |
+| 11 s | port CLI, Metal, default | 0 ms | 39 ms | 9 ms | 48 ms | 0.0044 | 375 MB | 0.0 % |
+| 11 s | fork engine API, Metal | 4 ms | 84 ms | 19 ms | 106 ms | 0.0097 | 396 MB | 0.0 % |
+| 11 s | port engine API, Metal, default | 0 ms | 39 ms | 9 ms | 48 ms | 0.0043 | 375 MB | 0.0 % |
+| 11 s | fork CLI, Core ML | 3 ms | 14 ms | 9 ms | 27 ms | 0.0025 | 142 MB | 0.0 % |
+| 11 s | port CLI, Core ML | 0 ms | 14 ms | 5 ms | 20 ms | 0.0018 | 139 MB | 0.0 % |
+| 11 s | fork engine API, Core ML | 3 ms | 14 ms | 59 ms | 77 ms | 0.0070 | 147 MB | 0.0 % |
+| 11 s | port engine API, Core ML | 1 ms | 14 ms | 61 ms | 76 ms | 0.0069 | 152 MB | 0.0 % |
+| 413 s | fork CLI, default 60 s / 25 % windows | 121 ms | 13.2 s | 386 ms | 13.7 s | 0.0332 | 1.7 GB | 5.3 % |
+| 413 s | port CLI, `--window-sec 60 --overlap 0.25` | 13 ms | 11.5 s | 175 ms | 11.6 s | 0.0282 | 968 MB | 5.1 % |
+| 413 s | port CLI, default (balanced automatic windows) | 13 ms | 11.6 s | 177 ms | 11.8 s | 0.0285 | 972 MB | 5.1 % |
+| 413 s | fork engine API, default options | 121 ms | 23.6 s | 429 ms | 24.1 s | 0.0585 | 6.9 GB | 6.2 % |
+| 413 s | port engine API, default options | 12 ms | 11.6 s | 179 ms | 11.8 s | 0.0285 | 951 MB | 5.1 % |
+| 413 s | fork engine API, 750-frame windows, 94 context | 118 ms | 12.0 s | 379 ms | 12.5 s | 0.0302 | 3.0 GB | 5.8 % |
+| 413 s | port engine API, 750-frame windows, 94 context | 12 ms | 11.6 s | 177 ms | 11.8 s | 0.0285 | 951 MB | 5.1 % |
+| 413 s | fork CLI, Metal | fails | | | | | | |
+| 413 s | port CLI, Metal, 60 s / 25 % windows | 13 ms | 2.2 s | 344 ms | 2.6 s | 0.0062 | 486 MB | 5.1 % |
+| 413 s | port CLI, Metal, default | 13 ms | 2.2 s | 345 ms | 2.6 s | 0.0062 | 481 MB | 5.1 % |
+| 413 s | fork engine API, Metal | fails | | | | | | |
+| 413 s | port engine API, Metal, default | 12 ms | 2.2 s | 345 ms | 2.5 s | 0.0062 | 474 MB | 5.1 % |
+| 413 s | fork CLI, Core ML | 118 ms | 496 ms | 372 ms | 986 ms | 0.0024 | 210 MB | 7.1 % |
+| 413 s | port CLI, Core ML | 13 ms | 493 ms | 181 ms | 689 ms | 0.0017 | 236 MB | 10.5 % |
+| 413 s | fork engine API, Core ML | 119 ms | 522 ms | 389 ms | 1.0 s | 0.0025 | 205 MB | 12.9 % |
+| 413 s | port engine API, Core ML | 12 ms | 513 ms | 428 ms | 955 ms | 0.0023 | 201 MB | 11.6 % |
+| 619 s | fork CLI, default 60 s / 25 % windows | 179 ms | 18.7 s | 579 ms | 19.4 s | 0.0313 | 1.7 GB | 4.9 % |
+| 619 s | port CLI, `--window-sec 60 --overlap 0.25` | 18 ms | 16.2 s | 268 ms | 16.4 s | 0.0266 | 1010 MB | 4.5 % |
+| 619 s | port CLI, default (balanced automatic windows) | 18 ms | 16.2 s | 269 ms | 16.4 s | 0.0266 | 1014 MB | 4.5 % |
+| 619 s | fork engine API, default options | 181 ms | 40.0 s | 629 ms | 40.9 s | 0.0660 | 7.0 GB | 6.6 % |
+| 619 s | port engine API, default options | 18 ms | 16.1 s | 267 ms | 16.4 s | 0.0266 | 990 MB | 4.5 % |
+| 619 s | fork engine API, 750-frame windows, 94 context | 180 ms | 17.8 s | 578 ms | 18.6 s | 0.0300 | 3.6 GB | 4.9 % |
+| 619 s | port engine API, 750-frame windows, 94 context | 19 ms | 16.1 s | 267 ms | 16.4 s | 0.0265 | 993 MB | 4.5 % |
+| 619 s | fork CLI, Metal | fails | | | | | | |
+| 619 s | port CLI, Metal, 60 s / 25 % windows | 20 ms | 3.0 s | 517 ms | 3.6 s | 0.0058 | 528 MB | 4.7 % |
+| 619 s | port CLI, Metal, default | 19 ms | 3.1 s | 516 ms | 3.6 s | 0.0058 | 532 MB | 4.7 % |
+| 619 s | fork engine API, Metal | fails | | | | | | |
+| 619 s | port engine API, Metal, default | 18 ms | 3.1 s | 519 ms | 3.6 s | 0.0058 | 507 MB | 4.7 % |
+| 619 s | fork CLI, Core ML | 179 ms | 730 ms | 566 ms | 1.5 s | 0.0024 | 248 MB | 6.4 % |
+| 619 s | port CLI, Core ML | 19 ms | 722 ms | 266 ms | 1.0 s | 0.0016 | 279 MB | 9.7 % |
+| 619 s | fork engine API, Core ML | 178 ms | 782 ms | 498 ms | 1.5 s | 0.0024 | 232 MB | 11.7 % |
+| 619 s | port engine API, Core ML | 18 ms | 769 ms | 547 ms | 1.3 s | 0.0022 | 226 MB | 11.8 % |
+
+**Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads**
+
+| Clip | Build and path | Mel | Encoder | Decoder | Total | RTF | Peak RSS | WER |
+|---|---|--:|--:|--:|--:|--:|--:|--:|
+| 11 s | fork CLI, default 60 s / 25 % windows | 5 ms | 182 ms | 11 ms | 199 ms | 0.0181 | - | 0.0 % |
+| 11 s | port CLI, `--window-sec 60 --overlap 0.25` | 4 ms | 154 ms | 13 ms | 171 ms | 0.0155 | - | 0.0 % |
+| 11 s | port CLI, default (balanced automatic windows) | 3 ms | 153 ms | 10 ms | 166 ms | 0.0151 | - | 0.0 % |
+| 11 s | fork engine API, default options | 6 ms | 195 ms | 13 ms | 213 ms | 0.0194 | 547 MB | 0.0 % |
+| 11 s | port engine API, default options | 3 ms | 227 ms | 11 ms | 241 ms | 0.0220 | 396 MB | 0.0 % |
+| 11 s | fork engine API, 750-frame windows, 94 context | 6 ms | 186 ms | 12 ms | 204 ms | 0.0186 | 547 MB | 0.0 % |
+| 11 s | port engine API, 750-frame windows, 94 context | 1 ms | 147 ms | 8 ms | 157 ms | 0.0143 | 398 MB | 0.0 % |
+| 413 s | fork CLI, default 60 s / 25 % windows | 225 ms | 21.5 s | 613 ms | 22.3 s | 0.0541 | - | 5.1 % |
+| 413 s | port CLI, `--window-sec 60 --overlap 0.25` | 81 ms | 21.3 s | 430 ms | 21.8 s | 0.0528 | - | 4.9 % |
+| 413 s | port CLI, default (balanced automatic windows) | 118 ms | 29.7 s | 539 ms | 30.3 s | 0.0735 | - | 4.9 % |
+| 413 s | fork engine API, default options | 557 ms | 96.3 s | 1.4 s | 98.3 s | 0.2382 | 7.8 GB | 6.5 % |
+| 413 s | port engine API, default options | 119 ms | 28.1 s | 541 ms | 28.8 s | 0.0698 | 875 MB | 4.9 % |
+| 413 s | fork engine API, 750-frame windows, 94 context | 495 ms | 30.3 s | 1.1 s | 31.9 s | 0.0773 | 2.9 GB | 5.6 % |
+| 413 s | port engine API, 750-frame windows, 94 context | 98 ms | 31.1 s | 539 ms | 31.7 s | 0.0768 | 875 MB | 4.9 % |
+| 619 s | fork CLI, default 60 s / 25 % windows | 488 ms | 38.1 s | 1.4 s | 40.0 s | 0.0646 | - | 4.7 % |
+| 619 s | port CLI, `--window-sec 60 --overlap 0.25` | 159 ms | 37.9 s | 794 ms | 38.9 s | 0.0628 | - | 4.5 % |
+| 619 s | port CLI, default (balanced automatic windows) | 167 ms | 41.3 s | 801 ms | 42.3 s | 0.0683 | - | 4.5 % |
+
 ## Multi-machine benchmark (2026-09)
 
 Maintainer-run measurement of Parakeet TDT 0.6b v3 across four machines and
