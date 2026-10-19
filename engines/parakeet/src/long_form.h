@@ -133,6 +133,19 @@ plan_long_form_windows(int n_units, int center_units, int ctx_units,
 //     than one that exceeds the trained range.
 //
 // Exercised model-free by test/test_long_form_windows.cpp.
+// Centre frames of the automatic windows for an input of `n_enc_frames`: the
+// fewest windows whose centres fit `center_frames`, then every window takes an
+// equal share, so a recording just past one window is encoded as two half
+// windows instead of two full ones (the attention cost is quadratic in the
+// window, and every window still gets its full context on both sides).
+inline int balanced_center_frames(long long n_enc_frames, int center_frames) {
+    if (center_frames <= 0 || n_enc_frames <= center_frames) {
+        return center_frames;
+    }
+    const long long windows = (n_enc_frames + center_frames - 1) / center_frames;
+    return (int) ((n_enc_frames + windows - 1) / windows);
+}
+
 inline int resolve_long_form_window_frames(int requested, int pos_emb_max_len,
                                            int auto_window_frames,
                                            int min_window_frames) {
@@ -343,10 +356,17 @@ inline LongFormPlan resolve_long_form_plan_frames(int requested_window_frames,
         return plan;
     }
 
+    // A requested window is honoured as given; the automatic one is balanced
+    // over the input so no window is larger than its share needs.
+    const long long n_enc_frames = (n_mel_frames + sub - 1) / sub;
+    const int planned_center = requested_window_frames == 0
+        ? balanced_center_frames(n_enc_frames, center_frames)
+        : center_frames;
+
     plan.enabled        = true;
-    plan.window_frames  = window_frames;
+    plan.window_frames  = planned_center + 2 * context_frames;
     plan.context_frames = context_frames;
-    plan.center_frames  = center_frames;
+    plan.center_frames  = planned_center;
     plan.left_context_frames  = context_frames;
     plan.right_context_frames = context_frames;
     return plan;

@@ -181,9 +181,11 @@ struct EngineOptions {
     // and never exceeds the encoder's trained positional range
     // (pos_emb_max_len), which is a hard ceiling:
     //     > 0  explicit request (still clamped to pos_emb_max_len).
-    //     = 0  auto: min(pos_emb_max_len, 3750), which keeps each window inside
-    //          the model's trained positional range and caps the attention
-    //          score tensor at a few hundred MB.
+    //     = 0  auto: at most min(pos_emb_max_len, 3750), which keeps each
+    //          window inside the model's trained positional range and caps
+    //          the attention score tensor at a few hundred MB; the input is
+    //          split into the fewest such windows and they share it equally,
+    //          so a recording just past one window gets two half windows.
     //     < 0  disabled: always single-pass (legacy behaviour; OOMs on long
     //          inputs -- for A/B testing only).
     //

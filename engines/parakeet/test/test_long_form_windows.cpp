@@ -102,6 +102,37 @@ void check_plan(int n, int center, int ctx) {
 // load-bearing property is that pos_emb_max_len is a HARD ceiling that wins over
 // the minimum-window floor: no window may exceed the encoder's trained
 // positional range, even when that range is smaller than the floor.
+// The automatic window shares the input equally among the fewest windows
+// that fit; a requested window keeps its length.
+void check_balanced_automatic_plan() {
+    using namespace parakeet;
+    constexpr int sub = 8, ctx = 256, center = 3750 - 2 * ctx;
+
+    expect(balanced_center_frames(5159, center) == 2580, "balanced: 5159 frames -> two centres of 2580");
+    expect(balanced_center_frames(7739, center) == 2580, "balanced: 7739 frames -> three centres of 2580");
+    expect(balanced_center_frames(3751, center) == 1876, "balanced: just past one centre -> two halves");
+    expect(balanced_center_frames(3238, center) == center, "balanced: one centre stays as it is");
+    expect(balanced_center_frames(323800, center) == center, "balanced: an exact multiple keeps the full centre");
+    expect(balanced_center_frames(100, 0) == 0, "balanced: a degenerate centre is returned unchanged");
+
+    const LongFormPlan automatic = resolve_long_form_plan_frames(0, 0, 5000, sub, 41272);
+    expect(automatic.enabled && automatic.center_frames == 2580 &&
+           automatic.window_frames == 2580 + 2 * ctx && automatic.context_frames == ctx,
+           "automatic plan over 412.7 s: two balanced 247 s windows with full context");
+
+    const LongFormPlan single = resolve_long_form_plan_frames(0, 0, 5000, sub, 3750 * sub);
+    expect(!single.enabled, "an input that fits one window keeps the single pass");
+
+    const LongFormPlan requested = resolve_long_form_plan_frames(750, 94, 5000, sub, 41272);
+    expect(requested.enabled && requested.window_frames == 750 && requested.center_frames == 750 - 2 * 94,
+           "a requested window is honoured as given");
+
+    const LongFormPlan long_input = resolve_long_form_plan_frames(0, 0, 5000, sub, 90 * 60 * 100);
+    expect(long_input.enabled && long_input.center_frames <= center &&
+           long_input.center_frames > center - center / 100,
+           "a long input keeps nearly full centres");
+}
+
 void check_window_resolution() {
     constexpr int kAuto = 3750;
     constexpr int kMin  = 256;
@@ -454,6 +485,8 @@ void check_shared_final_span() {
 }  // namespace
 
 int main() {
+    check_balanced_automatic_plan();
+
     // Planner: single-window, exact multiples, remainders, degenerate context.
     check_plan(100, 1000, 100);
     check_plan(1000, 1000, 128);
