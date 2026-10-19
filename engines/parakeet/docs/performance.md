@@ -760,10 +760,11 @@ Method and recordings are those of the previous sections: three timed runs
 after a warm-up (two on the phone), peak RSS from `/usr/bin/time` or, on
 the phone, the engine driver's own `getrusage`, WER against the clips' own
 transcripts. The phone throttles under a 40-minute run, so its default and
-engine rows were measured again in an interleaved fork/port round with 45 s
-cool-downs before every run (the phone left the USB link before a second
-round and before the engine rows of the 619 s recording); its 60 s / 25 %
-CLI rows are from the first pass, where fork and port ran back to back.
+engine rows were measured again in an interleaved fork/port round with cool-downs before every run, best of two rounds; its 60 s / 25 % CLI
+rows are from the first pass, where fork and port ran back to back. The
+fork's engine API default was not run on the phone for the 619 s recording:
+its automatic 300 s windows take 8.1 GB on the 413 s one, and on the 619 s
+one the phone (11.4 GB) rebooted twice, each time during that row.
 
 Total time, port over fork (below 100 %: the port is faster); "fails" is
 the fork's crash on long recordings on CUDA and Metal:
@@ -837,15 +838,17 @@ the fork's crash on long recordings on CUDA and Metal:
 | Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | CPU, CLI, 60 s / 25 % windows | 413 s | 21.8 s | 22.3 s | 98 % |
 | Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | CPU, CLI, 60 s / 25 % windows | 619 s | 38.9 s | 40.0 s | 97 % |
 | Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | CPU, CLI, 60 s / 25 % windows, 4 threads | 413 s | 36.0 s | 40.4 s | 89 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 11 s | 169 ms | 205 ms | 82 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 413 s | 26.8 s | 28.3 s | 95 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 619 s | 42.3 s | 46.8 s | 91 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, default options on both | 11 s | 155 ms | 205 ms | 75 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, default options on both | 413 s | 27.3 s | 96.8 s | 28 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, default options on both | 619 s | - | - | - |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, 750-frame windows / 94 context | 11 s | 167 ms | 204 ms | 82 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, 750-frame windows / 94 context | 413 s | 28.4 s | 29.3 s | 97 % |
-| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, 750-frame windows / 94 context | 619 s | - | - | - |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 11 s | 169 ms | 204 ms | 83 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 413 s | 25.6 s | 26.1 s | 98 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 619 s | 41.1 s | 46.8 s | 88 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, default options on both | 11 s | 155 ms | 202 ms | 77 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, default options on both | 413 s | 23.1 s | 77.1 s | 30 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, default options on both | 619 s | 40.7 s | reboots the phone (out of memory) | - |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, 750-frame windows / 94 context | 11 s | 167 ms | 202 ms | 83 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, 750-frame windows / 94 context | 413 s | 26.5 s | 26.5 s | 100 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, interleaved round | CPU, engine API, 750-frame windows / 94 context | 619 s | 40.7 s | 47.0 s | 87 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, one run | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 2063 s | 135.7 s | 165.7 s | 82 % |
+| Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, one run | CPU, engine API, port default vs the fork's 750-frame windows (its default exceeds the phone's memory) | 2063 s | 134.2 s | 165.0 s | 81 % |
 
 What changed since the first pass and what the table says:
 
@@ -864,11 +867,29 @@ What changed since the first pass and what the table says:
 - Core ML on the M4: the CLI is 27 to 32 % faster, the engine path 8 to 9 %
   faster on long recordings and equal on `jfk.wav` (76 against 77 ms, ten
   runs), where the single-lane batched decoder dominates on both.
-- Samsung S25, CPU only, interleaved round: port default against
-  fork default 82 %, 95 %, 91 % (11 s, 413 s, 619 s); engine API
-  defaults 75 %, 28 %, -; engine API at 750-frame windows 82 %, 97 %, -.
+- Samsung S25, CPU only, best of two interleaved rounds: port default
+  against fork default 83 %, 98 %, 88 % (11 s, 413 s, 619 s); engine API
+  defaults 77 %, 30 %, -; engine API at 750-frame windows 83 %, 100 %, 87 %.
   The phone throttles, so the first pass had put the port's re-measured
-  rows at a disadvantage; the interleaved round removes it.
+  rows at a disadvantage; the interleaved rounds remove it.
+
+Peak memory (engine API, the path the addon uses; the engine driver's own
+`getrusage` on the phone, `/usr/bin/time` on the desktops):
+
+| Build and path | S25 11 s | S25 413 s | S25 619 s | S25 2063 s | M4 413 s | M4 619 s | Ryzen 413 s | Ryzen 619 s |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| port, engine API, default (TranscribePsy's 60 s / 25 % windows) | 0.4 GB | 0.9 GB | 0.9 GB | 1.0 GB | 0.9 GB | 1.0 GB | 1.1 GB | 1.1 GB |
+| port, engine API, 750-frame windows / 94 context | 0.4 GB | 0.9 GB | 0.9 GB | - | 0.9 GB | 1.0 GB | 1.1 GB | 1.1 GB |
+| fork, engine API, 750-frame windows / 94 context | 0.5 GB | 2.9 GB | 3.5 GB | 3.7 GB | 3.0 GB | 3.6 GB | 3.2 GB | 3.7 GB |
+| fork, engine API, default (automatic 300 s windows) | 0.5 GB | 8.1 GB | reboots the phone (> 11.4 GB) | not run (would exceed 11.4 GB) | 6.9 GB | 7.0 GB | 9.7 GB | 14.7 GB |
+
+The port's memory does not grow with the recording: 0.9 GB on the phone from
+413 s to 34 minutes, because a windowed pass holds one encoder graph, the
+60 s window bounds the attention buffers, and the waveform and STFT scratch
+are released once the mel exists. The fork needs three to four times as
+much at the same 60 s windows (it keeps three graphs and the full scratch)
+and, at its engine default, 8 GB at 413 s and more than the phone has at
+619 s. The memory the addon will see is the port's default row.
 
 Accuracy per backend on this pass (same recordings and references as the
 previous section; the port's default rows now coincide with its 60 s rows):
