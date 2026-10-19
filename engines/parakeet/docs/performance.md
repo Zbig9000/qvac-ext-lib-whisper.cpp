@@ -849,6 +849,15 @@ the fork's crash on long recordings on CUDA and Metal:
 | Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, best of two interleaved rounds | CPU, engine API, 750-frame windows / 94 context | 619 s | 40.7 s | 47.0 s | 87 % |
 | Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, one run | CPU, CLI, port default (the model's validated 60 s / 25 % windows) vs fork default | 2063 s | 135.7 s | 165.7 s | 82 % |
 | Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads, one run | CPU, engine API, port default vs the fork's 750-frame windows (its default exceeds the phone's memory) | 2063 s | 134.2 s | 165.0 s | 81 % |
+| Samsung S25, Adreno 830 OpenCL, 6 CPU threads | OpenCL, CLI, port default (60 s / 25 % windows) vs fork default | 11 s | 255 ms | 327 ms | 78 % |
+| Samsung S25, Adreno 830 OpenCL, 6 CPU threads | OpenCL, CLI, port default (60 s / 25 % windows) vs fork default | 413 s | 16.1 s | 18.6 s | 87 % |
+| Samsung S25, Adreno 830 OpenCL, 6 CPU threads | OpenCL, CLI, port default (60 s / 25 % windows) vs fork default | 619 s | 27.5 s | 31.1 s | 88 % |
+| Samsung S25, Adreno 830 OpenCL, 6 CPU threads | OpenCL, engine API, port default vs fork default (fork: 11 s only, its default exceeds the phone's memory on long recordings) | 11 s | 252 ms | 337 ms | 75 % |
+| Samsung S25, Adreno 830 OpenCL, 6 CPU threads | OpenCL, engine API, port default vs fork default (fork: 11 s only, its default exceeds the phone's memory on long recordings) | 413 s | 16.7 s | not run | - |
+| Samsung S25, Adreno 830 OpenCL, 6 CPU threads | OpenCL, engine API, port default vs fork default (fork: 11 s only, its default exceeds the phone's memory on long recordings) | 619 s | 28.6 s | not run | - |
+| Samsung S25, Adreno 830 OpenCL, 6 CPU threads | OpenCL, engine API, port default vs the fork's 750-frame windows | 11 s | 252 ms | 343 ms | 74 % |
+| Samsung S25, Adreno 830 OpenCL, 6 CPU threads | OpenCL, engine API, port default vs the fork's 750-frame windows | 413 s | 16.7 s | 19.4 s | 86 % |
+| Samsung S25, Adreno 830 OpenCL, 6 CPU threads | OpenCL, engine API, port default vs the fork's 750-frame windows | 619 s | 28.6 s | 35.8 s | 80 % |
 
 What changed since the first pass and what the table says:
 
@@ -872,6 +881,37 @@ What changed since the first pass and what the table says:
   defaults 77 %, 30 %, -; engine API at 750-frame windows 83 %, 100 %, 87 %.
   The phone throttles, so the first pass had put the port's re-measured
   rows at a disadvantage; the interleaved rounds remove it.
+- Samsung S25 on its Adreno 830 through OpenCL (both trees cross-compiled
+  with the OpenCL backend against the Khronos ICD loader, the phone's own
+  `libOpenCL.so` at run time; encoder on the GPU): port default against
+  fork default on the CLI 78 %, 87 %, 88 % (11 s, 413 s, 619 s), engine
+  API against the fork's 750-frame windows 74 %, 86 %, 80 %. Neither tree
+  can run the decoder graphs on ggml-opencl (it drops the in-place state
+  writes); the fork falls back to its packed q8_0 host decoder and the port
+  now runs its ggml-graph decoder on the CPU backend from a CPU copy of the
+  decoder weights (`c86079ec`), which decodes the 413 s recording in half a
+  second where the scalar host fallback it replaced took two.
+- Accuracy on that OpenCL path is wrong for long recordings, in both trees
+  alike: single-window inputs are correct (`jfk.wav`, `sample-16k.wav`, and
+  two different 11 s clips transcribed one after the other by one engine),
+  but every recording that needs more than one encoder window loses most
+  of its words from the second window on (fork and port both 36 % WER on
+  long-mix, 54 % on the pause-free English recording, where the CPU is at
+  0 %; the two trees' outputs are word-for-word the same). The defect is in
+  the shared ggml-opencl backend on this device, not in either tree's
+  windowing: the same code is exact on the CPU, CUDA and Metal; it is
+  deterministic and survived disabling the port's graph reuse, copying each
+  window's mel into its own buffer, and every backend switch
+  (`GGML_OPENCL_FLUSH_WORK_MB`, `GGML_OPENCL_FA_MAX_NQ`,
+  `GGML_OPENCL_FA_ADRENO`, `GGML_OPENCL_ADRENO_USE_LARGE_BUFFER`); it
+  worsens with the window size (25 s windows: 16 % WER on the 374 s file,
+  60 s: 54 %, 120 s: everything after the first window is empty) while a
+  62 s single pass is exact. Reproduction: `en-nopause-2x.wav` (jfk and
+  sample-16k twice, 62 s) with `--window-sec 60 --overlap 0.25` on the
+  Adreno 830 gives 104 words instead of 158 on both trees. Until the backend
+  is fixed, recordings longer than one window must not be transcribed on
+  Adreno OpenCL; the OpenCL speed rows above stand as measurements of the
+  work done, not of a usable result on long audio.
 
 Peak memory (engine API, the path the addon uses; the engine driver's own
 `getrusage` on the phone, `/usr/bin/time` on the desktops):
@@ -882,6 +922,8 @@ Peak memory (engine API, the path the addon uses; the engine driver's own
 | port, engine API, 750-frame windows / 94 context | 0.4 GB | 0.9 GB | 0.9 GB | - | 0.9 GB | 1.0 GB | 1.1 GB | 1.1 GB |
 | fork, engine API, 750-frame windows / 94 context | 0.5 GB | 2.9 GB | 3.5 GB | 3.7 GB | 3.0 GB | 3.6 GB | 3.2 GB | 3.7 GB |
 | fork, engine API, default (automatic 300 s windows) | 0.5 GB | 8.1 GB | reboots the phone (> 11.4 GB) | not run (would exceed 11.4 GB) | 6.9 GB | 7.0 GB | 9.7 GB | 14.7 GB |
+| port, engine API on OpenCL, default (process RSS; OpenCL buffers are not in it) | 0.1 GB | 0.2 GB | 0.2 GB | - | | | | |
+| fork, engine API on OpenCL, 750-frame windows (process RSS; OpenCL buffers are not in it) | 0.1 GB | 0.2 GB | 0.2 GB | - | | | | |
 
 The port's memory does not grow with the recording: 0.9 GB on the phone from
 413 s to 34 minutes, because a windowed pass holds one encoder graph, the
@@ -921,6 +963,8 @@ previous section; the port's default rows now coincide with its 60 s rows):
 | Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | port, CPU, 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | - |
 | Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | port, CPU, default | 0.0 % | 0.2 % | 21.9 % | 28.6 % | - |
 | Samsung S25, Snapdragon 8 Elite (CPU only), 6 threads | fork, CPU, its default 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | - |
+| Samsung S25, Adreno 830 OpenCL, 6 CPU threads | port, OpenCL, default (60 s / 25 % windows) | 54.4 % | 65.8 % | 21.9 % | 28.6 % | - |
+| Samsung S25, Adreno 830 OpenCL, 6 CPU threads | fork, OpenCL, its default 60 s / 25 % windows | 54.4 % | 65.8 % | 21.9 % | 28.6 % | - |
 
 Per-machine detail (`jfk.wav`, long-mix and the 619 s recording):
 **Linux, Ryzen 9 9950X + RTX 5090 (GPU0), 8 threads**
