@@ -1459,7 +1459,7 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
     PARAKEET_LOG_INFO(
         "[bench] encoder_backend=%s  decoder_backend=%s\n",
         encoder_backend.c_str(),
-        model_active_backend_name(model).c_str());
+        model_decoder_backend_name(model).c_str());
 
     PARAKEET_LOG_INFO(
         "[bench] ----------- summary (%d timed runs, warmup excluded) -----------\n"
