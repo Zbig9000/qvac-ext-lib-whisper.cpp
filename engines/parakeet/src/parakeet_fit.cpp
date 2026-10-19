@@ -570,6 +570,7 @@ FitResult fit_params(const FitOptions & opts) {
         host = sat_add(host, sat_mul(mirrors, resident_mel.size()));
         host = sat_add(host, dm.host_bytes);           // CPU decode path: dequantised f32 weights
         host = sat_add(host, lm.sortformer_cpu_bytes); // Mali-Vulkan CPU head copy (host RAM)
+        host = sat_add(host, lm.tdt_cpu_bytes);        // OpenCL: CPU-resident decoder weights (host RAM)
         host = sat_add(host, extra_host);
         if (is_nemotron) {
             // Offline prompt conditioning stages the one-hot concat input and

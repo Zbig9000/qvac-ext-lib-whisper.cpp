@@ -476,6 +476,11 @@ struct ParakeetCtcModel {
     CtcHeadWeights            ctc;
     RnntWeights               rnnt;
     TdtWeights                tdt;
+    // CPU-resident copies of the TDT / RNN-T decoder weights, built when the
+    // encoder runs on OpenCL: ggml-opencl cannot run the decoder graphs, so
+    // they run on the CPU backend from these copies. Empty on every other
+    // backend (model_tdt_decoder_on_cpu).
+    TdtWeights                tdt_cpu;
     EouWeights                eou;
     SortformerWeights         sortformer;
     // CPU-resident copies of the Sortformer head weights; populated at load only
@@ -499,6 +504,7 @@ struct ParakeetCtcModel {
     // GGUF-resident tensors (e.g. parakeet_tdt's per-step LSTM/joint graphs).
     // Both return `nullptr` until `load_from_gguf` succeeds.
     ggml_backend_t backend_active() const;  // Metal / CUDA / Vulkan if compiled & enabled, else CPU
+    ggml_backend_t backend_cpu() const;     // the CPU backend every load has
     ggml_context * weights_ctx()    const;  // ggml_context that owns the GGUF tensor metadata
 };
 
@@ -545,6 +551,7 @@ struct GgufLoadMeasure {
     size_t weights_bytes        = 0;  // default-buft weight buffers on the active backend
     size_t repack_bytes         = 0;  // CPU extra-buft (repack) weight buffers, CPU runs only
     size_t sortformer_cpu_bytes = 0;  // Mali-Vulkan CPU head weight copies
+    size_t tdt_cpu_bytes        = 0;  // OpenCL: CPU-resident TDT / RNN-T decoder weight copies
 };
 
 // Metadata-only twin of load_from_gguf: identical backend resolution, GGUF
@@ -695,6 +702,15 @@ int         model_coreml_seam_context_frames(const ParakeetCtcModel & m);
 
 // Decoder compute-backend label, same contract as model_encoder_backend_name.
 std::string model_decoder_backend_name(const ParakeetCtcModel & m);
+
+// True when the TDT / RNN-T decoder runs on the CPU backend from
+// model.tdt_cpu because the encoder backend (OpenCL) cannot run its graphs.
+bool model_tdt_decoder_on_cpu(const ParakeetCtcModel & m);
+
+// Duplicates the model's TDT (or RNN-T) decoder weights into model.tdt_cpu on
+// the CPU backend. The loader does this on OpenCL; exposed so the copy can be
+// checked against the originals on any backend. Returns false on failure.
+bool model_build_tdt_cpu_weights(ParakeetCtcModel & m);
 // Fixed mel-frame capacity advertised by the active Core ML sidecar, or 0 when
 // Core ML is unavailable, disabled, flexible-shape, or has an unknown layout.
 int         model_coreml_fixed_mel_frames(const ParakeetCtcModel & m);

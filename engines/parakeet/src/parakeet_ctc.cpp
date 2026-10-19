@@ -312,6 +312,9 @@ struct ParakeetCtcModel::Impl {
     // dereferencing the GPU-resident originals.
     ggml_context         * sortformer_cpu_ctx    = nullptr;
     ggml_backend_buffer_t  sortformer_cpu_buffer = nullptr;
+    // CPU-resident copies of the TDT / RNN-T decoder weights (OpenCL only).
+    ggml_context         * tdt_cpu_ctx           = nullptr;
+    ggml_backend_buffer_t  tdt_cpu_buffer        = nullptr;
     ggml_backend_buffer_t  weights_buffer = nullptr;
     // CPU "extra" buffer-type (CPU_REPACK) buffers holding the repack-eligible
     // encoder GEMM weights on CPU-only runs. See alloc_cpu_repack_weights.
@@ -369,6 +372,8 @@ struct ParakeetCtcModel::Impl {
         weights_extra_buffers.clear();
         if (sortformer_cpu_buffer) ggml_backend_buffer_free(sortformer_cpu_buffer);
         if (sortformer_cpu_ctx)    ggml_free(sortformer_cpu_ctx);
+        if (tdt_cpu_buffer)        ggml_backend_buffer_free(tdt_cpu_buffer);
+        if (tdt_cpu_ctx)           ggml_free(tdt_cpu_ctx);
         if (ctx)            ggml_free(ctx);
         if (gguf)           gguf_free(gguf);
         if (backend_blas)   ggml_backend_free(backend_blas);
@@ -379,6 +384,10 @@ struct ParakeetCtcModel::Impl {
 
 ggml_backend_t ParakeetCtcModel::backend_active() const {
     return impl ? impl->backend_active : nullptr;
+}
+
+ggml_backend_t ParakeetCtcModel::backend_cpu() const {
+    return impl ? impl->backend_cpu : nullptr;
 }
 
 ggml_context * ParakeetCtcModel::weights_ctx() const {
@@ -1495,6 +1504,96 @@ void set_opencl_cache_dir(const std::string & dir) {
 #else
     (void) dir;
 #endif
+}
+
+// Tripwire: build_tdt_cpu_weights() hand-enumerates every field; fail the build if one is added/removed.
+static_assert(sizeof(TdtLstmLayer) == 4 * sizeof(ggml_tensor *),
+              "TdtLstmLayer layout changed; update build_tdt_cpu_weights()");
+static_assert(sizeof(TdtWeights) == 7 * sizeof(ggml_tensor *) + sizeof(std::vector<TdtLstmLayer>),
+              "TdtWeights layout changed; update build_tdt_cpu_weights()");
+
+// Duplicate the TDT / RNN-T decoder weights into a fresh context + buffer on
+// the CPU backend, for an encoder on OpenCL: ggml-opencl drops the in-place
+// state writes the decoder graphs rely on, so they run on the CPU backend and
+// must read weights that live there. Measure mode sizes the buffer only.
+static bool build_tdt_cpu_weights(ParakeetCtcModel::Impl * impl,
+                                  const TdtWeights & src,
+                                  TdtWeights & dst,
+                                  size_t * measure_bytes = nullptr) {
+    dst = TdtWeights{};
+    dst.lstm.resize(src.lstm.size());
+
+    struct Field { ggml_tensor * src; ggml_tensor ** dst; };
+    std::vector<Field> fields;
+    auto add = [&](ggml_tensor * s, ggml_tensor ** d) {
+        if (s) fields.push_back({ s, d });
+    };
+    add(src.predict_embed, &dst.predict_embed);
+    for (size_t i = 0; i < src.lstm.size(); ++i) {
+        add(src.lstm[i].w_ih, &dst.lstm[i].w_ih);  add(src.lstm[i].w_hh, &dst.lstm[i].w_hh);
+        add(src.lstm[i].b_ih, &dst.lstm[i].b_ih);  add(src.lstm[i].b_hh, &dst.lstm[i].b_hh);
+    }
+    add(src.joint_enc_w,  &dst.joint_enc_w);   add(src.joint_enc_b,  &dst.joint_enc_b);
+    add(src.joint_pred_w, &dst.joint_pred_w);  add(src.joint_pred_b, &dst.joint_pred_b);
+    add(src.joint_out_w,  &dst.joint_out_w);   add(src.joint_out_b,  &dst.joint_out_b);
+
+    ggml_init_params p = {
+        /*mem_size=*/   ggml_tensor_overhead() * (fields.size() + 8),
+        /*mem_buffer=*/ nullptr,
+        /*no_alloc=*/   true,
+    };
+    ggml_context * cpu_ctx = ggml_init(p);
+    if (!cpu_ctx) return false;
+
+    for (Field & f : fields) {
+        ggml_tensor * t = ggml_new_tensor(cpu_ctx, f.src->type, GGML_MAX_DIMS, f.src->ne);
+        ggml_set_name(t, ggml_get_name(f.src));
+        *f.dst = t;
+    }
+
+    if (measure_bytes) {
+        *measure_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            cpu_ctx, ggml_backend_get_default_buffer_type(impl->backend_cpu));
+        ggml_free(cpu_ctx);
+        dst = TdtWeights{};
+        return true;
+    }
+
+    impl->tdt_cpu_ctx    = cpu_ctx;
+    impl->tdt_cpu_buffer = ggml_backend_alloc_ctx_tensors(cpu_ctx, impl->backend_cpu);
+    if (!impl->tdt_cpu_buffer) return false;
+
+    std::vector<uint8_t> buf;
+    for (Field & f : fields) {
+        const size_t nb = ggml_nbytes(f.src);
+        buf.resize(nb);
+        ggml_backend_tensor_get(f.src, buf.data(), 0, nb);
+        ggml_backend_tensor_set(*f.dst, buf.data(), 0, nb);
+    }
+    return true;
+}
+
+static const TdtWeights * transducer_decoder_weights(const ParakeetCtcModel & m) {
+    if (m.model_type == ParakeetModelType::TDT)  return &m.tdt;
+    if (m.model_type == ParakeetModelType::RNNT) return &m.rnnt;
+    return nullptr;
+}
+
+bool model_build_tdt_cpu_weights(ParakeetCtcModel & m) {
+    const TdtWeights * src = transducer_decoder_weights(m);
+    if (!m.impl || !src) return false;
+    return build_tdt_cpu_weights(m.impl.get(), *src, m.tdt_cpu);
+}
+
+bool model_tdt_decoder_on_cpu(const ParakeetCtcModel & m) {
+    return m.tdt_cpu.predict_embed != nullptr;
+}
+
+// An encoder on OpenCL leaves the TDT / RNN-T decoder graphs to the CPU
+// backend (see build_tdt_cpu_weights); Nemotron keeps its host decoder.
+static bool decoder_moves_to_cpu(const ParakeetCtcModel & m, const ParakeetCtcModel::Impl * impl) {
+    return impl->backend_gpu && backend_is_opencl(impl->backend_gpu) &&
+           transducer_decoder_weights(m) != nullptr;
 }
 
 // Tripwire: build_sortformer_cpu_weights() hand-enumerates every field; fail the build if one is added/removed.
@@ -2726,6 +2825,23 @@ static int load_from_gguf_impl(const std::string & gguf_path,
             "(diarization head runs on CPU; encoder stays on the Mali GPU)\n");
     }
 
+    if (decoder_moves_to_cpu(out_model, impl.get())) {
+        const TdtWeights & src = *transducer_decoder_weights(out_model);
+        if (measure) {
+            TdtWeights scratch;
+            if (!build_tdt_cpu_weights(impl.get(), src, scratch, &measure->tdt_cpu_bytes)) {
+                PARAKEET_LOG_ERROR("parakeet: failed to size CPU-resident decoder weights\n");
+                return 15;
+            }
+        } else if (!build_tdt_cpu_weights(impl.get(), src, out_model.tdt_cpu)) {
+            PARAKEET_LOG_ERROR("parakeet: failed to build CPU-resident decoder weights\n");
+            return 15;
+        }
+        if (!measure && verbose) PARAKEET_LOG_INFO(
+            "parakeet: built CPU-resident decoder weights "
+            "(TDT decode graphs run on the CPU; encoder stays on OpenCL)\n");
+    }
+
     if (measure) {
         exclude_weights_from_graph_measure(impl->ctx);
     }
@@ -2841,6 +2957,9 @@ std::string model_decoder_backend_name(const ParakeetCtcModel & m) {
         return parakeet_coreml_decoder_backend_label(m.impl->ctx_coreml_dec);
     }
 #endif
+    if (model_tdt_decoder_on_cpu(m) && m.impl && m.impl->backend_cpu) {
+        return ggml_backend_name(m.impl->backend_cpu);
+    }
     return model_active_backend_name(m);
 }
 

@@ -1187,6 +1187,17 @@ static int tdt_prepare_runtime_impl(const ParakeetCtcModel & model, TdtRuntimeWe
         return 1;
     }
 
+    // ggml-opencl drops the in-place ggml_cpy writes that advance the LSTM
+    // state, so with the encoder on OpenCL the TDT / RNN-T decode graphs run
+    // on the CPU backend from the loader's CPU-resident weight copies (the
+    // measure pass sizes them from the originals' shapes). Nemotron keeps the
+    // host loop below.
+    if (!is_nemotron && backend_is_opencl(W.backend) && model.backend_cpu() &&
+        (measure || model_tdt_decoder_on_cpu(model))) {
+        W.backend = model.backend_cpu();
+        if (!measure) W.weights = &model.tdt_cpu;
+    }
+
     // The CPU backend keeps the thread count the encoder configured at load;
     // compute_graph only overrides it when n_threads is set explicitly.
     W.n_threads = 0;

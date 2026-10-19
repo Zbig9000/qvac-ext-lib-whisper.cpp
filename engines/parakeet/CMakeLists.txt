@@ -2354,6 +2354,31 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "--model" "${_qvp_transcribepsy_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_transcribepsy_gguf}" "${_qvp_jfk_wav}")
 
+    # The CPU-resident TDT decoder copies an OpenCL load builds: byte-equal to
+    # the originals on the CPU backend, and the decoder reports that backend.
+    add_executable(test-tdt-cpu-copies
+        test/test_tdt_cpu_copies.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
+        src/parakeet_unified.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/parakeet_diarization_v3.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-tdt-cpu-copies PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-tdt-cpu-copies PRIVATE src include ggml/include)
+    parakeet_apply_backend_defs(test-tdt-cpu-copies)
+    parakeet_apply_ccache(test-tdt-cpu-copies)
+    parakeet_register_test(test-tdt-cpu-copies
+        LABEL    "fixture"
+        ARGS     "--model" "${_qvp_transcribepsy_gguf}" "--wav" "${_qvp_jfk_wav}"
+        REQUIRES "${_qvp_transcribepsy_gguf}" "${_qvp_jfk_wav}")
+
     # The Core ML-owned encoder: an encoder-less GGUF is rejected without its
     # sidecar on every platform; with Core ML and the sidecar it loads, runs,
     # refuses the ggml encoder, and PARAKEET_COREML_ONLY skips the encoder

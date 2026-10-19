@@ -78,7 +78,9 @@ GGUF with its sidecars, so every backend meets the same accuracy bar. Two more f
 use the same GGUF: `test-encoder-graph-cache` fills the ggml encoder graph
 cache with several shapes, lowers the limit and checks the eviction, then
 checks that a windowed pass holds one graph and restores the limit on both a
-complete and a cancelled run; `test-coreml-encoder-owner-reject` checks that
+complete and a cancelled run; `test-tdt-cpu-copies` builds the CPU-resident
+decoder weight copies an OpenCL load makes and checks them byte for byte
+against the originals on the CPU backend; `test-coreml-encoder-owner-reject` checks that
 the encoder-less Core ML GGUF (`transcribepsy-250m-eu-sub-coreml.gguf`) is
 refused with a clear error when no sidecar can take the encoder over, and on
 a Core ML build with the `-encoder.mlmodelc` sidecar staged

@@ -54,10 +54,14 @@ routed to CPU because that head is incorrect on Mali Vulkan.
 
 TDT predictor/joint decoding uses ggml graphs on every backend, including
 ggml-cpu, where the quantised joint matmuls run about ten times faster than the
-former host f32 gemv loop. OpenCL keeps the host scalar decoder because it lacks
-the graph operation support this path needs, and `PARAKEET_TDT_HOST_DECODE=1`
-forces it elsewhere for parity testing. EOU decoding uses graphs on Metal,
-Vulkan and CUDA and the scalar path on CPU and OpenCL.
+former host f32 gemv loop. ggml-opencl drops the in-place state writes those
+graphs rely on, so with the encoder on OpenCL the TDT and RNN-T decoder graphs
+run on the CPU backend from a CPU-resident copy of the decoder weights that
+the loader makes (`model_tdt_decoder_on_cpu`; the fit projector counts the
+copy); Nemotron keeps the host scalar decoder there, and
+`PARAKEET_TDT_HOST_DECODE=1` forces the host decoder elsewhere for parity
+testing. EOU decoding uses graphs on Metal, Vulkan and CUDA and the scalar
+path on CPU and OpenCL.
 
 Nemotron 3.5 ASR streaming is supported on OpenCL (Adreno 700+). The encoder
 runs on the GPU and the cache-aware streaming operating points (80, 160, 320,
