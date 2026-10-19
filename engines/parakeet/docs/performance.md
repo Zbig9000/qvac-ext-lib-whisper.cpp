@@ -361,13 +361,13 @@ window changes the result by three points):
 | The TranscribePsy fork's own CLI on the Core ML GGUF (its internal 1500-frame tiler and q8_0 host decoder) | 7.1 % |
 
 The committed frames nearest a window's right edge differ most from the
-full-context encoder (cosine 0.63 to 0.72 against 0.84 mid-window), so the
-loss comes from the short seam context, not from the Neural Engine arithmetic:
-a single 15 s window matches the ggml encoder frame for frame (cosine 0.98)
-and transcribes the sample clips identically. Long recordings where accuracy
-matters more than speed should take the 60 s / 25 % CPU windows; the Neural
-Engine paths are the fastest and lightest option and were validated by the
-fork on short utterances and pause-rich recordings.
+full-context encoder (cosine 0.63 to 0.72 against 0.84 mid-window), and a
+single 15 s window matches the ggml encoder frame for frame (cosine 0.98) and
+transcribes the sample clips identically, so the loss comes from where the
+seams fall, not from the Neural Engine arithmetic. The per-backend accuracy
+section below shows what the seams cost on single-language speech (nothing to
+0.6 %) and why this recording exaggerates it: every seam that lands near the
+French sentence at a language switch can flip it.
 
 ### TranscribePsy: port against the research fork (2026-10)
 
@@ -476,16 +476,13 @@ What the numbers say:
   the same or lower WER (11.6 against 12.9 % on long-mix, 11.8 against 11.7 %
   on the 619 s recording); `jfk.wav` takes 20 to 22 ms against 27 ms on the
   CLI and 74 to 88 ms on both engine paths, where the batched decoder fills
-  one lane. The port's CLI is, however, three WER points behind the fork's
-  CLI on the long recordings (10.5 against 7.1 % on long-mix, 9.7 against
-  6.4 % on the 619 s recording). The geometry differs: the fork's CLI runs
-  its 60 s / 25 % planner windows and its wrapper tiles each of them into
-  1500-frame Neural Engine windows with 16 frames of leading context, while
-  this branch plans 15 s windows at the export's capacity with 16 frames of
-  context on both sides (the seam analysis is in the previous section;
-  `PARAKEET_COREML_ANE_CONTEXT_FRAMES=32` recovers to 8.4 %). Nesting the
-  Neural Engine tiles inside the CLI's long-form windows, as the fork does,
-  is the open follow-up for this path.
+  one lane. On these mixed-language recordings the port's CLI trails the
+  fork's CLI (10.5 against 7.1 % on long-mix, 9.7 against 6.4 % on the 619 s
+  recording) while on English it leads it (0.6 against 2.7 % without pauses,
+  0.1 against 0.6 % with pauses, next section): both tile the same 15 s
+  Neural Engine windows with 16 frames of context on both sides, the fork
+  inside its 60 s CLI windows and this branch directly, so their seams fall
+  in different places, and what a seam costs depends on what it lands on.
 
 Per-machine tables for `jfk.wav`, long-mix and the 619 s recording; the
 fork's failed GPU runs on the long recordings have no row:
@@ -679,6 +676,72 @@ Core ML distribution (encoder-less GGUF, Neural Engine encoder and decoder sidec
 | long-10min, 619 s | port CLI, Core ML GGUF (Neural Engine windows, ggml decoder) | 26 ms | 728 ms | 272 ms | 1.0 s | 0.0017 | 282 MB | 9.7 % |
 | long-10min, 619 s | fork engine, Core ML GGUF | 178 ms | 782 ms | 498 ms | 1.5 s | 0.0024 | 232 MB | 11.7 % |
 | long-10min, 619 s | port engine, Core ML GGUF (pause-cut segments, batched Neural Engine decoder) | 26 ms | 779 ms | 517 ms | 1.3 s | 0.0021 | 231 MB | 11.8 % |
+
+### TranscribePsy: accuracy per backend (2026-10)
+
+The same recordings transcribed on every backend of this branch, with the
+fork for reference, on the machines of the previous section. The CPU and
+Metal rows are from the M4 and the M3 Ultra, which agree with each other and
+with the Ryzen to the word; CUDA is the RTX 5090; the Core ML rows are
+identical on both Macs. Four recordings were built from the sample clips so
+that the reference is exact: `jfk.wav` and `sample-16k.wav` concatenated
+twelve times, with and without 0.7 s pauses; `fr-multipiece-16k.wav` thirty
+times, with and without pauses; plus the mixed long-mix recording of the
+previous sections. WER is against the clips' own single-clip transcripts,
+repeated. Time is not shown; it is the previous section's.
+
+| Build, backend and path | English, no pauses, 374 s | English, pauses, 390 s | French, no pauses, 98 s | French, pauses, 119 s | mixed EN+FR, no pauses, 413 s |
+|---|--:|--:|--:|--:|--:|
+| ggml CPU, 60 s / 25 % windows (CLI `--window-sec 60 --overlap 0.25`) | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.1 % |
+| ggml CPU, engine API, 750-frame windows with 94 frames of context | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.1 % |
+| ggml CPU, default (automatic 300 s window) | 0.0 % | 0.0 % | 28.6 % | 28.6 % | 7.1 % |
+| CUDA, RTX 5090, 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.3 % |
+| CUDA, RTX 5090, default | 0.0 % | 0.0 % | 28.6 % | 28.6 % | 6.9 % |
+| Metal, M4 and M3 Ultra, 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.1 % |
+| Metal, M4 and M3 Ultra, default | 0.0 % | 0.0 % | 28.6 % | 28.6 % | 6.9 % |
+| Core ML, CLI: 15 s Neural Engine windows, 16 frames of seam context, ggml decoder | 0.6 % | 0.1 % | 21.0 % | 29.5 % | 10.5 % |
+| Core ML, CLI with `PARAKEET_COREML_ANE_CONTEXT_FRAMES=32` | 0.8 % | 0.0 % | 22.4 % | 27.6 % | 8.4 % |
+| Core ML, engine API: pause-cut segments, batched Neural Engine decoder | 0.0 % | 0.0 % | 20.0 % | 27.6 % | 11.6 % |
+| Core ML, engine API with `PARAKEET_ANE_BATCH_DECODE=0` (windows, ggml decoder) | 0.6 % | 0.1 % | 21.0 % | 29.5 % | 10.5 % |
+| fork, ggml CPU, its default 60 s / 25 % windows | 0.0 % | 0.2 % | 21.9 % | 28.6 % | 5.3 % |
+| fork, CUDA and Metal | fails | fails | 21.9 % | 28.6 % | fails |
+| fork, Core ML CLI | 2.7 % | 0.6 % | 21.0 % | 35.7 % | 7.1 % |
+| fork, Core ML engine API | 0.1 % | 0.0 % | 21.0 % | 27.1 % | 12.9 % |
+
+What the table says:
+
+- The ggml backends agree. CPU, CUDA and Metal give the same words on every
+  recording at the same window settings; CUDA differs by two words on the
+  mixed recording.
+- The Core ML paths match the ggml backends on English speech. The engine API
+  path (pause-cut segments and the Neural Engine decoder) is exact on both
+  English recordings. The CLI's fixed 15 s Neural Engine windows lose 0.6 %
+  without any pause in 374 s (six words: "thought Alice" dropped where it
+  straddles a window seam) and 0.1 % with pauses. The fork's Core ML CLI
+  loses 2.7 % and 0.6 % on the same recordings.
+- The French rows measure the model, not the backends. The 3.3 s clip's
+  seven words come out differently when the clip is repeated than in
+  isolation ("ces" for "ses", "rest" for "restent"), on the CPU single pass
+  as much as anywhere (28.6 % is two words in seven), and every backend lands
+  within one such variant of the others.
+- The mixed recording is the one where the Core ML paths trail (10.5 to
+  11.6 % against 5.1 to 7.1 %), and it is the only recording that is both
+  pause-free and language-switching: the French sentence is transcribed,
+  dropped or anglicised depending on what the encoder window around it holds,
+  so a path with a seam every 12.4 s (the 15 s export) disturbs it far more
+  often than one with a seam every 45 s (the 60 s windows) or none (the 300 s
+  window). A sweep of the seam context (16, 24, 32, 40 and 47 frames give
+  10.5, 12.3, 8.4, 9.1 and 10.9 %) is not monotonic, which is what seam
+  placement on an unstable sentence looks like; on English the same sweep
+  moves nothing (0.6 to 0.8 %). This supersedes the earlier reading of that
+  gap as a seam-context shortfall.
+- `test-transcribepsy` holds every backend to the same bar: a 187 s
+  pause-free English recording (the two clips six times) must transcribe
+  within 1 % word error with the default options and with the 60 s / 25 %
+  windows. It is registered for the ggml CPU, for the GPU backend of the
+  build (`test-transcribepsy-gpu`, `--n-gpu-layers 999`) and for the Core ML
+  GGUF with its sidecars (`test-transcribepsy-coreml`), and passes on all
+  three on the M4 with no word error.
 
 ## Multi-machine benchmark (2026-09)
 
