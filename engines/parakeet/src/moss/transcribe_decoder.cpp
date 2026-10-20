@@ -268,7 +268,8 @@ struct TranscribeDecoder::Impl {
         if (model.fused_attention()) {
             return ggml_cpy(ctx, v_rows, cache_rows(ctx, cache_v[(size_t) layer], pos, tokens));
         }
-        return ggml_cpy(ctx, ggml_transpose(ctx, v_rows), value_columns(ctx, layer, pos, tokens));
+        return copy_into_cache(ctx, model.backend(), ggml_transpose(ctx, v_rows),
+                value_columns(ctx, layer, pos, tokens));
     }
 
     float attention_scale() const {
