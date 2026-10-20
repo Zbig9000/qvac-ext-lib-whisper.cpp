@@ -263,7 +263,7 @@ jobs:
       # The WebGPU fixes these lanes rely on (Null-adapter refusal, aligned
       # uploads) are tetherto/qvac-ext-ggml#127; until it lands on the speech
       # branch, build that commit instead of the branch tip.
-      GGML_WEBGPU_SHA: db4c9e9562f8c4a3d8b5c8e0cbb0fd5a7c43e8f1
+      GGML_WEBGPU_SHA: db4c9e95c29288864737b4450cb46d5e476a5e4f
     steps:
       - uses: actions/checkout@v4
 
@@ -387,7 +387,7 @@ jobs:
       # The WebGPU fixes these lanes rely on (Null-adapter refusal, aligned
       # uploads) are tetherto/qvac-ext-ggml#127; until it lands on the speech
       # branch, build that commit instead of the branch tip.
-      GGML_WEBGPU_SHA: db4c9e9562f8c4a3d8b5c8e0cbb0fd5a7c43e8f1
+      GGML_WEBGPU_SHA: db4c9e95c29288864737b4450cb46d5e476a5e4f
     steps:
       - name: Manual Workspace Cleanup
         run: rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
