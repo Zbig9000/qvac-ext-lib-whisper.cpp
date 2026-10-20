@@ -260,6 +260,10 @@ jobs:
     env:
       DAWN_VERSION: v20260317.182325
       DAWN_ASSET_NAME: Dawn-18eb229ef5f707c1464cc581252e7603c73a3ef0-ubuntu-latest-Release
+      # The WebGPU fixes these lanes rely on (Null-adapter refusal, aligned
+      # uploads) are tetherto/qvac-ext-ggml#127; until it lands on the speech
+      # branch, build that commit instead of the branch tip.
+      GGML_WEBGPU_SHA: db4c9e9562f8c4a3d8b5c8e0cbb0fd5a7c43e8f1
     steps:
       - uses: actions/checkout@v4
 
@@ -276,9 +280,9 @@ jobs:
           mkdir dawn
           tar -xf dawn.tar.gz -C dawn --strip-components=1
 
-      - name: Resolve ggml pin (tip of ${{ env.GGML_BRANCH }})
+      - name: Resolve ggml pin (qvac-ext-ggml#127)
         id: ggml
-        run: echo "sha=$(git ls-remote "$GGML_REPO" "refs/heads/$GGML_BRANCH" | cut -f1)" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$GGML_WEBGPU_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Cache ggml install
         id: ggml-cache
@@ -380,6 +384,10 @@ jobs:
     env:
       DAWN_VERSION: v20260317.182325
       DAWN_ASSET_NAME: Dawn-18eb229ef5f707c1464cc581252e7603c73a3ef0-ubuntu-latest-Release
+      # The WebGPU fixes these lanes rely on (Null-adapter refusal, aligned
+      # uploads) are tetherto/qvac-ext-ggml#127; until it lands on the speech
+      # branch, build that commit instead of the branch tip.
+      GGML_WEBGPU_SHA: db4c9e9562f8c4a3d8b5c8e0cbb0fd5a7c43e8f1
     steps:
       - name: Manual Workspace Cleanup
         run: rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
@@ -401,7 +409,10 @@ jobs:
 
       - name: Build ggml with the WebGPU backend and the whisper umbrella
         run: |
-          git clone --depth 1 --branch "$GGML_BRANCH" "$GGML_REPO" ggml-src
+          git init -q ggml-src
+          git -C ggml-src remote add origin "$GGML_REPO"
+          git -C ggml-src fetch --depth 1 origin "$GGML_WEBGPU_SHA"
+          git -C ggml-src checkout -q FETCH_HEAD
           cmake -S ggml-src -B ggml-src/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
