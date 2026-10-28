@@ -488,8 +488,8 @@ no fallback: construction fails when HTP0 is missing, and `--gpu` never selects
 it. The backbone's transformer layers and audio heads run on the NPU, and so
 does the codec (the decoder, and the encoder for cloning and dialogue); the
 host embeds each row, samples it, and projects the whole text head on the few
-steps that need it. It needs a `qvac-ext-ggml@speech` build with the Hexagon
-backend (measured at `6bb85ad6`).
+steps that need it. It needs a fabric ggml build with the Hexagon
+backend (measured on ggml-speech `6bb85ad6`).
 
 Weights go into the Hexagon repack buffer type. HTP multiplies `f32`, `f16`,
 `q8_0` and `q4_0` weights; the backbone and the codec refuse other types for
@@ -832,8 +832,8 @@ crashing the process. The loader takes `f32`, `f16`,
 `bf16` and `q8_0` linear weights; HTP runs all of them but `bf16`, which is
 refused at load, so both validated GGUFs run.
 
-It needs a `qvac-ext-ggml@speech` build with the Hexagon backend at `d85713da`
-or later, which carries the DSP buffer remapping fix
+It needs a fabric ggml build whose Hexagon backend carries the DSP buffer
+remapping fix (ggml-speech `d85713da` or later,
 ([tetherto/qvac-ext-ggml#124](https://github.com/tetherto/qvac-ext-ggml/pull/124));
 the numbers below were measured at that commit. Without it the first DiT pass maps more 1 GiB weight
 buffers than the DSP's address space or its 16 mapping slots can hold, the
@@ -1125,7 +1125,7 @@ when requested explicitly: `SpeechOptions::backend = "hexagon"` or `moss-cli
 construction fails when HTP0 is missing. The reply decoder (the S3Gen flow
 decoder and HiFT shared with Chatterbox) does not run on the NPU: add `--gpu`
 (`use_gpu`) to decode on the Adreno GPU through OpenCL, otherwise it runs on the
-CPU. CAM++ always runs on the CPU. It needs a `qvac-ext-ggml@speech` build with the Hexagon
+CPU. CAM++ always runs on the CPU. It needs a fabric ggml build with the Hexagon
 backend; the generated-model tests also pass without the DSP buffer remapping
 fix ([tetherto/qvac-ext-ggml#124](https://github.com/tetherto/qvac-ext-ggml/pull/124)),
 and the full-model measurements below were taken with it.
