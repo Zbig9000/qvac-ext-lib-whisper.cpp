@@ -115,6 +115,10 @@ jobs:
     env:
       GGML_E2E_SHA: be6e387b9f2fda9a6fa0ca59f9607f2b6bb21db2
       TTS_BASELINE_SHA: 8ae24fffce8d25fe4bfcc9b8d81f51374b29e65c
+      # The TTS baseline predates the fabric ggml (it still calls the
+      # ggml_supertonic_* ops), so it builds against its own ggml-speech pin.
+      GGML_BASELINE_REPO: https://github.com/tetherto/qvac-ext-ggml.git
+      GGML_BASELINE_SHA: e16d1332bdafcaade27eb402c62418239faef632
     steps:
       - name: Manual Workspace Cleanup
         run: rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
@@ -170,6 +174,8 @@ jobs:
               exit 1
               ;;
           esac
+          # The baseline build below reuses the same backend selection.
+          echo "BACKEND_OPTIONS=$BACKEND_OPTIONS" >> "$GITHUB_ENV"
           cmake -S ggml-src/ggml -B ggml-src/build -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF \
             $BACKEND_OPTIONS -DGGML_METAL=OFF \
@@ -210,10 +216,22 @@ jobs:
           git fetch --depth 1 origin "$TTS_BASELINE_SHA"
           git worktree add --detach moss-baseline-src "$TTS_BASELINE_SHA"
           git -C moss-baseline-src rev-parse HEAD > moss-e2e-results/tts-baseline-commit.txt
+          git init -q ggml-baseline-src
+          git -C ggml-baseline-src remote add origin "$GGML_BASELINE_REPO"
+          git -C ggml-baseline-src fetch --depth 1 origin "$GGML_BASELINE_SHA"
+          git -C ggml-baseline-src checkout -q FETCH_HEAD
+          git -C ggml-baseline-src rev-parse HEAD > moss-e2e-results/ggml-baseline-commit.txt
+          cmake -S ggml-baseline-src -B ggml-baseline-src/build -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF \
+            $BACKEND_OPTIONS -DGGML_METAL=OFF \
+            -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-baseline-install"
+          cmake --build ggml-baseline-src/build -j4
+          cmake --install ggml-baseline-src/build
           cmake -S moss-baseline-src -B build-moss-baseline -DCMAKE_BUILD_TYPE=Release \
             -DSPEECH_BUILD_WHISPER=OFF -DSPEECH_BUILD_AUDIOGEN=OFF -DSPEECH_BUILD_PARAKEET=OFF \
             -DSPEECH_BUILD_TESTS=OFF -DSPEECH_BUILD_EXECUTABLES=ON \
-            -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
+            -DCMAKE_PREFIX_PATH="$PWD/ggml-baseline-install"
           cmake --build build-moss-baseline --target moss-cli -j4
       - name: Build independent CPU reference ASR
         if: startsWith(matrix.model, 'tts-')
@@ -237,7 +255,9 @@ jobs:
           MODEL_CASE: ${{ matrix.model }}
           BACKEND: ${{ matrix.backend }}
           MODEL_S3_BUCKET: ${{ secrets.MODEL_S3_BUCKET }}
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          # Both runtimes: the PR tree's fabric ggml and the baseline's ggml-speech
+          # (different library names, so one search path serves both CLIs).
+          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib:${{ github.workspace }}/ggml-baseline-install/lib
         run: python3 scripts/ci/moss-gpu-e2e.py --backend "$BACKEND" --case "$MODEL_CASE"
       - name: Upload generated audio, transcripts and evidence
         if: always()
